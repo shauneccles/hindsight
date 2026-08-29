@@ -560,6 +560,13 @@ carries — `[[], ["source:chat"]]` for a session transcript, `[[], ["source:git
 diff. Read an axis back with `tags: ["source:git"], tags_match: "exact"`, and the merged view with
 `tags: [], tags_match: "exact"`.
 
+Two `source:` tags are provenance labels rather than kinds of claim, and are handled specially —
+both found by running this on real repositories. `source:git-log` maps onto `source:git`: the
+commit-message seed carries both, so a scope for each produced two near-identical belief sets (307
+observations against 302 on one repo) for double the consolidation. `source:survey-baseline` is
+excluded outright: it marks the "researching…" status document, whose retain strategy extracts
+nothing, and it yielded a scope holding a single observation.
+
 This cannot be expressed as a scope list. The server treats an explicit `list[list[str]]` as
 unconditional — it is not filtered against the memory's own tags — so a configured
 `[[], ["source:git"], ["source:chat"]]` writes every document into all three, and the `source:git`

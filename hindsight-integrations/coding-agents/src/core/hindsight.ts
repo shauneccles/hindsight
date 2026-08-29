@@ -59,12 +59,39 @@ export type ObservationScopes =
  * The empty scope is always first and always present, so the untagged observations that knowledge
  * pages read (they match with `tags_match: "all"`) keep being written exactly as under `shared`.
  */
+/**
+ * `source:` tags are provenance labels, and not every one of them names a KIND of
+ * claim. Two do not, and both were found by running this on real repositories:
+ *
+ * - `source:git-log` is a bookkeeping alias. `git.ts` tags the commit-message seed
+ *   with it AND `source:git`, so a scope for each produced two near-identical
+ *   belief sets — 307 observations against 302 on one repo — and doubled the
+ *   consolidation for the pair. It is the same claim as `source:git`: what the
+ *   commits say.
+ * - `source:survey-baseline` marks the "researching…" status document, whose retain
+ *   strategy is meant to extract nothing. It still yielded a scope holding exactly
+ *   one observation: a belief set that exists only to be noise.
+ *
+ * Mapping rather than excluding keeps the seed's facts in the git scope instead of
+ * dropping them, which matters because that document is where a cold repo's whole
+ * commit history arrives.
+ */
+const SOURCE_SCOPE_ALIASES: Record<string, string> = { "source:git-log": "source:git" };
+const SOURCE_SCOPE_EXCLUDED = new Set(["source:survey-baseline"]);
+
 export function resolveRetainScopes(
   tags: string[] | undefined,
   configured: ObservationScopes
 ): ObservationScopes {
   if (configured !== "per_source") return configured;
-  const sources = [...new Set((tags ?? []).filter((t) => t.startsWith("source:")))].sort();
+  const sources = [
+    ...new Set(
+      (tags ?? [])
+        .filter((t) => t.startsWith("source:"))
+        .filter((t) => !SOURCE_SCOPE_EXCLUDED.has(t))
+        .map((t) => SOURCE_SCOPE_ALIASES[t] ?? t)
+    ),
+  ].sort();
   return [[], ...sources.map((s) => [s])];
 }
 

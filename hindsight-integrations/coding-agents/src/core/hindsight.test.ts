@@ -262,17 +262,37 @@ describe("HindsightClient.retain — per_source scoping", () => {
     expect(item.observation_scopes).toEqual([[]]);
   });
 
-  // The commit-message seed is tagged `source:git` AND `source:git-log` (git.ts keeps both: the
-  // cold-repo check filters on `source:git`). Taking every distinct source tag is the only rule
-  // that needs no arbitrary tie-break and does not depend on the order git.ts happens to emit.
-  it("gives a document carrying two source tags a scope for each", async () => {
+  // The commit-message seed carries `source:git` AND `source:git-log` (git.ts keeps
+  // both so the cold-repo check can find it). `git-log` is a bookkeeping alias for
+  // the same kind of claim — what the commits say — not a second axis. Emitting a
+  // scope for each produced two near-identical belief sets on a real repository:
+  // 307 observations against 302, for double the consolidation.
+  it("folds the commit-log alias into the git scope rather than duplicating it", async () => {
     const item = await retainItem(perSource(), ["source:git", "source:git-log", "gitlog-head:abc"]);
-    expect(item.observation_scopes).toEqual([[], ["source:git"], ["source:git-log"]]);
+    expect(item.observation_scopes).toEqual([[], ["source:git"]]);
+  });
+
+  it("gives the commit-log seed the git scope even when only the alias is present", async () => {
+    const item = await retainItem(perSource(), ["source:git-log"]);
+    expect(item.observation_scopes).toEqual([[], ["source:git"]]);
+  });
+
+  // The survey baseline is the "researching…" status marker, whose retain strategy
+  // is meant to extract nothing. On a real repository it still yielded a scope
+  // holding exactly one observation — a belief set that exists only to be noise.
+  it("gives the survey status marker no scope of its own", async () => {
+    const item = await retainItem(perSource(), ["source:survey-baseline"]);
+    expect(item.observation_scopes).toEqual([[]]);
+  });
+
+  it("still scopes a real source alongside an excluded one", async () => {
+    const item = await retainItem(perSource(), ["source:chat", "source:survey-baseline"]);
+    expect(item.observation_scopes).toEqual([[], ["source:chat"]]);
   });
 
   it("orders the scopes independently of the order the tags arrive in", async () => {
-    const item = await retainItem(perSource(), ["source:git-log", "source:git"]);
-    expect(item.observation_scopes).toEqual([[], ["source:git"], ["source:git-log"]]);
+    const item = await retainItem(perSource(), ["source:upload", "source:chat"]);
+    expect(item.observation_scopes).toEqual([[], ["source:chat"], ["source:upload"]]);
   });
 
   it("never lets a volatile provenance tag become a scope", async () => {
