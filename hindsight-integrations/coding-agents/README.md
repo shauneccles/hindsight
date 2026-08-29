@@ -560,12 +560,11 @@ carries — `[[], ["source:chat"]]` for a session transcript, `[[], ["source:git
 diff. Read an axis back with `tags: ["source:git"], tags_match: "exact"`, and the merged view with
 `tags: [], tags_match: "exact"`.
 
-Two `source:` tags are provenance labels rather than kinds of claim, and are handled specially —
-both found by running this on real repositories. `source:git-log` maps onto `source:git`: the
-commit-message seed carries both, so a scope for each produced two near-identical belief sets (307
-observations against 302 on one repo) for double the consolidation. `source:survey-baseline` is
-excluded outright: it marks the "researching…" status document, whose retain strategy extracts
-nothing, and it yielded a scope holding a single observation.
+A document carrying two `source:` tags gets a scope for each, and that is deliberate rather than
+duplication. The commit-message seed is tagged `source:git` and `source:git-log`, so
+`source:git-log` is fed only by the seed — what the commit _messages_ say — while `source:git` also
+collects every per-commit diff under `gitIngest: "full"`. Two questions, two answers, each
+deduplicated within itself by consolidation. A fact belonging to more than one axis is the point.
 
 This cannot be expressed as a scope list. The server treats an explicit `list[list[str]]` as
 unconditional — it is not filtered against the memory's own tags — so a configured
