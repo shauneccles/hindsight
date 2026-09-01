@@ -3,6 +3,9 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     index: "src/index.ts",
+    // opencode v2 (`opencode2`) loads this via the package's root index.js, which re-exports it.
+    // Its plugin contract shares nothing with v1's, so it is a separate entry — see src/opencode2.ts.
+    opencode2: "src/opencode2.ts",
     // Kilo CLI (an opencode fork) loads this as its persistent plugin — see src/kilo.ts.
     kilo: "src/kilo.ts",
     deepen: "src/deepen.ts",
@@ -25,12 +28,18 @@ export default defineConfig({
     // Prime Agent loads this module as an extension (default export) by absolute path from its
     // settings.json `extensions` array, so it must be self-contained like the hook bins.
     "prime-agent": "src/prime-agent.ts",
+    "qwen-hook": "src/qwen-hook.ts",
+    "qwen-sessionstart-hook": "src/qwen-sessionstart-hook.ts",
+    "qwen-stop-hook": "src/qwen-stop-hook.ts",
     "grok-hook": "src/grok-hook.ts",
     "grok-sessionstart-hook": "src/grok-sessionstart-hook.ts",
     "grok-stop-hook": "src/grok-stop-hook.ts",
     "codex-hook": "src/codex-hook.ts",
     "codex-sessionstart-hook": "src/codex-sessionstart-hook.ts",
     "codex-stop-hook": "src/codex-stop-hook.ts",
+    "dcode-hook": "src/dcode-hook.ts",
+    "dcode-sessionstart-hook": "src/dcode-sessionstart-hook.ts",
+    "dcode-stop-hook": "src/dcode-stop-hook.ts",
     "antigravity-hook": "src/antigravity-hook.ts",
     "antigravity-stop-hook": "src/antigravity-stop-hook.ts",
     "antigravity-statusline": "src/antigravity-statusline.ts",
@@ -58,5 +67,13 @@ export default defineConfig({
   // hindsight-all (the local-daemon lifecycle manager) is inlined for the same reason: hooks are
   // wired by absolute path to ONE dist file and never load the package's node_modules. It has zero
   // dependencies of its own, so inlining costs almost nothing.
-  noExternal: [/^@modelcontextprotocol\/sdk/, /^zod/, /^@vectorize-io\/hindsight-all/],
+  // jsonc-parser likewise: installer.js is staged to ~/.hindsight/coding-agents as dist + skill +
+  // package.json — never node_modules — so an external import there is unresolvable, and re-running
+  // `install` from the staged copy (the upgrade path) dies with ERR_MODULE_NOT_FOUND.
+  noExternal: [
+    /^@modelcontextprotocol\/sdk/,
+    /^zod/,
+    /^@vectorize-io\/hindsight-all/,
+    /^jsonc-parser/,
+  ],
 });

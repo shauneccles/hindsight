@@ -6,6 +6,7 @@ describe("HARNESS_NAMES", () => {
     expect(HARNESS_NAMES).toEqual(
       expect.arrayContaining([
         "opencode",
+        "opencode2",
         "kilo",
         "cline-cli",
         "prime-agent",
@@ -13,19 +14,28 @@ describe("HARNESS_NAMES", () => {
         "claude-code",
         "cursor-cli",
         "codex",
+        "dcode",
         "antigravity-cli",
         "devin-cli",
         "copilot-cli",
         "grok-build",
+        "qwen-code",
       ])
     );
-    expect(HARNESS_NAMES).toHaveLength(12);
+    expect(HARNESS_NAMES).toHaveLength(15);
   });
 });
 
 describe("getHarness", () => {
   it("resolves hook harnesses without touching the opencode adapter", async () => {
-    for (const name of ["claude-code", "cursor-cli", "codex", "antigravity-cli", "devin-cli"]) {
+    for (const name of [
+      "claude-code",
+      "cursor-cli",
+      "codex",
+      "dcode",
+      "antigravity-cli",
+      "devin-cli",
+    ]) {
       const adapter = await getHarness(name);
       expect(adapter.name).toBe(name);
       // Lightweight hook adapters have no persistent runtime — createRuntime always throws before
@@ -42,6 +52,15 @@ describe("getHarness", () => {
     // directly, bypassing this registry. Lock it so a future change can't silently make this look
     // functional.
     expect(() => adapter.createRuntime({} as never)).toThrow();
+  });
+
+  it("resolves opencode2 as its own plugin harness, separate from v1", async () => {
+    // Same no-runtime shape as opencode above, but a DIFFERENT entrypoint: v2's plugin contract
+    // shares nothing with v1's, so handing either host the other's export loads a plugin that
+    // registers nothing and reports no error.
+    const adapter = await getHarness("opencode2");
+    expect(adapter.name).toBe("opencode2");
+    expect(() => adapter.createRuntime({} as never)).toThrow(/src\/opencode2\.ts/);
   });
 
   it("resolves Cline as a native-plugin harness rather than a hook binary", async () => {
@@ -71,6 +90,18 @@ describe("registry covers every installable harness", () => {
   it("has no harness the installer wires but the registry rejects", async () => {
     const { INSTALLERS } = await import("../installer");
     const missing = INSTALLERS.map((i) => i.name).filter((n) => !HARNESS_NAMES.includes(n));
+    expect(missing).toEqual([]);
+  });
+
+  // The check above is DIRECTIONAL, and the other direction is just as broken: a harness in the
+  // registry with no installer is advertised by the README and rejected by `install <name>` with
+  // "unknown harness". Every hook harness must be installable — the plugin harnesses are wired by
+  // their own entrypoints and are exempt only because they still carry an INSTALLERS entry.
+  it("has no hook harness the registry names but the installer cannot wire", async () => {
+    const { INSTALLERS } = await import("../installer");
+    const { HOOK_HARNESSES } = await import("./hook-lifecycle");
+    const installable = new Set(INSTALLERS.map((i) => i.name));
+    const missing = Object.keys(HOOK_HARNESSES).filter((n) => !installable.has(n));
     expect(missing).toEqual([]);
   });
 });

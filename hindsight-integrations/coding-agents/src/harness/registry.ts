@@ -40,6 +40,9 @@ const noRuntimeAdapter = (name: string, hint: string): HarnessAdapter => ({
 
 export const HARNESS_NAMES = [
   "opencode",
+  // opencode v2 (binary `opencode2`) — a ground-up rewrite of the plugin API, loaded from the
+  // package's root index.js (src/opencode2.ts). Like opencode it has NO hook binary.
+  "opencode2",
   // Kilo CLI is an opencode fork loaded as a persistent plugin (src/kilo.ts), so like opencode it
   // has NO hook binary — deliberately absent from HOOK_BINS below.
   "kilo",
@@ -53,26 +56,31 @@ export const HARNESS_NAMES = [
   "claude-code",
   "cursor-cli",
   "codex",
+  "dcode",
   "antigravity-cli",
   "devin-cli",
   "copilot-cli",
   "grok-build",
+  "qwen-code",
 ];
 
 const HOOK_BINS: Record<string, string> = {
   "claude-code": "hindsight-claude-hook",
   "cursor-cli": "hindsight-cursor-hook",
   codex: "hindsight-codex-hook",
+  dcode: "hindsight-dcode-hook",
   "antigravity-cli": "hindsight-antigravity-hook",
   "devin-cli": "hindsight-devin-hook",
   "copilot-cli": "hindsight-copilot-hook",
   "grok-build": "hindsight-grok-hook",
+  "qwen-code": "hindsight-qwen-hook",
   // more hook harnesses: add a HookSpec entry point (see src/cursor-hook.ts) + a registration here.
 };
 
 /** Where each persistent-plugin harness's runtime is actually built (see the branch below). */
 const PLUGIN_ENTRYPOINTS: Record<string, string> = {
   opencode: "src/index.ts",
+  opencode2: "src/opencode2.ts",
   kilo: "src/kilo.ts",
   "cline-cli": "src/cline.ts",
   "prime-agent": "src/prime-agent.ts",
