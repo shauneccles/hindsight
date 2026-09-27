@@ -12,9 +12,16 @@ assert on the generated SQL, the way ``test_multilingual_bm25`` does.
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from hindsight_api._text_search import mental_models_text_document
 from hindsight_api.engine.db.ops_postgresql import pg_search_vector_expr
 from hindsight_api.engine.sql.postgresql import KnowledgeBm25Arm, knowledge_bm25_arm
+
+# Asserts the SQL text this dispatch emits -- the `$3::text` bind and the absence of
+# `search_vector`. A store that owns the knowledge index emits no SQL at all, so there is nothing
+# here for the assertions to read.
+pytestmark = pytest.mark.memory_backend_incompatible
 
 
 def _cfg(ext: str) -> SimpleNamespace:
@@ -29,14 +36,16 @@ def test_native_uses_tsvector_operators():
     arm = _arm("native")
     # The mental_models tsvector is generated with the 'english' config, so the
     # query must use 'english' regardless of the configured native language.
-    assert "ts_rank_cd(mm.search_vector, websearch_to_tsquery('english', $3))" in arm.score_expr
-    assert arm.match_filter == "AND mm.search_vector @@ websearch_to_tsquery('english', $3)"
+    # Joining tokens with OR aligns candidate recall with memory-recall BM25;
+    # precision is restored downstream via ts_rank_cd ranking and RRF fusion.
+    assert "ts_rank_cd(mm.search_vector, to_tsquery('english', $3))" in arm.order_by
+    assert arm.match_filter == "AND mm.search_vector @@ to_tsquery('english', $3)"
 
 
 def test_pgroonga_uses_multilingual_expression_index():
     arm = _arm("pgroonga")
-    assert arm.score_expr == "pgroonga_score(mm.tableoid, mm.ctid)"
-    assert arm.match_filter == "AND (COALESCE(mm.name, '') || ' ' || mm.content) &@~ pgroonga_query_escape($3)"
+    assert "pgroonga_tokenize($3, 'tokenizer', 'TokenBigram', 'normalizer', 'NormalizerNFKC150')" in arm.match_filter
+    assert "string_agg(pgroonga_query_escape(elem->>'value'), ' OR ')" in arm.match_filter
     # pgroonga_score() reads 0 off any plan that did not use the pgroonga index,
     # so the ordering carries a tiebreak instead of collapsing to input order.
     assert arm.order_by == "pgroonga_score(mm.tableoid, mm.ctid) DESC, mm.id"
@@ -51,20 +60,40 @@ def test_pgroonga_filter_repeats_the_indexed_expression_verbatim():
 
 def test_pg_search_uses_paradedb_over_base_columns():
     arm = _arm("pg_search")
-    assert arm.score_expr == "paradedb.score(mm.id)"
+    assert arm.order_by == "paradedb.score(mm.id) DESC"
     assert "mm.id @@@ paradedb.boolean(should => ARRAY[" in arm.match_filter
     assert "paradedb.match('name', $3)" in arm.match_filter
     assert "paradedb.match('content', $3)" in arm.match_filter
     # Must not fall back to the native tsvector function.
-    assert "ts_rank_cd" not in arm.score_expr
     assert "ts_rank_cd" not in arm.order_by
+
+
+def test_pg_search_uses_custom_function_schema():
+    arm = knowledge_bm25_arm("pg_search", table_alias="mm", text_param="$3", pg_search_function_schema="pgsearch")
+    assert arm.order_by == "pgsearch.score(mm.id) DESC"
+    assert "mm.id @@@ pgsearch.boolean(should => ARRAY[" in arm.match_filter
+    assert "pgsearch.match('name', $3)" in arm.match_filter
+    assert "pgsearch.match('content', $3)" in arm.match_filter
+    assert "paradedb" not in arm.order_by
+    assert "paradedb" not in arm.match_filter
+
+
+def test_pg_search_tokenizer_prunes_to_terms_like_memory_recall():
+    """Knowledge search shares recall's pg_search term pruning (#4313)."""
+    arm = knowledge_bm25_arm(
+        "pg_search", table_alias="mm", text_param="$3", pg_search_tokenizer="jieba", max_query_terms=16
+    )
+    assert "unnest($3::text::pdb.jieba::text[])" in arm.match_filter
+    assert "(VALUES ('name'), ('content'))" in arm.match_filter
+    assert "LIMIT 16" in arm.match_filter
+    assert "paradedb.match(" not in arm.match_filter
 
 
 def test_pg_textsearch_ranks_content_by_bm25_distance():
     arm = _arm("pg_textsearch")
-    # `<@>` is a distance (lower = closer): order ASC, negate for the score.
+    # `<@>` is a distance (lower = closer), so the arm orders ASC off the raw
+    # distance and lets the index drive the ordering.
     assert arm.order_by == "mm.content <@> to_bm25query($3, 'idx_mental_models_text_search') ASC"
-    assert arm.score_expr == "-(mm.content <@> to_bm25query($3, 'idx_mental_models_text_search'))"
     # It ranks every row, so there is no boolean match gate.
     assert arm.match_filter == ""
     assert "ts_rank_cd" not in arm.order_by
@@ -74,18 +103,16 @@ def test_vchord_ranks_over_bm25vector_search_vector():
     arm = _arm("vchord")
     # Negated <&> distance over the bm25vector column and the mental_models index,
     # gated on a positive score — the same operator build_bm25_arm uses.
-    assert (
-        arm.score_expr
-        == "-(mm.search_vector <&> to_bm25query('idx_mental_models_text_search', tokenize($3, 'llmlingua2')))"
+    assert arm.order_by == (
+        "-(mm.search_vector <&> to_bm25query('idx_mental_models_text_search', tokenize($3, 'llmlingua2'))) DESC"
     )
-    assert arm.order_by.endswith(" DESC")
     assert arm.match_filter.endswith(" > 0")
-    assert "ts_rank_cd" not in arm.score_expr
+    assert "ts_rank_cd" not in arm.order_by
 
 
 def test_text_param_and_alias_are_threaded_through():
     arm = knowledge_bm25_arm("pg_search", table_alias="kbm", text_param="$7")
-    assert "paradedb.score(kbm.id)" == arm.score_expr
+    assert "paradedb.score(kbm.id) DESC" == arm.order_by
     assert "kbm.id @@@" in arm.match_filter
     assert "paradedb.match('name', $7)" in arm.match_filter
 

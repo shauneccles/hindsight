@@ -2,9 +2,10 @@
  * DeepSeek Harness (dsh) transcript normalizer.
  *
  * dsh keeps a session as an append-only log of typed `SessionEvent`s rather than a chat array, and
- * a plugin reads that log straight off `agent.session.events` — so this is a pure function over
- * those events, like the opencode normalizer, not a file reader. The SAME event vocabulary is what
- * dsh persists to disk, so the backfill reader (core/history.ts) feeds this exact function.
+ * a plugin reads that log straight off the live session (`snapshotEvents()`) — so this is a pure
+ * function over those events, like the opencode normalizer, not a file reader. The SAME event
+ * vocabulary is what dsh persists to disk, so the backfill reader (core/history.ts) feeds this
+ * exact function.
  *
  * Only three of the ~30 event types carry conversation:
  *   - `user/message`      surface, a UserMessage — the human prompt OR an injected plugin context
@@ -24,9 +25,10 @@ import type { TransportTurn } from "./chat";
 import { actionLine, stripInjectedMemory } from "./transcript-util";
 
 /**
- * The Cordis plugin name, which is also the `source.plugin` dsh records on every message this
- * integration injects — so an injected block is identifiable in a session log even though the
- * `kind: 'user'` filter below already keeps it (and every other plugin's context) out of a retain.
+ * The Cordis plugin name. Messages this integration injects carry `source.kind: 'plugin:hindsight'`
+ * (the V4 producer-owned kind; V3 logs recorded `kind: 'plugin', plugin: 'hindsight'`), so an
+ * injected block is identifiable in a session log even though the `kind: 'user'` filter below
+ * already keeps it (and every other plugin's context) out of a retain.
  */
 export const HINDSIGHT_PLUGIN = "hindsight";
 

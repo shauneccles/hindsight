@@ -3,6 +3,9 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     index: "src/index.ts",
+    // opencode v2 (`opencode2`) loads this via the package's root index.js, which re-exports it.
+    // Its plugin contract shares nothing with v1's, so it is a separate entry — see src/opencode2.ts.
+    opencode2: "src/opencode2.ts",
     // Kilo CLI (an opencode fork) loads this as its persistent plugin — see src/kilo.ts.
     kilo: "src/kilo.ts",
     deepen: "src/deepen.ts",
@@ -22,23 +25,40 @@ export default defineConfig({
     cline: "src/cline.ts",
     // DeepSeek Harness loads this as a native Cordis plugin — see src/dsh.ts.
     dsh: "src/dsh.ts",
-    // Prime Agent loads this module as an extension (default export) by absolute path from its
-    // settings.json `extensions` array, so it must be self-contained like the hook bins.
+    // pi and its fork Prime Agent each load their own module as an extension (default export) by
+    // absolute path from their settings.json `extensions` array, so both must be self-contained
+    // like the hook bins. They share src/harness/pi-extension.ts, which `splitting: false` inlines
+    // into each bundle rather than a shared chunk.
+    pi: "src/pi.ts",
     "prime-agent": "src/prime-agent.ts",
+    "qwen-hook": "src/qwen-hook.ts",
+    "qwen-sessionstart-hook": "src/qwen-sessionstart-hook.ts",
+    "qwen-stop-hook": "src/qwen-stop-hook.ts",
     "grok-hook": "src/grok-hook.ts",
     "grok-sessionstart-hook": "src/grok-sessionstart-hook.ts",
     "grok-stop-hook": "src/grok-stop-hook.ts",
     "codex-hook": "src/codex-hook.ts",
     "codex-sessionstart-hook": "src/codex-sessionstart-hook.ts",
     "codex-stop-hook": "src/codex-stop-hook.ts",
+    "dcode-hook": "src/dcode-hook.ts",
+    "dcode-sessionstart-hook": "src/dcode-sessionstart-hook.ts",
+    "dcode-stop-hook": "src/dcode-stop-hook.ts",
     "antigravity-hook": "src/antigravity-hook.ts",
     "antigravity-stop-hook": "src/antigravity-stop-hook.ts",
     "antigravity-statusline": "src/antigravity-statusline.ts",
     "devin-hook": "src/devin-hook.ts",
     "devin-sessionstart-hook": "src/devin-sessionstart-hook.ts",
     "devin-stop-hook": "src/devin-stop-hook.ts",
+    "zcode-hook": "src/zcode-hook.ts",
+    "zcode-sessionstart-hook": "src/zcode-sessionstart-hook.ts",
+    "zcode-stop-hook": "src/zcode-stop-hook.ts",
+    "droid-hook": "src/droid-hook.ts",
+    "droid-sessionstart-hook": "src/droid-sessionstart-hook.ts",
+    "droid-stop-hook": "src/droid-stop-hook.ts",
     // Spawned DETACHED to start the local daemon — a cold start outlives every hook timeout.
     "daemon-start": "src/daemon-start.ts",
+    // Spawned DETACHED to hold the codebase-survey lease for the survey agent's lifetime.
+    "survey-supervisor": "src/survey-supervisor.ts",
     "mcp-server": "src/mcp-server.ts",
     "hindsight-seed": "src/hindsight-seed.ts",
   },
@@ -58,5 +78,15 @@ export default defineConfig({
   // hindsight-all (the local-daemon lifecycle manager) is inlined for the same reason: hooks are
   // wired by absolute path to ONE dist file and never load the package's node_modules. It has zero
   // dependencies of its own, so inlining costs almost nothing.
-  noExternal: [/^@modelcontextprotocol\/sdk/, /^zod/, /^@vectorize-io\/hindsight-all/],
+  // jsonc-parser likewise: installer.js is staged to ~/.hindsight/coding-agents as dist + skill +
+  // package.json — never node_modules — so an external import there is unresolvable, and re-running
+  // `install` from the staged copy (the upgrade path) dies with ERR_MODULE_NOT_FOUND.
+  noExternal: [
+    /^@modelcontextprotocol\/sdk/,
+    /^zod/,
+    /^@vectorize-io\/hindsight-all/,
+    /^jsonc-parser/,
+    // smol-toml likewise: installer.js parses ~/.grok/config.toml with it.
+    /^smol-toml/,
+  ],
 });

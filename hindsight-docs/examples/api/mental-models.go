@@ -37,7 +37,7 @@ func main() {
 	} {
 		client.MemoryAPI.RetainMemories(ctx, mmBankID).
 			RetainRequest(hindsight.RetainRequest{
-				Items: []hindsight.MemoryItem{{Content: content}},
+				Items: []hindsight.MemoryItem{{Content: hindsight.TextContent(content)}},
 			}).Execute()
 	}
 	time.Sleep(2 * time.Second)
@@ -111,8 +111,9 @@ func main() {
 	time.Sleep(5 * time.Second)
 
 	// [docs:list-mental-models]
-	// List all mental models in a bank
-	mentalModels, _, _ := client.MentalModelsAPI.ListMentalModels(ctx, mmBankID).Execute()
+	// List all mental models in a bank. The list returns metadata by default;
+	// Detail("content") adds source_query/content/trigger.
+	mentalModels, _, _ := client.MentalModelsAPI.ListMentalModels(ctx, mmBankID).Detail("content").Execute()
 
 	for _, mm := range mentalModels.GetItems() {
 		fmt.Printf("- %s: %s\n", mm.GetName(), mm.GetSourceQuery())
@@ -181,6 +182,44 @@ func main() {
 		}
 	}
 	// [/docs:get-mental-model-history]
+
+	// [docs:mental-model-detail]
+	// List: metadata only, the default (smallest response)
+	client.MentalModelsAPI.ListMentalModels(ctx, mmBankID).Execute()
+
+	// List with content but without provenance chains (opt-in)
+	client.MentalModelsAPI.ListMentalModels(ctx, mmBankID).Detail("content").Execute()
+
+	// Get one model — full detail is the default here
+	client.MentalModelsAPI.GetMentalModel(ctx, mmBankID, mentalModelID).Execute()
+	// [/docs:mental-model-detail]
+
+	// [docs:dry-run-refresh]
+	// Preview what a refresh would do, without writing anything
+	preview, _, err := client.MentalModelsAPI.DryRunRefreshMentalModel(ctx, mmBankID, mentalModelID).Execute()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Mode: %s, would persist: %v\n", preview.GetEffectiveMode(), preview.GetWouldPersist())
+	fmt.Println(preview.GetDiff())
+	// [/docs:dry-run-refresh]
+
+	// [docs:keep-trace]
+	// Record how every refresh (scheduled ones too) reached its result
+	mode := "delta"
+	keepTrace := true
+	_, _, err = client.MentalModelsAPI.UpdateMentalModel(ctx, mmBankID, mentalModelID).
+		UpdateMentalModelRequest(hindsight.UpdateMentalModelRequest{
+			Trigger: *hindsight.NewNullableMentalModelTriggerInput(&hindsight.MentalModelTriggerInput{
+				Mode:      &mode,
+				KeepTrace: &keepTrace,
+			}),
+		}).Execute()
+	if err != nil {
+		panic(err)
+	}
+	// [/docs:keep-trace]
 
 	// [docs:delete-mental-model]
 	// Delete a mental model

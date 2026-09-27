@@ -171,7 +171,7 @@ async def test_bank_creation_alone_creates_no_vector_indexes(memory, request_con
     """
     bank_id = f"test_hnsw_empty_{uuid.uuid4().hex[:8]}"
     try:
-        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
         indexes = await _get_bank_vector_indexes(memory._pool, bank_id)
         assert indexes == [], f"bank creation must not create vector indexes, got: {indexes}"
@@ -250,7 +250,7 @@ async def test_retrieve_semantic_bm25_grouped_by_fact_type(memory, request_conte
             request_context=request_context,
         )
 
-        query_emb = memory.embeddings.encode(["software engineer Alice"])
+        query_emb = await memory.embeddings.encode(["software engineer Alice"])
         query_emb_str = str(query_emb[0])
 
         fact_types = ["world", "experience"]

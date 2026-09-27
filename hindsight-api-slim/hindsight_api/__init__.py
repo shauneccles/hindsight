@@ -20,10 +20,15 @@ So: adding an eager top-level import here is not a neutral edit. It puts the cos
 spawned worker, and the failure it causes does not look like an import problem — it looks like the
 pod being fine.
 
-``apply_default_thread_limits()`` stays eager on purpose, and is the one thing that must: it caps
-the native ML thread pools by setting environment variables that OpenBLAS/OpenMP/MKL read only at
-load time, so it has to run before anything pulls in numpy/torch/onnxruntime. Laziness below makes
-that guarantee stronger, not weaker — those libraries now load later than they used to.
+One call stays eager on purpose, and is the only one that must. It configures how the
+process executes, and is worthless once the libraries it governs have loaded:
+
+``apply_default_thread_limits()`` caps the native ML thread pools by setting environment
+variables that OpenBLAS/OpenMP/MKL read only at load time, so it has to run before anything
+pulls in numpy/torch/onnxruntime.
+
+Laziness below makes that guarantee stronger, not weaker — those libraries now load later
+than they used to.
 """
 
 from typing import TYPE_CHECKING
@@ -35,7 +40,7 @@ from ._thread_limits import apply_default_thread_limits
 
 apply_default_thread_limits()
 
-__version__ = "0.9.2"
+__version__ = "0.10.1"
 
 # name -> (module, attribute). Kept as data so `__all__`, `__dir__` and the resolver cannot drift.
 _LAZY_EXPORTS: "dict[str, tuple[str, str]]" = {
@@ -50,9 +55,7 @@ _LAZY_EXPORTS: "dict[str, tuple[str, str]]" = {
     "LLMConfig": (".engine.llm_wrapper", "LLMConfig"),
     "MemoryEngine": (".engine.memory_engine", "MemoryEngine"),
     "EntryPoint": (".engine.search.trace", "EntryPoint"),
-    "LinkInfo": (".engine.search.trace", "LinkInfo"),
     "NodeVisit": (".engine.search.trace", "NodeVisit"),
-    "PruningDecision": (".engine.search.trace", "PruningDecision"),
     "QueryInfo": (".engine.search.trace", "QueryInfo"),
     "SearchPhaseMetrics": (".engine.search.trace", "SearchPhaseMetrics"),
     "SearchSummary": (".engine.search.trace", "SearchSummary"),
@@ -95,9 +98,7 @@ if TYPE_CHECKING:  # pragma: no cover - for type checkers and IDEs, never at run
     from .engine.memory_engine import MemoryEngine  # noqa: F401
     from .engine.search.trace import (  # noqa: F401
         EntryPoint,
-        LinkInfo,
         NodeVisit,
-        PruningDecision,
         QueryInfo,
         SearchPhaseMetrics,
         SearchSummary,

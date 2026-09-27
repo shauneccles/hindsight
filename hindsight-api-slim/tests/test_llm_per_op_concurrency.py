@@ -1,7 +1,8 @@
 """Tests for per-operation LLM concurrency caps.
 
 These tests exercise the dispatch logic in `llm_wrapper` that gates calls on
-per-operation semaphores when `HINDSIGHT_API_{RETAIN,REFLECT,CONSOLIDATION}_LLM_MAX_CONCURRENT`
+per-operation semaphores when
+`HINDSIGHT_API_{RETAIN,REFLECT,CONSOLIDATION,MENTAL_MODEL_REFRESH}_LLM_MAX_CONCURRENT`
 is set. They patch the module-level semaphore registry so they can run without
 needing to re-import the module with custom env vars.
 """
@@ -15,6 +16,7 @@ import httpx
 import pytest
 from openai import APIConnectionError
 
+from hindsight_api.config import clear_config_cache
 from hindsight_api.engine import llm_wrapper
 from hindsight_api.engine.llm_wrapper import (
     LLMProvider,
@@ -36,10 +38,13 @@ class TestScopeToOperation:
             ("reflect_structured", "reflect"),
             ("reflect_tool_call", "reflect"),
             ("consolidation", "consolidation"),
+            # The background mental-model refresh is its own bucket, not reflect's.
+            ("refresh_mental_model", "mental_model_refresh"),
+            ("dry_run_refresh_mental_model", "mental_model_refresh"),
+            ("mental_model_delta_ops", "mental_model_refresh"),
             # Out-of-bucket scopes — only the global cap applies.
             ("memory_think", None),
             ("bank_mission", None),
-            ("mental_model_delta_ops", None),
             ("verification", None),
             ("", None),
         ],
@@ -90,7 +95,16 @@ class TestSemaphoresForScope:
 
 
 class TestBuildPerOpSemaphores:
-    """`_build_per_op_semaphores()` reads env vars and validates them."""
+    """`_build_per_op_semaphores()` reads the resolved config and validates it.
+
+    Each case clears the config cache after setting the environment: the caps come
+    from HindsightConfig now, so the env only takes effect once the config is rebuilt.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self):
+        """Leave no rebuilt config behind for the next test to inherit."""
+        yield
 
     def test_empty_when_no_env_vars(self, monkeypatch):
         monkeypatch.delenv("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT", raising=False)
@@ -104,9 +118,11 @@ class TestBuildPerOpSemaphores:
         monkeypatch.delenv("HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT", raising=False)
         result = llm_wrapper._build_per_op_semaphores()
         assert set(result.keys()) == {"retain", "reflect"}
-        # asyncio.Semaphore's internal counter is _value; assert it matches.
-        assert result["retain"]._value == 2
-        assert result["reflect"]._value == 3
+        # These are CrossLoopSemaphores (process-wide caps usable from several event
+        # loops), which expose the configured cap as a public property rather than
+        # requiring a peek at asyncio.Semaphore's private _value.
+        assert result["retain"].capacity == 2
+        assert result["reflect"].capacity == 3
 
     def test_empty_string_treated_as_unset(self, monkeypatch):
         monkeypatch.setenv("HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT", "")
@@ -295,7 +311,7 @@ class TestSemaphoreEnforcement:
                 provider.call(messages=[{"role": "user", "content": "unrelated"}], scope="retain"),
                 timeout=0.5,
             )
-            assert await asyncio.wait_for(retrying, timeout=3) == "ok"
+            assert (await asyncio.wait_for(retrying, timeout=3)).content == "ok"
 
         assert events == ["retrying-attempt-1", "unrelated", "retrying"]
 
@@ -379,7 +395,7 @@ class TestSemaphoreEnforcement:
             assert holder.stage == "llm.openai.retain.attempt=1/2.backoff", (
                 "backoff sleep must be visible in the stage while no permit is held"
             )
-            assert await asyncio.wait_for(task, timeout=3) == "ok"
+            assert (await asyncio.wait_for(task, timeout=3)).content == "ok"
 
     @pytest.mark.asyncio
     async def test_per_op_composes_with_global(self):

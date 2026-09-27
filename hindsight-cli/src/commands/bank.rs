@@ -36,6 +36,35 @@ pub fn list(client: &ApiClient, verbose: bool, output_format: OutputFormat) -> R
     }
 }
 
+/// Read a bank's disposition traits and mission out of its configuration.
+///
+/// The display name is not configuration, so it comes from the bank listing.
+fn load_disposition(
+    client: &ApiClient,
+    bank_id: &str,
+    verbose: bool,
+) -> Result<ui::DispositionView> {
+    let config = client.get_bank_config(bank_id, verbose)?.config;
+    let trait_value = |key: &str| config.get(key).and_then(|v| v.as_i64()).unwrap_or(3);
+    let name = client
+        .find_bank(bank_id, verbose)
+        .ok()
+        .and_then(|bank| bank.name)
+        .unwrap_or_else(|| bank_id.to_string());
+    Ok(ui::DispositionView {
+        bank_id: bank_id.to_string(),
+        name,
+        mission: config
+            .get("reflect_mission")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        skepticism: trait_value("disposition_skepticism"),
+        literalism: trait_value("disposition_literalism"),
+        empathy: trait_value("disposition_empathy"),
+    })
+}
+
 pub fn disposition(
     client: &ApiClient,
     bank_id: &str,
@@ -48,7 +77,7 @@ pub fn disposition(
         None
     };
 
-    let response = client.get_profile(bank_id, verbose);
+    let response = load_disposition(client, bank_id, verbose);
 
     if let Some(mut sp) = spinner {
         sp.finish();
@@ -211,58 +240,6 @@ pub fn update_name(
     }
 }
 
-pub fn update_background(
-    client: &ApiClient,
-    bank_id: &str,
-    content: &str,
-    no_update_disposition: bool,
-    verbose: bool,
-    output_format: OutputFormat,
-) -> Result<()> {
-    let current_profile = if !no_update_disposition {
-        client.get_profile(bank_id, verbose).ok()
-    } else {
-        None
-    };
-
-    let spinner = if output_format == OutputFormat::Pretty {
-        Some(ui::create_spinner("Merging background..."))
-    } else {
-        None
-    };
-
-    let response = client.add_background(bank_id, content, !no_update_disposition, verbose);
-
-    if let Some(mut sp) = spinner {
-        sp.finish();
-    }
-
-    match response {
-        Ok(profile) => {
-            if output_format == OutputFormat::Pretty {
-                ui::print_success("Background updated successfully");
-                println!("\n{}", profile.mission);
-
-                if !no_update_disposition {
-                    if let (Some(old_p), Some(new_p)) = (
-                        current_profile.as_ref().map(|p| p.disposition.clone()),
-                        &profile.disposition,
-                    ) {
-                        println!("\nDisposition changes:");
-                        println!("  Skepticism:  {} → {}", old_p.skepticism, new_p.skepticism);
-                        println!("  Literalism:  {} → {}", old_p.literalism, new_p.literalism);
-                        println!("  Empathy:     {} → {}", old_p.empathy, new_p.empathy);
-                    }
-                }
-            } else {
-                output::print_output(&profile, output_format)?;
-            }
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
-
 /// Set bank mission
 pub fn mission(
     client: &ApiClient,
@@ -348,7 +325,7 @@ pub fn create(
             if output_format == OutputFormat::Pretty {
                 ui::print_success(&format!("Bank '{}' created successfully", bank_id));
                 println!();
-                ui::print_disposition(&profile);
+                ui::print_disposition(&(&profile).into());
             } else {
                 output::print_output(&profile, output_format)?;
             }
@@ -417,7 +394,7 @@ pub fn update(
             if output_format == OutputFormat::Pretty {
                 ui::print_success(&format!("Bank '{}' updated successfully", bank_id));
                 println!();
-                ui::print_disposition(&profile);
+                ui::print_disposition(&(&profile).into());
             } else {
                 output::print_output(&profile, output_format)?;
             }
@@ -469,15 +446,15 @@ pub fn graph(
                 if !result.nodes.is_empty() {
                     println!("{}", ui::gradient_text("─── Sample Nodes ───"));
                     for node in result.nodes.iter().take(5) {
-                        let fact_type = node
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let id = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        println!("  {} [{}]", ui::dim(id), fact_type);
-                        if let Some(text) = node.get("text").and_then(|v| v.as_str()) {
-                            let preview: String = text.chars().take(60).collect();
-                            let ellipsis = if text.len() > 60 { "..." } else { "" };
+                        // The graph wraps every node in a Cytoscape `data` envelope, and it
+                        // carries no fact type — the old lookups (`node["type"]`,
+                        // `node["id"]`) read the envelope, so this always printed
+                        // "unknown [unknown]" with no text.
+                        let data = &node.data;
+                        println!("  {}", ui::dim(&data.id));
+                        if !data.text.is_empty() {
+                            let preview: String = data.text.chars().take(60).collect();
+                            let ellipsis = if data.text.len() > 60 { "..." } else { "" };
                             println!("    {}{}", preview, ellipsis);
                         }
                     }
@@ -555,6 +532,120 @@ pub fn delete(
         }
         Err(e) => Err(e),
     }
+}
+
+/// List the extra ids a bank answers to
+pub fn alias_list(
+    client: &ApiClient,
+    bank_id: &str,
+    verbose: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let result = client.list_bank_aliases(bank_id, verbose)?;
+
+    if output_format == OutputFormat::Pretty {
+        // `result.bank_id` rather than the argument: the request may have been made
+        // through one of the aliases, and the response names the bank it reached.
+        if result.aliases.is_empty() {
+            ui::print_info(&format!(
+                "Bank '{}' has no aliases; it is reachable only by its own id",
+                result.bank_id
+            ));
+        } else {
+            println!("Aliases that also reach '{}':", result.bank_id);
+            for entry in &result.aliases {
+                // Marked rather than listed separately: the primary one is still an
+                // ordinary alias, it is just the one the UI shows in place of the id.
+                let marker = if entry.primary { "  (shown)" } else { "" };
+                println!("  {}{}", entry.alias, marker);
+            }
+        }
+    } else {
+        output::print_output(&result, output_format)?;
+    }
+    Ok(())
+}
+
+/// Add an id that also reaches this bank
+pub fn alias_add(
+    client: &ApiClient,
+    bank_id: &str,
+    alias: &str,
+    verbose: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let result = client.create_bank_alias(bank_id, alias, verbose)?;
+
+    if output_format == OutputFormat::Pretty {
+        ui::print_success(&format!("'{}' now reaches bank '{}'", alias, result.bank_id));
+    } else {
+        output::print_output(&result, output_format)?;
+    }
+    Ok(())
+}
+
+/// Show this bank under one of its aliases
+pub fn alias_primary(
+    client: &ApiClient,
+    bank_id: &str,
+    alias: &str,
+    primary: bool,
+    verbose: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let result = client.set_bank_alias_primary(bank_id, alias, primary, verbose)?;
+
+    if output_format == OutputFormat::Pretty {
+        // Say what did NOT change as well: the point of the flag is that it is
+        // cosmetic, and an operator reading this needs to know the id everything
+        // else still uses.
+        if primary {
+            ui::print_success(&format!(
+                "Bank '{}' is now shown as '{}' (its id is still '{}')",
+                result.bank_id, alias, result.bank_id
+            ));
+        } else {
+            ui::print_success(&format!("Bank '{}' is shown under its own id again", result.bank_id));
+        }
+    } else {
+        output::print_output(&result, output_format)?;
+    }
+    Ok(())
+}
+
+/// Stop an id reaching this bank
+pub fn alias_remove(
+    client: &ApiClient,
+    bank_id: &str,
+    alias: &str,
+    yes: bool,
+    verbose: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
+    // Prompted like `bank delete` even though nothing is destroyed here: the id stops
+    // routing the moment this commits, so anything still calling it starts failing.
+    if !yes && output_format == OutputFormat::Pretty {
+        let message = format!(
+            "Remove alias '{}'? Every client still calling it will stop reaching bank '{}'.",
+            alias, bank_id
+        );
+        if !ui::prompt_confirmation(&message)? {
+            ui::print_info("Operation cancelled");
+            return Ok(());
+        }
+    }
+
+    let result = client.delete_bank_alias(bank_id, alias, verbose)?;
+
+    if output_format == OutputFormat::Pretty {
+        ui::print_success(&format!(
+            "'{}' no longer reaches bank '{}'",
+            alias, result.bank_id
+        ));
+    } else {
+        output::print_output(&result, output_format)?;
+    }
+    Ok(())
 }
 
 /// Trigger consolidation to create/update observations
@@ -967,7 +1058,7 @@ pub fn reset_config(
     }
 }
 
-/// Set disposition traits (skepticism, literalism, empathy) via PUT /profile
+/// Set disposition traits (skepticism, literalism, empathy) as bank configuration
 pub fn set_disposition(
     client: &ApiClient,
     bank_id: &str,
@@ -983,14 +1074,14 @@ pub fn set_disposition(
         None
     };
 
-    let response =
-        client.update_bank_disposition(bank_id, skepticism, literalism, empathy, verbose);
+    let response = client.set_bank_disposition(bank_id, skepticism, literalism, empathy, verbose);
 
     if let Some(mut sp) = spinner {
         sp.finish();
     }
 
-    let profile = response?;
+    response?;
+    let profile = load_disposition(client, bank_id, verbose)?;
     if output_format == OutputFormat::Pretty {
         ui::print_success(&format!("Disposition updated for bank '{}'", bank_id));
         ui::print_disposition(&profile);

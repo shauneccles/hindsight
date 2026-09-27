@@ -21,7 +21,7 @@ import pytest
 from hindsight_api.config import clear_config_cache
 from tests.sub_batch_helpers import collect_sub_batches
 from hindsight_api.engine.response_models import TokenUsage
-from hindsight_api.engine.retain.types import ChunkMetadata, ExtractedFact, RetainContent
+from hindsight_api.engine.retain.types import ChunkMetadata, ExtractedFact, ExtractionResult, RetainContent
 
 
 def _ts() -> float:
@@ -199,7 +199,7 @@ async def test_append_after_zero_fact_header_slice_skips_unchanged_history(
         contents: list[RetainContent],
         *args: Any,
         **kwargs: Any,
-    ) -> tuple[list[ExtractedFact], list[ChunkMetadata], TokenUsage]:
+    ) -> ExtractionResult:
         extracted_contents.extend(item.content for item in contents)
         facts: list[ExtractedFact] = []
         chunks: list[ChunkMetadata] = []
@@ -224,18 +224,18 @@ async def test_append_after_zero_fact_header_slice_skips_unchanged_history(
                         tags=item.tags,
                     )
                 )
-        return facts, chunks, TokenUsage()
+        return ExtractionResult(facts, chunks, TokenUsage())
 
     monkeypatch.setattr(
         fact_extraction,
         "extract_facts_from_contents",
         _record_extraction,
     )
-    monkeypatch.setattr(
-        memory.embeddings,
-        "encode_documents",
-        lambda texts: [[0.0] * memory.embeddings.dimension for _ in texts],
-    )
+
+    async def _zero_vectors(texts: list[str]) -> list[list[float]]:
+        return [[0.0] * memory.embeddings.dimension for _ in texts]
+
+    monkeypatch.setattr(memory.embeddings, "encode_documents", _zero_vectors)
 
     try:
         await memory.retain_async(

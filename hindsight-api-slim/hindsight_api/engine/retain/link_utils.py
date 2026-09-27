@@ -6,7 +6,9 @@ import logging
 import re
 import time
 from collections.abc import Sequence
-from datetime import UTC
+from datetime import UTC, datetime
+
+import numpy as np
 
 from ..._vector_index import ann_search_tuning_settings, configured_vector_extension
 from ..causal_links import (
@@ -30,6 +32,21 @@ _NIL_ENTITY_UUID = "00000000-0000-0000-0000-000000000000"
 # Any run of whitespace, including the \n / \r / \t that extraction sometimes
 # leaves inside a candidate entity name.
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+# Longest candidate entity name intake will accept. `entities.canonical_name` is
+# unbounded TEXT, but `idx_entities_bank_name` is a btree on (bank_id,
+# canonical_name) and a btree tuple cannot exceed ~2704 bytes, so a longer name
+# fails the INSERT with ProgramLimitExceededError — and takes the whole retain
+# with it, not just the one entity. 512 characters stays under that limit even at
+# 4 bytes per character plus a long bank_id. Real names never get close: on a
+# production bank set of ~11M entities the median was 13 characters and p99.9 was
+# 96; everything past a few hundred was an extraction artifact — SVG path data,
+# base64, a fragment of serialized JSON.
+# This cap counts characters, which is what the PostgreSQL btree needs. Oracle
+# declares canonical_name as VARCHAR2(512) — byte-counted — so a multibyte name
+# under this cap can still be rejected there; that is a narrower, pre-existing
+# limit of the Oracle schema, not something this cap is sized for.
+_MAX_ENTITY_NAME_CHARS = 512
 
 
 def _normalize_entity_name(name: str) -> str:
@@ -60,6 +77,11 @@ def _entity_resolve_flag(ent) -> bool:
 # more is wasted storage and write amplification.
 MAX_TEMPORAL_LINKS_PER_UNIT = 20
 
+# Rows of the within-batch similarity matrix computed per BLAS call. The transient
+# is (block_rows x n) floats, so this trades peak bytes against call overhead —
+# 256 rows is ~74 MB at the 36K facts a delta retain can hand over in one batch.
+_SEMANTIC_WITHIN_BATCH_BLOCK_ROWS = 256
+
 
 def _cap_links_per_unit(links: list[tuple], max_per_unit: int = MAX_TEMPORAL_LINKS_PER_UNIT) -> list[tuple]:
     """Keep only the top-N links per from_unit_id, ranked by weight descending.
@@ -89,6 +111,70 @@ def _cap_links_per_unit(links: list[tuple], max_per_unit: int = MAX_TEMPORAL_LIN
         result.extend(group_links[:max_per_unit])
 
     return result
+
+
+def _within_batch_temporal_links(
+    new_units: dict[str, tuple[datetime | None, str]],
+    time_window_hours: int,
+    max_per_unit: int = MAX_TEMPORAL_LINKS_PER_UNIT,
+) -> list[tuple]:
+    """Temporal links among the units of one batch, bounded to ``2 * max_per_unit`` each.
+
+    These are the pairs ``_cap_links_per_unit`` would have kept from an all-pairs
+    sweep, without materialising the pairs it would have thrown away.
+
+    Every same-``fact_type`` pair inside the window used to be appended before the
+    cap ran, so a batch carrying n same-day facts of one type built n*(n-1) tuples
+    in order to keep 20 per unit. That is merely wasteful at the ~1.7K facts a
+    streaming sub-batch holds (~600 MB, against a 128 MB budget) and fatal on a
+    delta, which hands over a whole document's changed chunks at once: 36K facts is
+    1.3 billion tuples, and the worker is OOM-killed inside the loop (#3848).
+
+    The cap is recoverable from a bounded candidate set because ``weight`` is a
+    non-increasing function of the gap: the top ``max_per_unit`` by weight ARE the
+    ``max_per_unit`` nearest in time. Sorting each fact_type group by event_date and
+    walking only the next ``max_per_unit`` entries therefore hands every unit its
+    nearest successors directly, and its nearest predecessors through the reverse
+    link each earlier unit writes — the ``2 * max_per_unit`` nearest overall, which
+    contains the ``max_per_unit`` the cap is about to choose.
+
+    Two consequences worth stating rather than discovering:
+
+    - The per-unit budget is spent on candidates, not enforced during generation.
+      Counting a unit's links as they are appended looks like a tighter bound and
+      is a worse one: the reverse links land first, so a unit hits the cap before
+      its own turn comes and keeps only predecessors — a graph biased to point
+      backwards, where the cap picks the nearest in both directions.
+    - Weight ties resolve differently than they did. Any gap past ~16.8h clamps to
+      0.3, so a unit with more than ``max_per_unit`` distant neighbours has more
+      tied candidates than places; which ones survived was already decided by dict
+      order, and is now decided by proximity.
+
+    The break is safe for the same reason the window is: the group is sorted, so
+    once a successor falls outside the window every later one does too.
+    """
+    by_fact_type: dict[str, list[tuple[str, datetime]]] = {}
+    for unit_id, (event_date, fact_type) in new_units.items():
+        if event_date is None:
+            continue  # Skip units without event_date for temporal linking
+        by_fact_type.setdefault(fact_type, []).append((unit_id, _normalize_datetime(event_date)))
+
+    links: list[tuple] = []
+    for group in by_fact_type.values():
+        if len(group) < 2:
+            continue
+        # Stable, so units sharing an event_date keep the order they were inserted in.
+        group.sort(key=lambda entry: entry[1])
+        for i, (unit_id, event_date_norm) in enumerate(group):
+            for other_id, other_event_date_norm in group[i + 1 : i + 1 + max_per_unit]:
+                time_diff_hours = (other_event_date_norm - event_date_norm).total_seconds() / 3600
+                if time_diff_hours > time_window_hours:
+                    break
+                weight = max(0.3, 1.0 - (time_diff_hours / time_window_hours))
+                # Create bidirectional links
+                links.append((unit_id, other_id, "temporal", weight, None))
+                links.append((other_id, unit_id, "temporal", weight, None))
+    return links
 
 
 def _lock_order_key(lnk: tuple) -> tuple[str, str, str, str]:
@@ -206,6 +292,8 @@ def _prepare_entities_for_resolution(
     Candidate names are whitespace-normalized here (see ``_normalize_entity_name``)
     and names that are empty afterwards are dropped, so no downstream stage has to
     cope with an entity whose canonical name is blank or spans several lines.
+    Names longer than ``_MAX_ENTITY_NAME_CHARS`` are dropped too: they are always
+    extraction artifacts, and storing one fails the retain on the btree index.
     Both happen before the flat list and ``entity_to_unit`` are derived, keeping
     the resolver's positional invariant (output index-aligned with input) intact.
 
@@ -218,6 +306,7 @@ def _prepare_entities_for_resolution(
     substep_start = time.time()
     all_entities = []
     dropped_empty = 0
+    dropped_oversized = 0
     for entity_list in llm_entities:
         formatted_entities = []
         # Normalization can make two candidates that reached here as distinct
@@ -241,6 +330,12 @@ def _prepare_entities_for_resolution(
                 # guard of its own.
                 dropped_empty += 1
                 continue
+            if len(normalized_text) > _MAX_ENTITY_NAME_CHARS:
+                # Dropped rather than truncated: a truncated SVG path or base64 run
+                # would become a real registry entity that is trigram-indexed and can
+                # fuzzy-merge with other truncated junk. The fact itself still retains.
+                dropped_oversized += 1
+                continue
 
             resolve = _entity_resolve_flag(ent)
             kept = seen_in_fact.get(normalized_text.lower())
@@ -262,6 +357,13 @@ def _prepare_entities_for_resolution(
             log_buffer,
             f"  [6.1] Dropped {dropped_empty} empty candidate entity name(s)",
             level="debug",
+        )
+    if dropped_oversized:
+        _log(
+            log_buffer,
+            f"  [6.1] Dropped {dropped_oversized} candidate entity name(s) longer than "
+            f"{_MAX_ENTITY_NAME_CHARS} characters",
+            level="warning",
         )
 
     total_entities = sum(len(ents) for ents in all_entities)
@@ -476,29 +578,7 @@ async def create_temporal_links_batch_per_fact(
 
         # Also compute temporal links WITHIN the new batch (new units to each other)
         if len(new_units) > 1:
-            # Convert new_units dict to candidate format for within-batch linking
-            new_unit_items = list(new_units.items())
-            for i, (unit_id, (event_date, fact_type)) in enumerate(new_unit_items):
-                if event_date is None:
-                    continue  # Skip units without event_date for temporal linking
-                unit_event_date_norm = _normalize_datetime(event_date)
-
-                # Compare with other new units (only those after this one to avoid duplicates)
-                for j in range(i + 1, len(new_unit_items)):
-                    other_id, (other_event_date, other_fact_type) = new_unit_items[j]
-                    if other_event_date is None:
-                        continue  # Skip units without event_date
-                    if fact_type != other_fact_type:
-                        continue  # Only link facts of the same type
-                    other_event_date_norm = _normalize_datetime(other_event_date)
-
-                    # Check if within time window
-                    time_diff_hours = abs((unit_event_date_norm - other_event_date_norm).total_seconds() / 3600)
-                    if time_diff_hours <= time_window_hours:
-                        weight = max(0.3, 1.0 - (time_diff_hours / time_window_hours))
-                        # Create bidirectional links
-                        links.append((unit_id, other_id, "temporal", weight, None))
-                        links.append((other_id, unit_id, "temporal", weight, None))
+            links.extend(_within_batch_temporal_links(new_units, time_window_hours))
 
         # Cap temporal links per unit to avoid write amplification;
         # retrieval only reads top 10-20 per unit anyway.
@@ -694,37 +774,81 @@ def compute_semantic_links_within_batch(
     if len(unit_ids) < 2:
         return []
 
-    import numpy as np
-
+    n_units = len(unit_ids)
     links = []
-    new_embeddings_matrix = np.asarray(embeddings, dtype=float)
-    norms = np.linalg.norm(new_embeddings_matrix, axis=1)
-    valid_embeddings = np.isfinite(new_embeddings_matrix).all(axis=1) & np.isfinite(norms) & (norms > 0)
-    normalized_embeddings = np.zeros_like(new_embeddings_matrix)
-    normalized_embeddings[valid_embeddings] = (
-        new_embeddings_matrix[valid_embeddings] / norms[valid_embeddings, np.newaxis]
+    # float32, not float64: `PackedEmbedding` is already `array("f")` and pgvector's `vector`
+    # column stores float32, so the doubles the old `dtype=float` produced were padding that
+    # nothing downstream could use -- they only doubled the working set and pushed BLAS off
+    # SGEMM onto DGEMM. `np.array` (not `asarray`) because this buffer is normalised in place
+    # below and must not alias an ndarray the caller still owns.
+    normalized_embeddings = np.array(embeddings, dtype=np.float32)
+    # Accumulate the norms in float64. The vectors are float32, but summing 1536 squares in
+    # float32 overflows to inf above ~1e19 and flushes to zero below ~1e-22, which would drop
+    # those rows as "invalid" when float64 handled them fine. `einsum` keeps the wide
+    # accumulator without materialising an (n, dim) float64 copy of the batch.
+    norms = np.sqrt(np.einsum("ij,ij->i", normalized_embeddings, normalized_embeddings, dtype=np.float64))
+    # A non-finite component poisons its own row norm, so the norm check alone catches NaN and
+    # inf rows -- no need for an (n, dim) `isfinite` mask over the whole batch.
+    valid_embeddings = np.isfinite(norms) & (norms > 0)
+    np.divide(
+        normalized_embeddings,
+        norms[:, np.newaxis].astype(np.float32),
+        out=normalized_embeddings,
+        where=valid_embeddings[:, np.newaxis],
     )
+    normalized_embeddings[~valid_embeddings] = 0.0
 
-    for i, unit_id in enumerate(unit_ids):
-        if not valid_embeddings[i]:
-            continue
+    # One matrix product per block of rows, rather than one per unit against a
+    # freshly gathered copy of every other unit. `normalized[others]` is advanced
+    # indexing, so each of the n iterations it used to run allocated and filled an
+    # (n-1, dim) array: at the 36K facts a delta retain can hand over in one batch
+    # that is a 110 MB memcpy done 36,000 times, several minutes of a synchronous
+    # call with the event loop blocked behind it (#3848). The work is the same
+    # O(n^2 * dim) dot products either way; this hands them to BLAS in one call and
+    # keeps the transient at one block of similarity rows.
+    block_rows = _SEMANTIC_WITHIN_BATCH_BLOCK_ROWS
+    # One (block_rows, n) buffer for the whole sweep. At 36K facts each block of
+    # similarities is 37 MB, and allocating and freeing that once per block is churn
+    # the allocator does not need to see.
+    similarity_buffer = np.empty((min(block_rows, n_units), n_units), dtype=np.float32)
+    invalid_columns = np.flatnonzero(~valid_embeddings)
+    for start in range(0, n_units, block_rows):
+        stop = min(start + block_rows, n_units)
+        block_similarities = similarity_buffer[: stop - start]
+        np.matmul(normalized_embeddings[start:stop], normalized_embeddings.T, out=block_similarities)
+        # A unit with an unusable embedding is neither a source nor a target.
+        if invalid_columns.size:
+            block_similarities[:, invalid_columns] = -np.inf
+        # Never link a unit to itself: row `i` of the block is unit `start + i`.
+        diagonal = np.arange(stop - start)
+        block_similarities[diagonal, start + diagonal] = -np.inf
 
-        other_indices = [j for j in range(len(unit_ids)) if j != i]
-        if not other_indices:
-            continue
+        for local_index, unit_index in enumerate(range(start, stop)):
+            if not valid_embeddings[unit_index]:
+                continue
 
-        other_embeddings = normalized_embeddings[other_indices]
-        similarities = np.dot(other_embeddings, normalized_embeddings[i])
-        similarities[~valid_embeddings[other_indices]] = -np.inf
+            similarities = block_similarities[local_index]
+            above_threshold = np.where(similarities >= threshold)[0]
+            candidate_count = len(above_threshold)
+            if candidate_count == 0:
+                continue
 
-        above_threshold = np.where(similarities >= threshold)[0]
-        if len(above_threshold) > 0:
-            sorted_local_indices = above_threshold[np.argsort(-similarities[above_threshold])][:top_k]
-            for local_idx in sorted_local_indices:
-                other_idx = other_indices[local_idx]
-                other_id = unit_ids[other_idx]
-                similarity = float(min(1.0, max(0.0, similarities[local_idx])))
-                links.append((unit_id, other_id, "semantic", similarity, None))
+            if candidate_count > top_k:
+                # Introselect the top k in O(candidates), then sort only those k, rather
+                # than sorting every candidate to throw all but k of them away.
+                candidate_scores = -similarities[above_threshold]
+                top_partition = np.argpartition(candidate_scores, top_k)[:top_k]
+                neighbours = above_threshold[top_partition[np.argsort(candidate_scores[top_partition])]]
+            elif candidate_count > 1:
+                neighbours = above_threshold[np.argsort(-similarities[above_threshold])]
+            else:
+                neighbours = above_threshold
+
+            from_id = unit_ids[unit_index]
+            # One C-level pass to clamp and unbox, instead of boxing each score on its own.
+            scores = np.clip(similarities[neighbours], 0.0, 1.0).tolist()
+            for other_index, similarity in zip(neighbours, scores):
+                links.append((from_id, unit_ids[other_index], "semantic", similarity, None))
 
     return links
 

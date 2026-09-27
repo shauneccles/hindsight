@@ -36,7 +36,10 @@ hindsight memory reflect my-bank "What do you know about Alice?"
 ### Go
 
 ```go
-# Section 'reflect-basic' not found in api/reflect.go
+client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query: "What should I know about Alice?",
+	}).Execute()
 ```
 
 ---
@@ -79,7 +82,12 @@ hindsight memory reflect my-bank "Summarize my week" --budget high --max-tokens 
 ### Go
 
 ```go
-# Section 'reflect-with-params' not found in api/reflect.go
+budgetMid := hindsight.MID
+client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query:  "We're considering a hybrid work policy. What do you think about remote work?",
+		Budget: &budgetMid,
+	}).Execute()
 ```
 
 ### max_tokens
@@ -169,7 +177,29 @@ rm -f schema.json
 ### Go
 
 ```go
-# Section 'reflect-structured-output' not found in api/reflect.go
+// Define JSON schema for structured output
+responseSchema := map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"recommendation": map[string]interface{}{"type": "string"},
+		"confidence":     map[string]interface{}{"type": "string", "enum": []string{"low", "medium", "high"}},
+		"key_factors":    map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+		"risks":          map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+	},
+	"required": []string{"recommendation", "confidence", "key_factors"},
+}
+
+structuredResponse, _, _ := client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query:          "Should we hire Alice for the ML team lead position?",
+		ResponseSchema: responseSchema,
+	}).Execute()
+
+// Access structured output
+if out := structuredResponse.GetStructuredOutput(); out != nil {
+	fmt.Println("Recommendation:", out["recommendation"])
+	fmt.Println("Key factors:", out["key_factors"])
+}
 ```
 
 ### tags
@@ -194,6 +224,10 @@ whenever a tag scope is supplied, including with a strict or exact match.
 | Non-empty `tags`, `any_strict` or `all_strict` | Matching tagged data only | Matching tagged models only | Matching tagged directives plus untagged/global directives |
 | Non-empty `tags`, `exact` | Data with exactly the requested tag set | Models with exactly the requested tag set | Exactly matching tagged directives plus untagged/global directives |
 | Non-empty `tag_groups`, default top-level `tags_match` | Data matching the compound expression | Models matching the compound expression | Matching tagged directives plus untagged/global directives |
+
+A `tag_groups` leaf may set `resolve: "fuzzy"`, as in
+[recall](./recall#fuzzy-leaves); reflect resolves it once, before the agentic
+loop starts, so every tool it runs filters on the same tags.
 
 The first row is intentionally asymmetric: an unscoped reflect can search all
 memories, but it does not load tagged directives. To create a directive that
@@ -243,7 +277,14 @@ hindsight memory reflect my-bank "What feedback did the user give?" \
 ### Go
 
 ```go
-# Section 'reflect-with-tags' not found in api/reflect.go
+// Filter reflection to only consider memories for a specific user
+tagsMatch := "any_strict"
+client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query:     "What does this user think about our product?",
+		Tags:      []string{"user:alice"},
+		TagsMatch: &tagsMatch,
+	}).Execute()
 ```
 
 #### Common scope examples
@@ -338,12 +379,48 @@ hindsight memory reflect my-bank "Tell me about Alice" --include-facts
 ### Go
 
 ```go
-# Section 'reflect-sources' not found in api/reflect.go
+// include.facts enables the based_on field in the response
+sourcesResponse, _, _ := client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query: "Tell me about Alice",
+		Include: &hindsight.ReflectIncludeOptions{
+			Facts: map[string]interface{}{}, // empty map enables fact inclusion
+		},
+	}).Execute()
+
+fmt.Println("Response:", sourcesResponse.GetText())
+fmt.Println("\nBased on:")
+if basedOn := sourcesResponse.GetBasedOn(); basedOn.Memories != nil {
+	for _, fact := range basedOn.GetMemories() {
+		fmt.Printf("  - [%s] %s\n", fact.GetType(), fact.GetText())
+	}
+}
 ```
 
 #### include.tool_calls
 
 When enabled, the response includes a `trace` object with the full execution log of every tool call and LLM call made during the agentic loop, including inputs, outputs, and durations. Set `output: false` to include only tool inputs for a smaller payload. Useful for debugging why the agent reached a particular conclusion.
+
+### reflect_search_observations_max_tokens
+
+Token budget for the agent's `search_observations` tool when the model names no
+budget of its own. Observation evidence is often the largest single contributor
+to the reflect context on a big bank, so lowering this trades the lowest-ranked
+observations for a smaller (cheaper, faster) LLM context. Defaults to `5000`.
+
+### reflect_search_observations_include_entities
+
+Whether `search_observations` attaches resolved entity names to each
+observation. They are useful when the surface text uses an alias ("Bob" for
+canonical "Robert Smith"), but they can be more than half the serialized tool
+payload; setting `false` keeps the same observations and ranking with a much
+smaller context. Defaults to `true`.
+
+Both options can be defaulted for a whole bank with the
+`reflect_default_options` config key (see
+[Configuration](../configuration.mdx)), and set per mental model through the
+refresh trigger's fields of the same name. An explicit value on the request
+always wins.
 
 ---
 
@@ -356,6 +433,10 @@ The synthesized answer as a well-formatted markdown string. This is the primary 
 ### structured_output
 
 The LLM's response parsed according to the `response_schema` provided in the request. Only present when `response_schema` was set. `null` otherwise.
+
+### structured_output_error
+
+Why the structured view could not be produced. Present only when a `response_schema` was given and the extraction pass failed — a provider error, a timeout, or output that would not parse. The reflect itself still succeeds: you get `200` and the markdown `text`, and this field tells you the machine-readable half is missing because something broke, not because the answer held nothing matching your schema. A missing `structured_output` **without** this field is the latter, ordinary case (the endpoint omits null fields). Treat its presence as retryable, and as the signal to alert on if structured output stops working.
 
 ### based_on
 
@@ -375,3 +456,16 @@ The full execution log of the agentic loop. Only present when `include.tool_call
 
 - `tool_calls` — each tool invocation with `tool` name (`lookup`, `recall`, `learn`, `expand`), `input`, `output` (if `output: true`), `duration_ms`, and `iteration` number.
 - `llm_calls` — each LLM call with `scope` (e.g., `"agent_1"`, `"final"`) and `duration_ms`.
+
+## When Reflect Fails
+
+Reflect answers from evidence it gathered, so a run that could not gather it does not answer at all — it fails with a **500**, rather than returning a confident reply built on nothing:
+
+- **A retrieval tool raised.** The database, the embedder or the reranker was unavailable. One failure in a batch fails the run: an answer written around a tool that never returned is indistinguishable from one over a bank that genuinely holds nothing on the topic, and callers store it as a real answer.
+- **The model produced no answer.** The `done` call arrived empty, or the final synthesis returned nothing.
+- **The model or transport cannot drive tool calls.** Reflect is driven entirely by structured tool calls; a transport that silently drops the tool definitions fails loudly so you can switch to a tool-calling-capable model.
+- **The provider kept failing.** A non-context-overflow LLM error is retried once inside the loop and then given up on.
+
+A **successful retrieval that returns nothing is not a failure**: the bank genuinely has nothing on the topic, and reflect says so in its answer.
+
+Two cases are deliberately not failures. A run whose *context window* overflows synthesizes from the evidence it has — the prompt was too big for the model, which is a budgeting problem, not a broken dependency. And a tool call the model got *wrong* — a missing argument, a tool that does not exist — is returned to it as an error to fix, not raised.

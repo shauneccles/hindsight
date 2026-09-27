@@ -9,9 +9,10 @@ multiple API servers.
 """
 
 import asyncio
+import copy
 import json
 import logging
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
@@ -23,12 +24,15 @@ from hindsight_api.config import (
     normalize_config_dict,
     validate_retain_chunking_config,
     validate_retain_completion_token_budget,
+    validate_retain_image_chunking_config,
 )
 from hindsight_api.engine.memory_engine import fq_table
 from hindsight_api.extensions.tenant import TenantExtension
 from hindsight_api.models import RequestContext
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
+
     from hindsight_api.engine.db.base import DatabaseBackend
 
 logger = logging.getLogger(__name__)
@@ -77,7 +81,21 @@ class ValidatedBankConfigUpdate:
     """
 
     updates: dict[str, Any]
-    parent_config: dict[str, Any] | None = None
+    parent_config: HindsightConfig | None = None
+
+
+def _detached(value: Any) -> Any:
+    """Copy container values on their way out of a config object.
+
+    Config reads used to go through ``asdict()``, which deep-copied everything, so a
+    caller could edit the dict it got back. Reading fields straight off the object is
+    ~100x cheaper but hands out the process-global config's own lists and dicts, so
+    copy those few (``retain_strategies``, ``memory_defense``, ``entity_labels``, ...).
+    Scalars and strings are immutable and pass through untouched.
+    """
+    if isinstance(value, dict | list):
+        return copy.deepcopy(value)
+    return value
 
 
 def _validate_retain_strategy_chunking(base_config: HindsightConfig, strategies: Any) -> None:
@@ -97,6 +115,9 @@ def _validate_retain_strategy_chunking(base_config: HindsightConfig, strategies:
                 resolved.retain_chunk_size,
                 resolved.retain_structured_chunk_size,
             )
+            validate_retain_image_chunking_config(
+                resolved.retain_max_attachments_per_chunk,
+            )
             validate_retain_completion_token_budget(
                 llm_provider=resolved.llm_provider,
                 retain_max_completion_tokens=resolved.retain_max_completion_tokens,
@@ -110,7 +131,7 @@ def _validate_retain_strategy_chunking(base_config: HindsightConfig, strategies:
 
 
 def _validate_projected_bank_config(
-    parent_config: dict[str, Any],
+    parent_config: HindsightConfig,
     current_overrides: dict[str, Any],
     normalized_updates: dict[str, Any],
     configurable_fields: set[str],
@@ -130,10 +151,13 @@ def _validate_projected_bank_config(
         else:
             projected[key] = value
 
-    base_config = HindsightConfig(**{**parent_config, **projected})
+    base_config = replace(parent_config, **projected) if projected else parent_config
     validate_retain_chunking_config(
         base_config.retain_chunk_size,
         base_config.retain_structured_chunk_size,
+    )
+    validate_retain_image_chunking_config(
+        base_config.retain_max_attachments_per_chunk,
     )
     _validate_retain_strategy_chunking(base_config, base_config.retain_strategies)
     _validate_recall_budget_bounds(base_config.recall_budget_min, base_config.recall_budget_max)
@@ -155,28 +179,55 @@ class ConfigResolver:
         self._global_config = _get_raw_config()
         self._configurable_fields = HindsightConfig.get_configurable_fields()
         self._credential_fields = HindsightConfig.get_credential_fields()
+        # The API-visible subset, resolved once: every config read filters to it.
+        self._public_fields = frozenset(self._configurable_fields - self._credential_fields)
 
-    async def _resolve_parent_config_dict(self, bank_id: str, context: RequestContext | None = None) -> dict[str, Any]:
-        """Resolve global + tenant config before bank-level overrides."""
-        config_dict = asdict(self._global_config)
+    async def _resolve_tenant_overrides(self, scope: str, context: RequestContext | None = None) -> dict[str, Any]:
+        """Tenant-level overrides to apply on top of the global config.
 
-        if self.tenant_extension and context:
-            try:
-                tenant_overrides = await self.tenant_extension.get_tenant_config(context)
-                if tenant_overrides:
-                    # Normalize keys and filter to configurable fields only
-                    normalized_tenant = normalize_config_dict(tenant_overrides)
-                    configurable_tenant = {k: v for k, v in normalized_tenant.items() if k in self._configurable_fields}
-                    config_dict.update(configurable_tenant)
-                    logger.debug(
-                        f"Applied tenant config overrides for bank {bank_id}: {list(configurable_tenant.keys())}"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to load tenant config for bank {bank_id}: {e}")
+        Returns only the fields the tenant actually overrides — the global config is
+        the base *object*, not a dict we rebuild per request. ``scope`` names the
+        caller (a bank id, or a description of a bulk resolve) for log messages only;
+        tenant config is per-request, not per-bank.
+        """
+        if not (self.tenant_extension and context):
+            return {}
+        try:
+            tenant_overrides = await self.tenant_extension.get_tenant_config(context)
+        except Exception as e:
+            logger.warning(f"Failed to load tenant config for {scope}: {e}")
+            return {}
+        if not tenant_overrides:
+            return {}
+        # Normalize keys and filter to configurable fields only
+        normalized_tenant = normalize_config_dict(tenant_overrides)
+        configurable_tenant = {k: v for k, v in normalized_tenant.items() if k in self._configurable_fields}
+        if configurable_tenant:
+            logger.debug(f"Applied tenant config overrides for {scope}: {list(configurable_tenant.keys())}")
+        return configurable_tenant
 
-        return config_dict
+    def _with_overrides(self, overrides: dict[str, Any]) -> HindsightConfig:
+        """Global config with ``overrides`` applied, as a fresh object.
 
-    async def resolve_full_config(self, bank_id: str, context: RequestContext | None = None) -> HindsightConfig:
+        ``copy.copy`` rather than ``asdict()`` + ``HindsightConfig(**dict)``: the config
+        has 400+ fields and resolution is per-request, so deep-walking the whole tree to
+        produce what is only ever used as a shallow copy dominated the recall hot path
+        (see #4209). A shallow copy is also *more* correct — ``asdict()`` flattened the
+        nested member dataclasses (``llm_members`` and friends) into plain dicts, which
+        the old code then had to restore field by field.
+
+        Safe because ``HindsightConfig`` is a plain non-frozen dataclass: no
+        ``__post_init__``, no ``init=False`` fields, no ``__slots__``, and no non-field
+        instance attributes. A test pins those properties.
+        """
+        resolved = copy.copy(self._global_config)
+        for key, value in overrides.items():
+            setattr(resolved, key, value)
+        return resolved
+
+    async def resolve_full_config(
+        self, bank_id: str, context: RequestContext | None = None, *, cached: bool = True
+    ) -> HindsightConfig:
         """
         Resolve full HindsightConfig for a bank with hierarchical overrides applied.
 
@@ -195,40 +246,27 @@ class ConfigResolver:
         Returns:
             Complete HindsightConfig with hierarchical overrides applied
         """
-        config_dict = await self._resolve_parent_config_dict(bank_id, context)
+        overrides = await self._resolve_tenant_overrides(f"bank {bank_id}", context)
 
         # Load bank config overrides
-        bank_overrides = await self._load_bank_config(bank_id)
+        bank_overrides = await self._load_bank_config(bank_id, cached=cached)
         if bank_overrides:
-            config_dict.update(bank_overrides)
+            overrides.update(bank_overrides)
             logger.debug(f"Applied bank config overrides for bank {bank_id}: {list(bank_overrides.keys())}")
 
-        # Return full config object (dataclass doesn't have __init__ that accepts kwargs, so we update the object)
-        # Create a new config instance by copying the global config and updating fields
-        resolved_config = HindsightConfig(**config_dict)
-        # Multi-LLM chains and the reranker failover chain are static credential fields
-        # (never tenant/bank-overridable), but asdict() above flattened their member
-        # dataclasses into plain dicts. Restore the original typed objects from the global
-        # config so the resolved object stays well-typed for any consumer that reads them.
-        resolved_config = replace(
-            resolved_config,
-            reranker_members=self._global_config.reranker_members,
-            llm_members=self._global_config.llm_members,
-            llm_strategy=self._global_config.llm_strategy,
-            retain_llm_members=self._global_config.retain_llm_members,
-            retain_llm_strategy=self._global_config.retain_llm_strategy,
-            reflect_llm_members=self._global_config.reflect_llm_members,
-            reflect_llm_strategy=self._global_config.reflect_llm_strategy,
-            consolidation_llm_members=self._global_config.consolidation_llm_members,
-            consolidation_llm_strategy=self._global_config.consolidation_llm_strategy,
-        )
+        resolved_config = self._with_overrides(overrides)
         validate_retain_chunking_config(
             resolved_config.retain_chunk_size,
             resolved_config.retain_structured_chunk_size,
         )
+        validate_retain_image_chunking_config(
+            resolved_config.retain_max_attachments_per_chunk,
+        )
         return resolved_config
 
-    async def get_bank_config(self, bank_id: str, context: RequestContext | None = None) -> dict[str, Any]:
+    async def get_bank_config(
+        self, bank_id: str, context: RequestContext | None = None, *, cached: bool = True
+    ) -> dict[str, Any]:
         """
         Get fully resolved config for a bank (filtered by permissions).
 
@@ -237,8 +275,15 @@ class ConfigResolver:
         2. Tenant config overrides (from TenantExtension.get_tenant_config())
         3. Bank config overrides (from banks.config JSONB)
 
-        Note: Config is resolved on every call (not cached) to ensure consistency
-        across multiple API servers.
+        ``cached`` defaults to True because this is ALSO on the hot path: ``recall_async`` and
+        ``retain_batch_async`` call it per request, and forcing a read there costs a pool acquire
+        each time — which is more than the query it carries, since the pool runs five
+        ``set_config`` calls on checkout.
+
+        The endpoint a user reads a bank's config back through passes ``cached=False``, and must:
+        the cache is per PROCESS, so a cached read there answers a successful write with the
+        values it just replaced, on whichever pod did not serve the write. Freshness is a property
+        of THAT caller, not of this method.
 
         SECURITY:
         - Only returns configurable fields (excludes static/infrastructure fields)
@@ -253,22 +298,30 @@ class ConfigResolver:
             Dict of allowed configurable fields only (never includes credentials or static fields)
         """
         # Resolve full config with all hierarchical overrides
-        resolved_config = await self.resolve_full_config(bank_id, context)
-        config_dict = asdict(resolved_config)
+        resolved_config = await self.resolve_full_config(bank_id, context, cached=cached)
 
         # SECURITY: drop static/infrastructure + credential fields, then permission-filter.
-        filtered = self._strip_static_and_credential_fields(config_dict)
+        filtered = self._public_fields_of(resolved_config)
         return await self._apply_permission_filter(filtered, bank_id, context)
 
-    def _strip_static_and_credential_fields(self, config_dict: dict[str, Any]) -> dict[str, Any]:
-        """Keep only configurable, non-credential fields.
+    def _public_fields_of(self, config: HindsightConfig) -> dict[str, Any]:
+        """Project a resolved config down to its configurable, non-credential fields.
+
+        Reads the ~50 public fields straight off the object instead of materializing
+        all 400+ with ``asdict()`` and throwing most away (#4209).
 
         SECURITY: excludes static/infrastructure fields and ALL credential fields
         (API keys, base URLs, etc.) so a resolved config is safe to return over the API.
         """
-        return {
-            k: v for k, v in config_dict.items() if k in self._configurable_fields and k not in self._credential_fields
-        }
+        return {name: _detached(getattr(config, name)) for name in self._public_fields}
+
+    def _strip_static_and_credential_fields(self, config_dict: dict[str, Any]) -> dict[str, Any]:
+        """Keep only configurable, non-credential fields of an already-dict config.
+
+        SECURITY: same allow-list as :meth:`_public_fields_of`, for the paths that
+        merge plain override dicts rather than resolved config objects.
+        """
+        return {k: v for k, v in config_dict.items() if k in self._public_fields}
 
     async def _apply_permission_filter(
         self, filtered: dict[str, Any], bank_id: str, context: RequestContext | None
@@ -309,20 +362,17 @@ class ConfigResolver:
             return {}
 
         # Global + tenant base, resolved once (tenant override is per-request, not per-bank).
-        base_dict = asdict(self._global_config)
-        if self.tenant_extension and context:
-            try:
-                tenant_overrides = await self.tenant_extension.get_tenant_config(context)
-                if tenant_overrides:
-                    normalized_tenant = normalize_config_dict(tenant_overrides)
-                    base_dict.update({k: v for k, v in normalized_tenant.items() if k in self._configurable_fields})
-            except Exception as e:
-                logger.warning(f"Failed to load tenant config for bulk resolve: {e}")
+        base_dict = self._public_fields_of(self._global_config)
+        tenant_base = await self._resolve_tenant_overrides("bulk resolve", context)
+        base_dict.update(self._strip_static_and_credential_fields(tenant_base))
 
         # All bank overrides in one query, then merge + strip per bank.
         bank_overrides = await self._load_bank_configs(bank_ids)
         stripped = {
-            bank_id: self._strip_static_and_credential_fields({**base_dict, **bank_overrides.get(bank_id, {})})
+            bank_id: {
+                **base_dict,
+                **self._strip_static_and_credential_fields(bank_overrides.get(bank_id, {})),
+            }
             for bank_id in bank_ids
         }
 
@@ -334,29 +384,58 @@ class ConfigResolver:
         )
         return dict(zip(bank_ids, permission_filtered, strict=True))
 
-    async def _load_bank_config(self, bank_id: str) -> dict[str, Any]:
+    async def _load_bank_config(self, bank_id: str, *, cached: bool = True) -> dict[str, Any]:
         """
         Load bank config overrides from banks.config JSONB column.
 
         Args:
             bank_id: Bank identifier
+            cached: read through the per-process cache. True on the RETAIN path, where this runs
+                once per sub-batch and a bank config that lags by one TTL changes nothing a caller
+                can see. False for anything that answers a reader about the bank's own config: the
+                cache is per PROCESS, so a write served by one pod is invisible to the others until
+                their entry expires, and a deployment runs several. Read-your-writes on a config
+                edit is not a race a user should have to lose.
 
         Returns:
             Dict of config overrides (only configurable fields, normalized keys)
         """
-        try:
-            async with self._backend.acquire() as conn:
-                row = await conn.fetchrow(
-                    f"""
-                    SELECT config FROM {fq_table("banks")} WHERE bank_id = $1
-                    """,
-                    bank_id,
-                )
+        # Cached per process (see engine/bank_info_cache). This is read on the WRITE path -- once
+        # per sub-batch of every retain -- and each read takes a pooled connection, whose checkout
+        # and release cost more statements than the query itself. Caching it is what lets a retain
+        # into a store-owned bank, which writes nothing to Postgres, avoid the pool entirely.
+        #
+        # The RAW column is cached, not the resolved overrides: `_active_bank_overrides` filters
+        # by what is configurable and permitted, and that answer can differ between callers of the
+        # same bank. Caching the resolved form would serve one caller's permissions to another.
+        from .engine import bank_info_cache
 
-                if row and row["config"]:
-                    return self._active_bank_overrides(bank_id, row["config"])
-        except Exception as e:
-            logger.error(f"Failed to load bank config for {bank_id}: {e}")
+        async def _read_config_row() -> dict:
+            try:
+                async with self._backend.acquire() as conn:
+                    row = await conn.fetchrow(
+                        f"""
+                        SELECT config FROM {fq_table("banks")} WHERE bank_id = $1
+                        """,
+                        bank_id,
+                    )
+                # Wrapped in a dict because the cache stores dicts; `{}` means "no row, or no
+                # config", which is also what this function returns for that case anyway.
+                return {"config": row["config"]} if row and row["config"] else {}
+            except Exception as e:
+                logger.error(f"Failed to load bank config for {bank_id}: {e}")
+                # Re-raise nothing: the original swallowed this and returned {}. Returning the
+                # empty dict keeps that behaviour, but it must NOT be cached as if it were an
+                # answer -- bank_info_cache drops empty values for exactly this reason.
+                return {}
+
+        row = (
+            await bank_info_cache.get_or_load(bank_id, "config", _read_config_row)
+            if cached
+            else await _read_config_row()
+        )
+        if row.get("config"):
+            return self._active_bank_overrides(bank_id, row["config"])
 
         return {}
 
@@ -501,6 +580,13 @@ class ConfigResolver:
             except Exception as e:
                 raise ValueError(f"Invalid entity_labels format: {e}")
 
+        # Both of these are merged into a request the API also accepts directly, so
+        # hold them to the same contract as the request that carries those fields.
+        if normalized_updates.get("knowledge_page_default_trigger") is not None:
+            _validate_knowledge_page_default_trigger(normalized_updates["knowledge_page_default_trigger"])
+        if normalized_updates.get("reflect_default_options") is not None:
+            _validate_reflect_default_options(normalized_updates["reflect_default_options"])
+
         # Validate retain_strategies: reject empty string keys
         if "retain_strategies" in normalized_updates and normalized_updates["retain_strategies"]:
             empty_keys = [k for k in normalized_updates["retain_strategies"] if not str(k).strip()]
@@ -519,6 +605,13 @@ class ConfigResolver:
                 except ValueError as e:
                     raise ValueError(f"Invalid retain strategy {strategy_name!r}: {e}") from e
 
+        # Validate consolidation_strategies: the config type is a plain list, so
+        # without this a typo ("scope" for "scopes", a string where the tag list
+        # belongs) is stored happily and then ignored for the life of the bank —
+        # the strategy simply never applies, with nothing to show why.
+        if normalized_updates.get("consolidation_strategies") is not None:
+            _validate_consolidation_strategies(normalized_updates["consolidation_strategies"])
+
         # Validate recall budget fields
         _validate_recall_budget_updates(normalized_updates)
 
@@ -530,9 +623,9 @@ class ConfigResolver:
         # bad update is rejected before the bank is created; _persist_bank_config
         # repeats it against the committed state under the bank row lock, which
         # is what makes the result independent of request interleaving.
-        parent_config: dict[str, Any] | None = None
+        parent_config: HindsightConfig | None = None
         if not _CROSS_FIELD_CONSTRAINED_FIELDS.isdisjoint(normalized_updates):
-            parent_config = await self._resolve_parent_config_dict(bank_id, context)
+            parent_config = self._with_overrides(await self._resolve_tenant_overrides(f"bank {bank_id}", context))
             current_overrides = (
                 await self._load_bank_config(bank_id)
                 if projected_bank_overrides is None
@@ -609,6 +702,11 @@ class ConfigResolver:
                 bank_id,
             )
 
+        # The config column just changed; the next read must not serve the entry loaded before it.
+        from .engine import bank_info_cache
+
+        await bank_info_cache.invalidate(bank_id, "config")
+
         logger.info(f"Updated bank config for {bank_id}: {list(validated.updates.keys())}")
 
     async def reset_bank_config(self, bank_id: str) -> None:
@@ -633,6 +731,11 @@ class ConfigResolver:
                 """,
                 bank_id,
             )
+
+        # The config column just changed; the next read must not serve the entry loaded before it.
+        from .engine import bank_info_cache
+
+        await bank_info_cache.invalidate(bank_id, "config")
 
         logger.info(f"Reset bank config for {bank_id} to defaults")
 
@@ -703,6 +806,58 @@ _TYPE_DESCRIPTIONS: dict[type, str] = {
 
 def _describe_types(allowed: tuple[type, ...]) -> str:
     return " or ".join(dict.fromkeys(_TYPE_DESCRIPTIONS.get(t, t.__name__) for t in allowed))
+
+
+def _validate_against_model(key: str, value: dict[str, Any], model: "type[BaseModel]", noun: str) -> None:
+    """Reject unknown fields and values the request model itself would refuse."""
+    from pydantic import ValidationError
+
+    unknown = sorted(set(value) - set(model.model_fields))
+    if unknown:
+        raise ValueError(f"{key} has unknown fields: {', '.join(unknown)}")
+    try:
+        model.model_validate(value)
+    except ValidationError as e:
+        problems = "; ".join(f"{'.'.join(map(str, err['loc'])) or noun}: {err['msg']}" for err in e.errors())
+        raise ValueError(f"Invalid {key}: {problems}") from e
+
+
+def _validate_knowledge_page_default_trigger(value: dict[str, Any]) -> None:
+    """Reject unknown trigger fields and values ``MentalModelTrigger`` refuses."""
+    from hindsight_api.api.http import MentalModelTrigger
+
+    _validate_against_model("knowledge_page_default_trigger", value, MentalModelTrigger, "trigger")
+
+
+def _validate_reflect_default_options(value: dict[str, Any]) -> None:
+    """Reject unknown option fields and values ``ReflectDefaultOptions`` refuses."""
+    from hindsight_api.api.http import ReflectDefaultOptions
+
+    _validate_against_model("reflect_default_options", value, ReflectDefaultOptions, "options")
+
+
+def _validate_consolidation_strategies(value: Any) -> None:
+    """Reject a consolidation_strategies value whose shape cannot work.
+
+    Shape only: an incomplete draft (a rule with no tags yet, a strategy with no
+    setting) is accepted, because the control plane saves strategies as typed and
+    consolidation ignores the unusable ones. What is rejected is what could only
+    be a mistake — an entry that is not an object, an unknown key, a tag list that
+    is not a list of strings, an unknown tags_match.
+    """
+    from pydantic import ValidationError
+
+    from .engine.response_models import StrictConsolidationStrategySpec
+
+    if not isinstance(value, list):
+        raise ValueError(f"consolidation_strategies must be a list, got {type(value).__name__}")
+    for index, entry in enumerate(value):
+        try:
+            StrictConsolidationStrategySpec.model_validate(entry)
+        except ValidationError as e:
+            first = e.errors()[0]
+            location = ".".join(str(part) for part in first["loc"]) or "entry"
+            raise ValueError(f"Invalid consolidation strategy at index {index}: {location}: {first['msg']}") from e
 
 
 def _validate_config_value_types(updates: dict[str, Any]) -> None:
@@ -891,6 +1046,9 @@ def apply_strategy(config: HindsightConfig, strategy_name: str) -> HindsightConf
     validate_retain_chunking_config(
         resolved.retain_chunk_size,
         resolved.retain_structured_chunk_size,
+    )
+    validate_retain_image_chunking_config(
+        resolved.retain_max_attachments_per_chunk,
     )
     validate_retain_completion_token_budget(
         llm_provider=resolved.llm_provider,

@@ -194,6 +194,44 @@ export type BackgroundResponse = {
 };
 
 /**
+ * BankAliasEntry
+ *
+ * One id a bank answers to.
+ */
+export type BankAliasEntry = {
+  /**
+   * Alias
+   */
+  alias: string;
+  /**
+   * Primary
+   *
+   * Whether this alias is shown in place of the bank's own id. Display only — the bank keeps its id, and everything that names a bank still uses it. At most one alias per bank can be primary, and none has to be.
+   */
+  primary?: boolean;
+};
+
+/**
+ * BankAliasesResponse
+ *
+ * Response model for a bank's aliases.
+ */
+export type BankAliasesResponse = {
+  /**
+   * Bank Id
+   *
+   * The bank's own id, which an alias never replaces
+   */
+  bank_id: string;
+  /**
+   * Aliases
+   *
+   * Extra ids that also reach this bank, the primary one first then oldest first
+   */
+  aliases: Array<BankAliasEntry>;
+};
+
+/**
  * BankConfigResponse
  *
  * Response model for bank configuration.
@@ -282,6 +320,18 @@ export type BankListItem = {
    * When anything was last written to this bank: a document retained (including appends to an existing document) or a fact stored. Null if the bank is empty.
    */
   last_write_at?: string | null;
+  /**
+   * Display Alias
+   *
+   * The alias this bank is presented under, when one was promoted. Display only: `bank_id` remains the bank's identity everywhere else. Null when no alias is primary, in which case show `bank_id`.
+   */
+  display_alias?: string | null;
+  /**
+   * Matched Aliases
+   *
+   * Aliases of this bank that matched the search `q`. Empty when no search was made, or when the bank matched on its own id or name — so a non-empty value explains a result whose `bank_id` does not contain the search text.
+   */
+  matched_aliases?: Array<string>;
 };
 
 /**
@@ -589,6 +639,12 @@ export type BankTemplateConfig = {
    */
   retain_chunk_batch_size?: number | null;
   /**
+   * Retain Max Attachments Per Chunk
+   *
+   * Hard cap on inline images in a single extraction chunk
+   */
+  retain_max_attachments_per_chunk?: number | null;
+  /**
    * Mcp Enabled Tools
    *
    * MCP tool allowlist for this bank (None = all tools)
@@ -621,17 +677,39 @@ export type BankTemplateConfig = {
   /**
    * Observation Scope Limits
    *
-   * Per-scope overrides of max_observations_per_scope: [{"scope": ["run_*", "shared"], "limit": 1}]. Each scope is a list of fnmatch tag-globs; a consolidation scope matches under exact cover (every tag matched by a glob and every glob matched by a tag). The first matching rule wins; unmatched scopes fall back to max_observations_per_scope.
+   * DEPRECATED — use consolidation_strategies, which carries the mission too. Still honoured, but consulted only after consolidation_strategies. Per-scope overrides of max_observations_per_scope: [{"scope": ["run_*", "shared"], "limit": 1}]. Each scope is a list of fnmatch tag-globs; a consolidation scope matches under exact cover (every tag matched by a glob and every glob matched by a tag). The first matching rule wins; unmatched scopes fall back to max_observations_per_scope.
    */
   observation_scope_limits?: Array<{
     [key: string]: unknown;
   }> | null;
+  /**
+   * Consolidation Strategies
+   *
+   * Per-scope consolidation settings: [{"scopes": [{"tags": ["company:*"]}], "observations_mission": "Record only generalized trends.", "max_observations_per_scope": 20}]. Each strategy lists the rules it claims scopes with — a rule's tags are fnmatch globs that must all be on the scope, and its "tags_match" decides whether the scope may carry others ("all", the default) or not ("exact"). The rules are alternatives: any one matching claims the scope. A strategy may set any of observations_mission, max_observations_per_scope, consolidation_source_facts_max_tokens and consolidation_source_facts_max_tokens_per_observation; each is optional. Exactly one strategy applies to a scope: the first in the list that claims it. Whatever that strategy leaves unset — and every scope no strategy claims — uses the bank-wide value; a later strategy never fills the gaps. Supersedes observation_scope_limits. Lets one bank be federated across user/team/company tag scopes, each consolidating under its own brief.
+   */
+  consolidation_strategies?: Array<ConsolidationStrategySpec> | null;
   /**
    * Reflect Source Facts Max Tokens
    *
    * Max tokens of source facts per reflect call
    */
   reflect_source_facts_max_tokens?: number | null;
+  /**
+   * Knowledge Page Default Trigger
+   *
+   * Trigger fields merged over the built-in knowledge-page default when a page is created (e.g. {"refresh_cron": "0 * * * *"}). A trigger sent with the create request still wins.
+   */
+  knowledge_page_default_trigger?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Reflect Default Options
+   *
+   * Default reflect options for this bank (e.g. {"reflect_search_observations_max_tokens": 3000, "reflect_search_observations_include_entities": false}). Applied to every reflect in the bank -- API, MCP and mental-model refresh -- whenever the request (or the model's trigger) leaves the option unset.
+   */
+  reflect_default_options?: {
+    [key: string]: unknown;
+  } | null;
   /**
    * Mental Model Min Refresh Interval Seconds
    *
@@ -929,6 +1007,55 @@ export type BankTemplateMentalModel = {
 };
 
 /**
+ * BankTransferSubmitResponse
+ *
+ * Response for the unified bank-transfer endpoints (202).
+ *
+ * The transfer runs in the background; poll
+ * GET /v1/default/banks/{bank_id}/operations/{operation_id}. An export's
+ * ``result_metadata`` carries ``download_url`` / ``storage_key`` /
+ * ``byte_size`` / ``filename``; an import's carries the per-component counts.
+ */
+export type BankTransferSubmitResponse = {
+  /**
+   * Operation Id
+   */
+  operation_id: string;
+  /**
+   * Status
+   */
+  status?: string;
+};
+
+/**
+ * Base64AttachmentSource
+ *
+ * Inline attachment bytes, base64-encoded.
+ *
+ * The only source type in this version. ``url`` (server-side fetch) and
+ * ``blob_id`` (pre-uploaded handle) are the natural next ones, which is why this
+ * is modelled as a discriminated union on ``type`` rather than as bare fields.
+ */
+export type Base64AttachmentSource = {
+  /**
+   * Type
+   */
+  type?: "base64";
+  /**
+   * Media Type
+   *
+   * MIME type of the attachment, e.g. 'image/png' or 'application/pdf'. Any well-formed type is accepted; whether the model can read it is the model's answer to give, and a provider that rejects it fails the retain with its own error.
+   */
+  media_type: string;
+  /**
+   * Data
+   *
+   * Base64-encoded bytes (no data: URI prefix).
+   */
+  data: string;
+};
+
+/**
  * Body_file_retain
  */
 export type BodyFileRetain = {
@@ -944,6 +1071,18 @@ export type BodyFileRetain = {
    * JSON string with FileRetainRequest model
    */
   request: string;
+};
+
+/**
+ * Body_import_bank_transfer
+ */
+export type BodyImportBankTransfer = {
+  /**
+   * File
+   *
+   * Transfer ZIP archive
+   */
+  file: Blob | File;
 };
 
 /**
@@ -1014,6 +1153,56 @@ export type ChildOperationStatus = {
 };
 
 /**
+ * ChunkAttachment
+ *
+ * An attachment referenced by retained text, and where to fetch it.
+ */
+export type ChunkAttachment = {
+  /**
+   * Id
+   *
+   * The id inside the text's placeholder; a prefix of the bytes' sha256.
+   */
+  id: string;
+  /**
+   * Hash
+   *
+   * Full sha256 of the attachment bytes.
+   */
+  hash: string;
+  /**
+   * Kind
+   *
+   * 'image' or 'file', as the caller sent it.
+   */
+  kind: string;
+  /**
+   * Media Type
+   *
+   * MIME type of the attachment.
+   */
+  media_type: string;
+  /**
+   * Byte Size
+   *
+   * Size of the attachment in bytes.
+   */
+  byte_size: number;
+  /**
+   * Filename
+   *
+   * Original filename, when the caller supplied one.
+   */
+  filename?: string | null;
+  /**
+   * Url
+   *
+   * Bank-scoped API path serving the bytes. Requires the same authorization as the bank.
+   */
+  url: string;
+};
+
+/**
  * ChunkData
  *
  * Chunk data for a single chunk.
@@ -1037,6 +1226,12 @@ export type ChunkData = {
    * Whether the chunk text was truncated due to token limits
    */
   truncated?: boolean;
+  /**
+   * Attachments
+   *
+   * Attachments this chunk's text references, in order of first appearance, when it was retained with inline content. The text keeps each attachment's placeholder token (⟦hs-att:...⟧) where it sat, so a multimodal agent can render or reason over the original at the position it occupied in the source document. Omitted when there are none.
+   */
+  attachments?: Array<ChunkAttachment> | null;
 };
 
 /**
@@ -1083,6 +1278,12 @@ export type ChunkResponse = {
    * Created At
    */
   created_at: string;
+  /**
+   * Attachments
+   *
+   * Attachments referenced by this chunk's text, when it was retained with inline content. Each carries a bank-scoped `url` serving the original bytes. Omitted when there are none.
+   */
+  attachments?: Array<ChunkAttachment> | null;
 };
 
 /**
@@ -1129,6 +1330,152 @@ export type ConsolidationResponse = {
    * True if an existing pending task was reused
    */
   deduplicated?: boolean;
+};
+
+/**
+ * ConsolidationScopePattern
+ *
+ * One rule of a consolidation strategy: tags, and how they must match.
+ *
+ * ``tags`` may be empty — that is a rule still being filled in, which the editor
+ * saves as typed and consolidation ignores. The type pins the *shape*, not
+ * completeness: a string where the tag list belongs is rejected at the door
+ * instead of being stored and silently ignored for the life of the bank.
+ *
+ * Unknown keys are rejected too, but by :class:`StrictConsolidationStrategySpec`
+ * on the write path rather than by ``extra="forbid"`` here: that would put
+ * ``additionalProperties: false`` in the schema, which openapi-generator cannot
+ * process ("Codegen Property not yet supported in getPydanticType").
+ */
+export type ConsolidationScopePattern = {
+  /**
+   * Tags
+   *
+   * fnmatch tag patterns, e.g. company:*
+   */
+  tags?: Array<string>;
+  /**
+   * Tags Match
+   *
+   * "all" (the default when omitted): the scope has every tag in the rule, other tags allowed. "exact": exactly these tags and no others.
+   */
+  tags_match?: string | null;
+};
+
+/**
+ * ConsolidationStrategiesPreview
+ *
+ * Which existing observation scopes each consolidation strategy would apply to.
+ */
+export type ConsolidationStrategiesPreview = {
+  /**
+   * Strategies
+   */
+  strategies: Array<StrategyPreview>;
+  default: DefaultScopesPreview;
+  /**
+   * Scopes Scanned
+   *
+   * Distinct scopes the preview was computed over
+   */
+  scopes_scanned: number;
+  /**
+   * Complete
+   *
+   * False when the bank has more distinct scopes than the preview scans; counts are then lower bounds
+   */
+  complete: boolean;
+};
+
+/**
+ * ConsolidationStrategiesPreviewRequest
+ *
+ * A draft consolidation_strategies value to preview against existing scopes.
+ */
+export type ConsolidationStrategiesPreviewRequest = {
+  /**
+   * Strategies
+   *
+   * Draft consolidation_strategies value
+   */
+  strategies: Array<ConsolidationStrategySpec>;
+  /**
+   * Sample Limit
+   *
+   * Example scopes returned per rule
+   */
+  sample_limit?: number;
+};
+
+/**
+ * ConsolidationStrategySpec
+ *
+ * One `consolidation_strategies` entry: the rules it claims scopes with, and
+ * the observation settings those scopes use. Every setting is optional; unset
+ * ones come from the bank-wide values.
+ */
+export type ConsolidationStrategySpec = {
+  /**
+   * Scopes
+   *
+   * Alternatives: the strategy claims a scope when any rule matches it
+   */
+  scopes?: Array<ConsolidationScopePattern>;
+  /**
+   * Observations Mission
+   */
+  observations_mission?: string | null;
+  /**
+   * Max Observations Per Scope
+   */
+  max_observations_per_scope?: number | null;
+  /**
+   * Consolidation Source Facts Max Tokens
+   */
+  consolidation_source_facts_max_tokens?: number | null;
+  /**
+   * Consolidation Source Facts Max Tokens Per Observation
+   */
+  consolidation_source_facts_max_tokens_per_observation?: number | null;
+};
+
+/**
+ * Content
+ *
+ * The raw content to retain or extract from. Either a plain string or an ordered list of content blocks.
+ */
+export type Content =
+  | string
+  | Array<
+      | ({
+          type: "text";
+        } & TextContentBlock)
+      | ({
+          type: "image";
+        } & ImageContentBlock)
+      | ({
+          type: "file";
+        } & FileContentBlock)
+    >;
+
+/**
+ * CreateBankAliasRequest
+ *
+ * Request model for adding an alias to a bank.
+ */
+export type CreateBankAliasRequest = {
+  /**
+   * Alias
+   *
+   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters), and it must not already name a bank or another alias.
+   */
+  alias: string;
+  /**
+   * Primary
+   *
+   * Also show the bank under this alias, replacing whichever alias is shown today.
+   */
+  primary?: boolean;
 };
 
 /**
@@ -1213,6 +1560,12 @@ export type CreateBankRequest = {
    * Maximum characters for a single JSONL line or conversation turn to keep whole during retain. Defaults to retain_chunk_size when unset.
    */
   retain_structured_chunk_size?: number | null;
+  /**
+   * Retain Max Attachments Per Chunk
+   *
+   * Maximum inline attachments one extraction chunk may carry. retain_chunk_size budgets text only — a placeholder costs the characters it occupies and nothing more — so this is what bounds attachments. Match it to the provider's per-request limit.
+   */
+  retain_max_attachments_per_chunk?: number | null;
   /**
    * Enable Observations
    *
@@ -1455,6 +1808,26 @@ export type CreateWebhookRequest = {
 };
 
 /**
+ * DefaultScopesPreview
+ *
+ * The scopes no strategy claims — they consolidate under the bank-wide settings.
+ */
+export type DefaultScopesPreview = {
+  /**
+   * Match Count
+   */
+  match_count: number;
+  /**
+   * Observation Count
+   */
+  observation_count: number;
+  /**
+   * Samples
+   */
+  samples: Array<StrategyScopePreview>;
+};
+
+/**
  * DeleteDocumentResponse
  *
  * Response model for delete document endpoint.
@@ -1660,6 +2033,81 @@ export type DocumentImportSubmitResponse = {
 };
 
 /**
+ * DocumentListItem
+ *
+ * One row of the document listing — a document's metadata without its text.
+ *
+ * Extra keys are allowed and passed through: the rows used to be an open object, and
+ * typing them must not drop a field an older or newer server also returns.
+ */
+export type DocumentListItem = {
+  /**
+   * Id
+   *
+   * Document ID
+   */
+  id: string;
+  /**
+   * Bank Id
+   *
+   * Bank the document belongs to
+   */
+  bank_id?: string;
+  /**
+   * Content Hash
+   *
+   * Hash of the document text, for idempotent retain
+   */
+  content_hash?: string | null;
+  /**
+   * Created At
+   *
+   * When the document was first retained (ISO 8601)
+   */
+  created_at?: string;
+  /**
+   * Updated At
+   *
+   * When the document was last written (ISO 8601)
+   */
+  updated_at?: string;
+  /**
+   * Text Length
+   *
+   * Length of the stored document text in characters
+   */
+  text_length?: number;
+  /**
+   * Memory Unit Count
+   *
+   * Number of memory units extracted from this document
+   */
+  memory_unit_count?: number;
+  /**
+   * Retain Params
+   *
+   * Parameters used during retain
+   */
+  retain_params?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Document Metadata
+   *
+   * Document metadata
+   */
+  document_metadata?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Tags
+   *
+   * Tags associated with this document
+   */
+  tags?: Array<string>;
+};
+
+/**
  * DocumentResponse
  *
  * Response model for get document endpoint.
@@ -1729,6 +2177,12 @@ export type DocumentResponse = {
    * The observation_scopes spec configured at retain time (e.g. 'all_combinations', 'per_tag', or explicit tag-set lists), captured into retain_params. None when none was set (default 'combined' scoping) or for documents retained before this was captured.
    */
   observation_scopes?: string | Array<Array<string>> | null;
+  /**
+   * Attachments
+   *
+   * Attachments referenced by this document, when it was retained with inline content. Each carries a bank-scoped `url` serving the original bytes. Omitted when there are none.
+   */
+  attachments?: Array<ChunkAttachment> | null;
 };
 
 /**
@@ -1742,11 +2196,9 @@ export type DocumentResponse = {
  */
 export type DryRunExtractRequest = {
   /**
-   * Content
-   *
-   * Text to extract facts from (e.g. a document or a single chunk).
+   * The raw content to extract facts from. Either a plain string, or an ordered list of content blocks (text, image, file) so images/attachments sit inline where they actually appear.
    */
-  content: string;
+  content: Content;
   /**
    * Context
    *
@@ -1767,6 +2219,12 @@ export type DryRunExtractRequest = {
    * @deprecated
    */
   agent_name?: string | null;
+  /**
+   * Strategy
+   *
+   * Name of a retain strategy to extract under (a key of the bank's `retain_strategies`). Omit it and the bank's `retain_default_strategy` applies, exactly as it does for a retain that names none.
+   */
+  strategy?: string | null;
   /**
    * Retain Mission
    */
@@ -1806,7 +2264,8 @@ export type DryRunExtractRequest = {
 /**
  * DryRunExtractionResult
  *
- * Result of dry-run fact extraction: candidate facts plus aggregated LLM token usage.
+ * Result of dry-run fact extraction: candidate facts, the chunks they came from,
+ * and aggregated LLM token usage.
  */
 export type DryRunExtractionResult = {
   /**
@@ -1815,6 +2274,12 @@ export type DryRunExtractionResult = {
    * Candidate facts the retain step would extract.
    */
   facts?: Array<ExtractedFact>;
+  /**
+   * Chunks
+   *
+   * The chunks the input was cut into before extraction. Already computed on every path; returned because `retain_chunk_size` is otherwise a number with no visible effect.
+   */
+  chunks?: Array<ExtractionChunk>;
   /**
    * Aggregated token usage across the extraction LLM calls.
    */
@@ -1860,6 +2325,115 @@ export type EntityDetailResponse = {
 };
 
 /**
+ * EntityGraphEdge
+ *
+ * A co-occurrence edge, in the Cytoscape ``{"data": {...}}`` envelope the graph uses.
+ */
+export type EntityGraphEdge = {
+  data: EntityGraphEdgeData;
+};
+
+/**
+ * EntityGraphEdgeData
+ *
+ * The payload of one co-occurrence edge.
+ */
+export type EntityGraphEdgeData = {
+  /**
+   * Id
+   *
+   * Edge ID (``<source>-<target>``)
+   */
+  id: string;
+  /**
+   * Source
+   *
+   * Source entity ID
+   */
+  source: string;
+  /**
+   * Target
+   *
+   * Target entity ID
+   */
+  target: string;
+  /**
+   * Linktype
+   *
+   * Kind of relationship this edge represents
+   */
+  linkType?: string;
+  /**
+   * Weight
+   *
+   * Number of co-occurrences between the two entities
+   */
+  weight?: number;
+  /**
+   * Color
+   *
+   * Suggested edge colour for rendering
+   */
+  color?: string | null;
+  /**
+   * Linestyle
+   *
+   * Suggested edge line style for rendering
+   */
+  lineStyle?: string | null;
+  /**
+   * Lastcooccurred
+   *
+   * ISO 8601 timestamp of the most recent co-occurrence
+   */
+  lastCooccurred?: string | null;
+};
+
+/**
+ * EntityGraphNode
+ *
+ * An entity node, in the Cytoscape ``{"data": {...}}`` envelope the graph uses.
+ */
+export type EntityGraphNode = {
+  data: EntityGraphNodeData;
+};
+
+/**
+ * EntityGraphNodeData
+ *
+ * The payload of one entity node in the co-occurrence graph.
+ *
+ * Extra keys are allowed and passed through: the graph payload has always been an open
+ * object, and typing it must not drop a field an older or newer server also returns.
+ */
+export type EntityGraphNodeData = {
+  /**
+   * Id
+   *
+   * Entity ID
+   */
+  id: string;
+  /**
+   * Label
+   *
+   * Entity canonical name
+   */
+  label?: string;
+  /**
+   * Mentioncount
+   *
+   * How many times this entity was mentioned
+   */
+  mentionCount?: number;
+  /**
+   * Color
+   *
+   * Suggested node colour for rendering
+   */
+  color?: string | null;
+};
+
+/**
  * EntityGraphResponse
  *
  * Response model for entity co-occurrence graph endpoint.
@@ -1868,15 +2442,11 @@ export type EntityGraphResponse = {
   /**
    * Nodes
    */
-  nodes: Array<{
-    [key: string]: unknown;
-  }>;
+  nodes: Array<EntityGraphNode>;
   /**
    * Edges
    */
-  edges: Array<{
-    [key: string]: unknown;
-  }>;
+  edges: Array<EntityGraphEdge>;
   /**
    * Total Entities
    */
@@ -2059,6 +2629,64 @@ export type ExtractedFact = {
    * Raw (unresolved) entity names mentioned in the fact.
    */
   entities?: Array<string>;
+  /**
+   * Chunk Index
+   *
+   * Index into `chunks` of the chunk this fact came from; null if it could not be attributed.
+   */
+  chunk_index?: number | null;
+  /**
+   * Attachments
+   *
+   * Attachments from user input that this fact is attributed to / associated with.
+   */
+  attachments?: Array<ExtractedFactAttachment>;
+};
+
+/**
+ * ExtractedFactAttachment
+ *
+ * An attachment from multimodal input associated with an extracted fact.
+ */
+export type ExtractedFactAttachment = {
+  /**
+   * Block Index
+   *
+   * Index of the content block in user's input (0-based)
+   */
+  block_index: number;
+  /**
+   * AttachmentType
+   *
+   * Content block type ('image' or 'file')
+   */
+  type: "image" | "file";
+  /**
+   * Media Type
+   *
+   * MIME media type of the attachment, e.g. 'image/png'
+   */
+  media_type: string;
+};
+
+/**
+ * ExtractionChunk
+ *
+ * One chunk the extractor was handed, and how much it yielded.
+ */
+export type ExtractionChunk = {
+  /**
+   * Text
+   *
+   * The chunk as the extractor saw it.
+   */
+  text: string;
+  /**
+   * Fact Count
+   *
+   * How many facts came out of this chunk.
+   */
+  fact_count: number;
 };
 
 /**
@@ -2142,6 +2770,34 @@ export type FeaturesInfo = {
    * Whether raw source text is persisted. When false, document/chunk source text is not stored.
    */
   store_document_text: boolean;
+  /**
+   * Llm Concurrency Api
+   *
+   * Whether the runtime LLM concurrency API accepts changes
+   */
+  llm_concurrency_api: boolean;
+};
+
+/**
+ * FileContentBlock
+ *
+ * A non-image attachment — a PDF, a spreadsheet — in its input position.
+ *
+ * This stays distinct from ``image`` because providers use different request
+ * parts for images and documents; retaining the caller's kind avoids guessing.
+ */
+export type FileContentBlock = {
+  /**
+   * Type
+   */
+  type: "file";
+  source: Base64AttachmentSource;
+  /**
+   * Filename
+   *
+   * Original filename, passed to providers that show one to the model (e.g. OpenAI).
+   */
+  filename?: string | null;
 };
 
 /**
@@ -2167,21 +2823,15 @@ export type GraphDataResponse = {
   /**
    * Nodes
    */
-  nodes: Array<{
-    [key: string]: unknown;
-  }>;
+  nodes: Array<MemoryGraphNode>;
   /**
    * Edges
    */
-  edges: Array<{
-    [key: string]: unknown;
-  }>;
+  edges: Array<MemoryGraphEdge>;
   /**
    * Table Rows
    */
-  table_rows: Array<{
-    [key: string]: unknown;
-  }>;
+  table_rows: Array<MemoryGraphTableRow>;
   /**
    * Total Units
    */
@@ -2200,6 +2850,19 @@ export type HttpValidationError = {
    * Detail
    */
   detail?: Array<ValidationError>;
+};
+
+/**
+ * ImageContentBlock
+ *
+ * An image within a multimodal item, in the position the caller wrote it.
+ */
+export type ImageContentBlock = {
+  /**
+   * Type
+   */
+  type: "image";
+  source: Base64AttachmentSource;
 };
 
 /**
@@ -2283,6 +2946,12 @@ export type KnowledgeNode = {
    */
   is_stale?: boolean | null;
   /**
+   * Last Refresh Failed At
+   *
+   * Pages only: when this page's most recent refresh failed, in ISO format, or null when the last one succeeded. While it is set the page does not rebuild itself on its trigger — see the same field on the mental model. An explicit refresh still runs.
+   */
+  last_refresh_failed_at?: string | null;
+  /**
    * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
    */
   trigger?: MentalModelTriggerOutput | null;
@@ -2359,13 +3028,13 @@ export type KnowledgePageResponse = {
   /**
    * Body
    *
-   * The page's synthesized markdown body.
+   * The page's synthesized markdown body, exactly as stored. Empty until a refresh writes one — unlike `markdown`, which says so in words. Build a UI's own empty state off this field; read `markdown` to show the document itself.
    */
   body?: string | null;
   /**
    * Markdown
    *
-   * The full markdown document: YAML frontmatter + markdown body.
+   * The full markdown document: YAML frontmatter + markdown body. A page with no body yet renders 'No content yet.' as its body rather than frontmatter alone, which reads as a page that failed to render. The notice is added here on the way out; the stored body in `body` stays empty, and the export bundle keeps the bare document.
    */
   markdown: string;
 };
@@ -2405,11 +3074,21 @@ export type KnowledgePageSearchResult = {
    */
   mental_model_id?: string | null;
   /**
+   * Source Query
+   *
+   * The question the page answers.
+   */
+  source_query?: string | null;
+  /**
    * Snippet
+   *
+   * The page's opening text. A page whose body is still empty says so in words — 'No content yet.' — rather than coming back blank, so a caller can tell an unwritten page from a page whose snippet simply did not render. The marker is produced on the way out; the stored body stays empty and out of the search index.
    */
   snippet: string;
   /**
    * Score
+   *
+   * Rank-fusion score in 0..1, where 1.0 means every search arm placed this page first. It reflects where the page ranked for this query, not how well its text matched, so it is only comparable within one result set.
    */
   score: number;
   /**
@@ -2448,6 +3127,52 @@ export type LlmCallTrace = {
    * Execution time in milliseconds
    */
   duration_ms: number;
+};
+
+/**
+ * LLMConcurrencyResponse
+ *
+ * The process-wide LLM concurrency cap and its live usage.
+ */
+export type LlmConcurrencyResponse = {
+  /**
+   * Max Concurrent
+   *
+   * Current cap on concurrent LLM calls in this process
+   */
+  max_concurrent: number;
+  /**
+   * Configured Max Concurrent
+   *
+   * The cap from HINDSIGHT_API_LLM_MAX_CONCURRENT, restored by DELETE and on restart
+   */
+  configured_max_concurrent: number;
+  /**
+   * In Flight
+   *
+   * LLM calls currently holding a permit
+   */
+  in_flight: number;
+  /**
+   * Waiting
+   *
+   * LLM calls queued for a permit
+   */
+  waiting: number;
+};
+
+/**
+ * LLMConcurrencyUpdate
+ *
+ * Request model for changing the process-wide LLM concurrency cap.
+ */
+export type LlmConcurrencyUpdate = {
+  /**
+   * Max Concurrent
+   *
+   * New cap on concurrent LLM calls in this process. Lowering it lets in-flight calls finish and starts no new call until usage is under the cap; raising it starts waiting calls immediately.
+   */
+  max_concurrent: number;
 };
 
 /**
@@ -2520,6 +3245,10 @@ export type LlmRequestEntry = {
    * Cached Tokens
    */
   cached_tokens: number | null;
+  /**
+   * Thoughts Tokens
+   */
+  thoughts_tokens: number | null;
   /**
    * Total Tokens
    */
@@ -2648,6 +3377,10 @@ export type LlmRequestTokenSums = {
    */
   cached: number;
   /**
+   * Thoughts
+   */
+  thoughts?: number | null;
+  /**
    * Total
    */
   total: number;
@@ -2670,7 +3403,7 @@ export type LabelGroupInput = {
   /**
    * Type
    */
-  type?: "value" | "multi-values" | "text" | "map";
+  type?: "value" | "multi-values" | "text" | "multi-text" | "map";
   /**
    * Optional
    */
@@ -2708,7 +3441,7 @@ export type LabelGroupOutput = {
   /**
    * Type
    */
-  type?: "value" | "multi-values" | "text" | "map";
+  type?: "value" | "multi-values" | "text" | "multi-text" | "map";
   /**
    * Optional
    */
@@ -2778,9 +3511,7 @@ export type ListDocumentsResponse = {
   /**
    * Items
    */
-  items: Array<{
-    [key: string]: unknown;
-  }>;
+  items: Array<DocumentListItem>;
   /**
    * Total
    */
@@ -2804,9 +3535,7 @@ export type ListMemoryUnitsResponse = {
   /**
    * Items
    */
-  items: Array<{
-    [key: string]: unknown;
-  }>;
+  items: Array<MemoryUnitListItem>;
   /**
    * Total
    */
@@ -2913,7 +3642,7 @@ export type MapFieldInput = {
   /**
    * Type
    */
-  type?: "text" | "value" | "multi-values" | "map";
+  type?: "text" | "multi-text" | "value" | "multi-values" | "map";
   /**
    * Description
    */
@@ -2939,7 +3668,7 @@ export type MapFieldOutput = {
   /**
    * Type
    */
-  type?: "text" | "value" | "multi-values" | "map";
+  type?: "text" | "multi-text" | "value" | "multi-values" | "map";
   /**
    * Description
    */
@@ -2993,15 +3722,240 @@ export type MemoriesTimeseriesResponse = {
 };
 
 /**
+ * MemoryGraphEdge
+ *
+ * An edge between two memory units, in the Cytoscape ``{"data": {...}}`` envelope.
+ */
+export type MemoryGraphEdge = {
+  data: MemoryGraphEdgeData;
+};
+
+/**
+ * MemoryGraphEdgeData
+ *
+ * The payload of one edge between two memory units.
+ */
+export type MemoryGraphEdgeData = {
+  /**
+   * Id
+   *
+   * Edge ID (``<source>-<target>-<linkType>``)
+   */
+  id: string;
+  /**
+   * Source
+   *
+   * Source memory unit ID
+   */
+  source: string;
+  /**
+   * Target
+   *
+   * Target memory unit ID
+   */
+  target: string;
+  /**
+   * Linktype
+   *
+   * Link kind: 'entity', 'semantic', 'temporal', ...
+   */
+  linkType?: string;
+  /**
+   * Weight
+   *
+   * Link strength
+   */
+  weight?: number;
+  /**
+   * Entityname
+   *
+   * Shared entity for an 'entity' link, empty otherwise
+   */
+  entityName?: string;
+  /**
+   * Color
+   *
+   * Suggested edge colour for rendering
+   */
+  color?: string | null;
+  /**
+   * Linestyle
+   *
+   * Suggested edge line style for rendering
+   */
+  lineStyle?: string | null;
+};
+
+/**
+ * MemoryGraphNode
+ *
+ * A memory-unit node, in the Cytoscape ``{"data": {...}}`` envelope the graph uses.
+ */
+export type MemoryGraphNode = {
+  data: MemoryGraphNodeData;
+};
+
+/**
+ * MemoryGraphNodeData
+ *
+ * The payload of one memory-unit node in the memory graph.
+ *
+ * Extra keys are allowed and passed through, so typing this never drops a field the
+ * server also returns.
+ */
+export type MemoryGraphNodeData = {
+  /**
+   * Id
+   *
+   * Memory unit ID
+   */
+  id: string;
+  /**
+   * Label
+   *
+   * Short display label (the text, truncated)
+   */
+  label?: string;
+  /**
+   * Text
+   *
+   * Full memory unit text
+   */
+  text?: string;
+  /**
+   * Date
+   *
+   * Event date (ISO 8601), empty when unknown
+   */
+  date?: string;
+  /**
+   * Context
+   *
+   * Context the memory was captured in
+   */
+  context?: string;
+  /**
+   * Entities
+   *
+   * Comma-separated entity names, 'None' when there are none
+   */
+  entities?: string;
+  /**
+   * Color
+   *
+   * Suggested node colour for rendering
+   */
+  color?: string | null;
+};
+
+/**
+ * MemoryGraphTableRow
+ *
+ * One row of the flat table view that accompanies the memory graph.
+ */
+export type MemoryGraphTableRow = {
+  /**
+   * Id
+   *
+   * Memory unit ID
+   */
+  id: string;
+  /**
+   * Text
+   *
+   * Memory unit text
+   */
+  text?: string;
+  /**
+   * Context
+   *
+   * Context the memory was captured in ('N/A' when absent)
+   */
+  context?: string;
+  /**
+   * Occurred Start
+   *
+   * Start of the event interval (ISO 8601)
+   */
+  occurred_start?: string | null;
+  /**
+   * Occurred End
+   *
+   * End of the event interval (ISO 8601)
+   */
+  occurred_end?: string | null;
+  /**
+   * Mentioned At
+   *
+   * When the memory was mentioned (ISO 8601)
+   */
+  mentioned_at?: string | null;
+  /**
+   * Date
+   *
+   * Deprecated: formatted event date, kept for backwards compatibility
+   */
+  date?: string | null;
+  /**
+   * Entities
+   *
+   * Comma-separated entity names, 'None' when there are none
+   */
+  entities?: string;
+  /**
+   * Document Id
+   *
+   * Source document ID
+   */
+  document_id?: string | null;
+  /**
+   * Chunk Id
+   *
+   * Source chunk ID
+   */
+  chunk_id?: string | null;
+  /**
+   * Fact Type
+   *
+   * Fact type: world, experience or observation
+   */
+  fact_type?: string | null;
+  /**
+   * Tags
+   *
+   * Tags on this memory unit
+   */
+  tags?: Array<string>;
+  /**
+   * Created At
+   *
+   * When the memory unit was created (ISO 8601)
+   */
+  created_at?: string | null;
+  /**
+   * Proof Count
+   *
+   * How many times the fact was independently seen
+   */
+  proof_count?: number | null;
+};
+
+/**
  * MemoryItem
  *
  * Single memory item for retain.
  */
 export type MemoryItem = {
   /**
-   * Content
+   * The raw content to retain. Either a plain string, or an ordered list of content blocks so images sit inline where they actually appear:
+   *
+   * [{"type": "text", "text": "click the button shown:"},
+   * {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}},
+   * {"type": "text", "text": "...then reconnect."}]
+   *
+   * The block form requires a vision-capable retain LLM; a retain carrying images against a text-only model is rejected rather than silently dropping them. A single text block is equivalent to the plain string form.
    */
-  content: string;
+  content: Content;
   /**
    * Timestamp
    *
@@ -3098,6 +4052,151 @@ export type MemoryTimeseriesBucket = {
    * Observations recorded in this bucket.
    */
   observation?: number;
+};
+
+/**
+ * MemoryUnitListItem
+ *
+ * One row of the memory-unit listing.
+ *
+ * Extra keys are allowed and passed through: the rows used to be an open object, and
+ * typing them must not drop a field an older or newer server also returns.
+ */
+export type MemoryUnitListItem = {
+  /**
+   * Id
+   *
+   * Memory unit ID
+   */
+  id: string;
+  /**
+   * Text
+   *
+   * The fact text
+   */
+  text?: string;
+  /**
+   * Context
+   *
+   * Context the memory was captured in
+   */
+  context?: string;
+  /**
+   * Date
+   *
+   * Event date (ISO 8601), empty when unknown
+   */
+  date?: string;
+  /**
+   * Fact Type
+   *
+   * Fact type: world, experience or observation
+   */
+  fact_type?: string | null;
+  /**
+   * Document Id
+   *
+   * Source document ID
+   */
+  document_id?: string | null;
+  /**
+   * Mentioned At
+   *
+   * When the memory was mentioned (ISO 8601)
+   */
+  mentioned_at?: string | null;
+  /**
+   * Occurred Start
+   *
+   * Start of the event interval (ISO 8601)
+   */
+  occurred_start?: string | null;
+  /**
+   * Occurred End
+   *
+   * End of the event interval (ISO 8601)
+   */
+  occurred_end?: string | null;
+  /**
+   * Entities
+   *
+   * Comma-separated canonical entity names
+   */
+  entities?: string;
+  /**
+   * Chunk Id
+   *
+   * Source chunk ID
+   */
+  chunk_id?: string | null;
+  /**
+   * Proof Count
+   *
+   * How many times the fact was independently seen
+   */
+  proof_count?: number;
+  /**
+   * Tags
+   *
+   * Tags on this memory unit
+   */
+  tags?: Array<string>;
+  /**
+   * Metadata
+   *
+   * Arbitrary metadata stored with the memory
+   */
+  metadata?: {
+    [key: string]: unknown;
+  };
+  /**
+   * Consolidated At
+   *
+   * When consolidation last succeeded (ISO 8601)
+   */
+  consolidated_at?: string | null;
+  /**
+   * Consolidation Failed At
+   *
+   * When consolidation last failed permanently (ISO 8601)
+   */
+  consolidation_failed_at?: string | null;
+  /**
+   * State
+   *
+   * Curation state: 'valid' or 'invalidated'
+   */
+  state?: string;
+  /**
+   * Invalidation Reason
+   *
+   * Why the fact was invalidated, if it was
+   */
+  invalidation_reason?: string | null;
+  /**
+   * Invalidated At
+   *
+   * When the fact was invalidated (ISO 8601)
+   */
+  invalidated_at?: string | null;
+  /**
+   * Edited At
+   *
+   * When the fact was last edited by hand (ISO 8601)
+   */
+  edited_at?: string | null;
+  /**
+   * Updated At
+   *
+   * Write watermark for this row (ISO 8601)
+   */
+  updated_at?: string | null;
+  /**
+   * Source Memory Ids
+   *
+   * An observation's source facts; empty for a source fact
+   */
+  source_memory_ids?: Array<string>;
 };
 
 /**
@@ -3534,6 +4633,12 @@ export type MentalModelResponse = {
    */
   last_memory_seen_at?: string | null;
   /**
+   * Last Refresh Failed At
+   *
+   * When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history.
+   */
+  last_refresh_failed_at?: string | null;
+  /**
    * Created At
    */
   created_at?: string | null;
@@ -3660,8 +4765,24 @@ export type MentalModelTraceToolCall = {
  * MentalModelTrigger
  *
  * Trigger settings for a mental model.
+ *
+ * Inherits the reflect options an operator can also default per bank
+ * (``reflect_default_options``): set here they apply to this model's refreshes
+ * only, and win over the bank default.
  */
 export type MentalModelTriggerInput = {
+  /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
   /**
    * Mode
    *
@@ -3754,8 +4875,24 @@ export type MentalModelTriggerInput = {
  * MentalModelTrigger
  *
  * Trigger settings for a mental model.
+ *
+ * Inherits the reflect options an operator can also default per bank
+ * (``reflect_default_options``): set here they apply to this model's refreshes
+ * only, and win over the bank default.
  */
 export type MentalModelTriggerOutput = {
+  /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
   /**
    * Mode
    *
@@ -3849,38 +4986,56 @@ export type MentalModelTriggerOutput = {
 /**
  * MinScores
  *
- * Optional per-stage score floors for recall (all inclusive, AND-ed).
+ * Optional per-stage score floors for recall. Every floor is inclusive (``>=``).
  *
- * ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into the SQL
- * arms (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
- * config for this request), so they prune weak matches before fusion. ``reranker``
- * and ``final`` are **post-query** filters applied to the scored results after
- * reranking. Any field left None imposes no floor; all-None (the default) means
- * no score filtering.
+ * The four floors act at two different levels, and the distinction decides what a
+ * returned result is guaranteed to satisfy.
+ *
+ * ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into their own
+ * SQL arm (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
+ * config for this request), so they prune weak matches before fusion. Each one
+ * constrains **only the arm it names**. Recall fuses four arms — semantic, keyword,
+ * graph and temporal — and a result reaches the response if *any* arm surfaced it,
+ * so a returned result may legitimately carry ``null`` for a stage it was not
+ * surfaced by, and results reached through the graph or temporal arm carry neither
+ * ``semantic`` nor ``keyword``. A *non-null* score always clears its floor — the
+ * gap is only ever a ``null``. Setting both does **not** restrict the response to
+ * results that clear both: they are not a predicate over each fused result. This is
+ * deliberate — an intersection would discard the strong single-arm matches that
+ * hybrid retrieval exists to find (a paraphrase with no lexical overlap, an exact
+ * identifier the embedding scores poorly).
+ *
+ * ``reranker`` and ``final`` are **post-query** filters applied to every scored
+ * result after fusion and reranking, so these *are* per-result predicates: a
+ * returned result always clears them. Use them, not the retrieval floors, to make
+ * recall abstain on low-confidence queries.
+ *
+ * Any field left None imposes no floor; all-None (the default) means no score
+ * filtering.
  */
 export type MinScores = {
   /**
    * Semantic
    *
-   * Retrieval-level: minimum vector similarity (0-1).
+   * Retrieval-level, semantic arm only: minimum vector similarity (0-1). A result the semantic arm did not surface reports `semantic: null` and is unaffected by this floor.
    */
   semantic?: number | null;
   /**
    * Keyword
    *
-   * Retrieval-level: minimum keyword/full-text (BM25) score.
+   * Retrieval-level, keyword arm only: minimum keyword/full-text (BM25) score. A result the keyword arm did not surface reports `keyword: null` and is unaffected by this floor.
    */
   keyword?: number | null;
   /**
    * Reranker
    *
-   * Post-query: minimum normalized reranker score (0-1).
+   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result.
    */
   reranker?: number | null;
   /**
    * Final
    *
-   * Post-query: minimum final ranking score.
+   * Post-query: minimum final ranking score. Applied to every returned result.
    */
   final?: number | null;
 };
@@ -3917,6 +5072,24 @@ export type ObservationScopesResponse = {
    * Distinct observation scopes, most populous first
    */
   scopes: Array<ObservationScope>;
+  /**
+   * Total
+   *
+   * Total number of distinct scopes in the bank (ignores limit/offset)
+   */
+  total: number;
+  /**
+   * Limit
+   *
+   * Maximum number of scopes returned in this page
+   */
+  limit: number;
+  /**
+   * Offset
+   *
+   * Offset this page started at
+   */
+  offset: number;
 };
 
 /**
@@ -4146,6 +5319,182 @@ export type OperationsListResponse = {
 };
 
 /**
+ * PromptBlockModel
+ *
+ * One block of a message: its text, and the setting that decides it.
+ *
+ * The **active** blocks of a message concatenate back to the exact text sent, so a
+ * client can render them separately without showing the reader something the model
+ * never receives. An **inactive** block has no text: it marks a setting that is
+ * switched off, at the point where it would land if it were on.
+ *
+ * Everything identifying a block is a machine value, never display copy — what a
+ * block is called, and what turning a switched-off one on would do, is for the
+ * client to say in the language it is running in.
+ */
+export type PromptBlockModel = {
+  /**
+   * Text
+   *
+   * The block's text; empty when the block is inactive.
+   */
+  text: string;
+  /**
+   * Source
+   *
+   * `config` — produced by a setting (`field` names it); `builtin` — Hindsight's own wording.
+   */
+  source: "config" | "builtin";
+  /**
+   * Field
+   *
+   * Config field behind this block; empty when no single field owns it.
+   */
+  field?: string;
+  /**
+   * Section
+   *
+   * Slug for a part the preview names itself and no field owns: `bank_identity`, `disposition`, `directives`. Empty otherwise.
+   */
+  section?: string;
+  /**
+   * Heading
+   *
+   * The section heading the prompt text carries at this point, extracted from the prompt itself. Empty when it carries none.
+   */
+  heading?: string;
+  /**
+   * Active
+   *
+   * Whether this block is in the prompt as configured.
+   */
+  active?: boolean;
+  /**
+   * Value
+   *
+   * The field's effective value; null when unset.
+   */
+  value?: string | null;
+  /**
+   * Kind
+   *
+   * Shape of the value, so a client can offer the right control for editing it.
+   */
+  kind: "text" | "boolean" | "choice" | "complex";
+  /**
+   * Choices
+   *
+   * Allowed values, when `kind` is `choice`.
+   */
+  choices?: Array<string> | null;
+  /**
+   * Editable
+   *
+   * Whether this bank may override the field via the bank config API. Server-level fields shape the prompt but cannot be set per bank, and offering to edit one would only collect a 400.
+   */
+  editable?: boolean;
+};
+
+/**
+ * PromptMessageModel
+ *
+ * One message of the request, as the blocks it is built from.
+ */
+export type PromptMessageModel = {
+  /**
+   * Role
+   */
+  role: "system" | "user";
+  /**
+   * Blocks
+   */
+  blocks?: Array<PromptBlockModel>;
+};
+
+/**
+ * PromptPreviewRequest
+ *
+ * Request to render the prompts an operation would send, without calling an LLM.
+ *
+ * The operation is the whole request: everything that shapes the prompt comes from
+ * the bank — its resolved config, profile and directives — and the runtime data an
+ * operation would be given is a fixed placeholder. There is deliberately nothing to
+ * override. A preview answers "what does this bank send"; letting a caller pass its
+ * own mission or sample text only moved that question somewhere the bank cannot
+ * answer it. To try a candidate value, save it and look again — the response says
+ * which settings are editable.
+ */
+export type PromptPreviewRequest = {
+  /**
+   * Operation
+   *
+   * Which operation's prompts to render.
+   */
+  operation?: "retain" | "consolidation" | "reflect";
+  /**
+   * Strategy
+   *
+   * Name of a retain strategy to render under (a key of the bank's `retain_strategies`). Retain only. Omit it and the bank's `retain_default_strategy` applies, exactly as it does for a retain that names none.
+   */
+  strategy?: string | null;
+};
+
+/**
+ * PromptPreviewResponse
+ *
+ * The messages one call of the requested operation would send.
+ *
+ * `messages` is in send order, system first. Both are always present because a
+ * mission is not necessarily in the system prompt: retain and consolidation keep
+ * their system prompt bank-agnostic (so one provider-side cache serves every bank)
+ * and carry the mission in the user message instead.
+ *
+ * When `skipped_reason` is set the configuration means no prompt is sent at all —
+ * `chunks` extraction mode stores each chunk verbatim and never calls an LLM — and
+ * `messages` is empty.
+ */
+export type PromptPreviewResponse = {
+  /**
+   * Messages
+   *
+   * Request messages, in send order. Each is given as the blocks it is built from.
+   */
+  messages?: Array<PromptMessageModel>;
+  /**
+   * Strategy
+   *
+   * The retain strategy these prompts were rendered under, if any.
+   */
+  strategy?: string | null;
+  /**
+   * Strategies
+   *
+   * Names of the bank's retain strategies, so a client can offer them without a second call.
+   */
+  strategies?: Array<string>;
+  /**
+   * Run Settings
+   *
+   * Settings that shape the operation without appearing in its prompt, such as chunk sizes.
+   */
+  run_settings?: Array<RunSettingModel>;
+  /**
+   * Response Schema
+   *
+   * JSON schema the response is constrained to, when the operation constrains it.
+   */
+  response_schema?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Skipped Reason
+   *
+   * Why no prompt is sent, when the configuration means none is.
+   */
+  skipped_reason?: string | null;
+};
+
+/**
  * RecallRequest
  *
  * Request model for recall endpoint.
@@ -4201,11 +5550,11 @@ export type RecallRequest = {
   /**
    * Tag Groups
    *
-   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
-   * Optional per-stage score floors (all inclusive, AND-ed). `semantic` and `keyword` are retrieval-level cutoffs pushed into the SQL arms (overriding the global similarity/BM25 minimums for this request); `reranker` and `final` are post-ranking filters on the scored results. Any field left unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).
+   * Optional per-stage score floors, each inclusive (`>=`). `semantic` and `keyword` are retrieval-level cutoffs pushed into the SQL arm they name (overriding the global similarity/BM25 minimums for this request), and constrain only that arm: recall fuses four arms (semantic, keyword, graph, temporal) and returns a result surfaced by any of them, so a returned result reports null for a stage that did not surface it (a non-null score always clears its floor). Setting both therefore does not restrict the response to results clearing both. `reranker` and `final` are post-ranking filters applied to every scored result, so those floors *are* guaranteed by each result returned — use them for query abstention. Any field left unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match may score ~0.001 even though it is ranked first).
    */
   min_scores?: MinScores | null;
   /**
@@ -4323,6 +5672,12 @@ export type RecallResult = {
    */
   source_fact_ids?: Array<string> | null;
   scores?: RecallScores | null;
+  /**
+   * Attachments
+   *
+   * Attachments this fact was drawn from, as recorded per fact at extraction time — the same edge the memory read endpoints return, not everything its chunk happened to carry. A fact stated in prose reports none; an observation reports those of the facts it was consolidated from. Omitted when there are none.
+   */
+  attachments?: Array<ChunkAttachment> | null;
 };
 
 /**
@@ -4459,6 +5814,34 @@ export type ReflectFact = {
    * Occurred End
    */
   occurred_end?: string | null;
+  /**
+   * Mentioned At
+   */
+  mentioned_at?: string | null;
+  /**
+   * Document Id
+   */
+  document_id?: string | null;
+  /**
+   * Chunk Id
+   */
+  chunk_id?: string | null;
+  /**
+   * Tags
+   */
+  tags?: Array<string> | null;
+  /**
+   * Metadata
+   */
+  metadata?: {
+    [key: string]: string;
+  } | null;
+  /**
+   * Attachments
+   *
+   * Attachments this memory was drawn from — the same per-fact edge recall reports. An observation reports those of the facts it was consolidated from. Omitted when there are none.
+   */
+  attachments?: Array<ChunkAttachment> | null;
 };
 
 /**
@@ -4530,6 +5913,18 @@ export type ReflectMentalModel = {
  */
 export type ReflectRequest = {
   /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
+  /**
    * Query
    */
   query: string;
@@ -4575,7 +5970,7 @@ export type ReflectRequest = {
   /**
    * Tag Groups
    *
-   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags.
+   * Compound tag filter using boolean groups. Groups in the list are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. Mutually exclusive with tags. A leaf may set resolve='fuzzy' to match its tags against the bank's tags by trigram similarity instead of literally, so a query that says 'typsecript' still reaches memories tagged 'typescript'.
    */
   tag_groups?: Array<TagGroupLeaf | TagGroupAndInput | TagGroupOrInput | TagGroupNotInput> | null;
   /**
@@ -4628,6 +6023,12 @@ export type ReflectResponse = {
   structured_output?: {
     [key: string]: unknown;
   } | null;
+  /**
+   * Structured Output Error
+   *
+   * Why structured output could not be produced. Present only when a response_schema was given and the extraction call failed (provider error, timeout, unparseable output). A missing structured_output *without* this field means the answer held nothing matching the schema — the reflect itself still succeeded either way.
+   */
+  structured_output_error?: string | null;
   /**
    * Token usage metrics for LLM calls during reflection.
    */
@@ -4732,7 +6133,8 @@ export type RefreshMentalModelOperationDetails = {
     | "content_preserved_no_new_facts"
     | "refresh_failed_empty_candidate"
     | "refresh_failed_delta_not_applied"
-    | "refresh_failed_structured_output";
+    | "refresh_failed_structured_output"
+    | "refresh_failed_error";
   /**
    * Failure Reason
    *
@@ -4745,6 +6147,9 @@ export type RefreshMentalModelOperationDetails = {
     | "delta_ops_all_skipped"
     | "delta_not_applied"
     | "structured_output_failed"
+    | "retrieval_failed"
+    | "no_answer"
+    | "unexpected_error"
     | null;
 };
 
@@ -4863,6 +6268,54 @@ export type RetryOperationResponse = {
 };
 
 /**
+ * RunSettingModel
+ *
+ * A setting that shapes the operation without appearing in its prompt.
+ *
+ * Chunk sizes decide how the input is cut before extraction runs, so they change
+ * what comes back while contributing no prompt text — they cannot be blocks, which
+ * partition the message, and these are in none of it.
+ */
+export type RunSettingModel = {
+  /**
+   * Field
+   */
+  field: string;
+  /**
+   * Value
+   *
+   * Effective value; null when unset.
+   */
+  value?: string | null;
+  /**
+   * Kind
+   *
+   * Shape of the value, so a client can offer the right control.
+   */
+  kind: "text" | "boolean" | "choice" | "complex";
+  /**
+   * Editable
+   *
+   * Whether this bank may override the field via the bank config API.
+   */
+  editable?: boolean;
+};
+
+/**
+ * SetBankAliasPrimaryRequest
+ *
+ * Request model for showing (or no longer showing) an alias in place of the bank id.
+ */
+export type SetBankAliasPrimaryRequest = {
+  /**
+   * Primary
+   *
+   * True to present the bank under this alias; False to go back to its own id.
+   */
+  primary: boolean;
+};
+
+/**
  * SourceFactsIncludeOptions
  *
  * Options for including source facts for observation-type results.
@@ -4880,6 +6333,90 @@ export type SourceFactsIncludeOptions = {
    * Maximum tokens of source facts per observation (-1 = unlimited)
    */
   max_tokens_per_observation?: number;
+};
+
+/**
+ * StrategyPreview
+ *
+ * Preview of one strategy, aligned by position with the request.
+ */
+export type StrategyPreview = {
+  /**
+   * Active
+   *
+   * False when the server would ignore this strategy (no usable rule, or no setting)
+   */
+  active: boolean;
+  /**
+   * Claimed Count
+   *
+   * Existing scopes this strategy actually applies to
+   */
+  claimed_count: number;
+  /**
+   * Rules
+   *
+   * One entry per rule, aligned with the request
+   */
+  rules: Array<StrategyRulePreview>;
+};
+
+/**
+ * StrategyRulePreview
+ *
+ * What one rule (one entry of a strategy's `scopes`) matches among existing scopes.
+ */
+export type StrategyRulePreview = {
+  /**
+   * Match Count
+   *
+   * Existing scopes this rule matches
+   */
+  match_count: number;
+  /**
+   * Taken Count
+   *
+   * Of those, how many an earlier strategy wins, so this one has no effect
+   */
+  taken_count: number;
+  /**
+   * Observation Count
+   *
+   * Observations across the matching scopes
+   */
+  observation_count: number;
+  /**
+   * Samples
+   *
+   * The most populous matching scopes, up to sample_limit
+   */
+  samples: Array<StrategyScopePreview>;
+};
+
+/**
+ * StrategyScopePreview
+ *
+ * One existing observation scope in a consolidation-strategy preview.
+ */
+export type StrategyScopePreview = {
+  /**
+   * Tags
+   *
+   * The scope's tags (sorted)
+   */
+  tags: Array<string>;
+  /**
+   * Count
+   *
+   * Observations in this scope
+   */
+  count: number;
+  /**
+   * Handled By
+   *
+   * Index of the strategy that actually applies to this scope (the first that claims it), or null when no strategy does and Default applies
+   */
+  handled_by: number | null;
 };
 
 /**
@@ -4920,6 +6457,10 @@ export type TagGroupLeaf = {
    * Match
    */
   match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+  /**
+   * Resolve
+   */
+  resolve?: "exact" | "fuzzy";
 };
 
 /**
@@ -5022,6 +6563,22 @@ export type TemporalWindow = {
    * End of the window (inclusive).
    */
   end: string;
+};
+
+/**
+ * TextContentBlock
+ *
+ * A run of text within a multimodal item, in the position the caller wrote it.
+ */
+export type TextContentBlock = {
+  /**
+   * Type
+   */
+  type: "text";
+  /**
+   * Text
+   */
+  text: string;
 };
 
 /**
@@ -5135,7 +6692,7 @@ export type UpdateDocumentRequest = {
   /**
    * Tags
    *
-   * New tags for the document and its memory units. Triggers observation invalidation and re-consolidation.
+   * The complete new set of tags for the document and its memory units — this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation.
    */
   tags?: Array<string> | null;
 };
@@ -5494,6 +7051,24 @@ export type WebhookListResponse = {
    * Items
    */
   items: Array<WebhookResponse>;
+  /**
+   * Total
+   *
+   * Total number of webhooks on the bank (ignores limit/offset)
+   */
+  total: number;
+  /**
+   * Limit
+   *
+   * Maximum number of webhooks returned in this page
+   */
+  limit: number;
+  /**
+   * Offset
+   *
+   * Offset this page started at
+   */
+  offset: number;
 };
 
 /**
@@ -5599,6 +7174,103 @@ export type GetVersionResponses = {
 
 export type GetVersionResponse = GetVersionResponses[keyof GetVersionResponses];
 
+export type ResetLlmConcurrencyData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path?: never;
+  query?: never;
+  url: "/v1/default/llm-concurrency";
+};
+
+export type ResetLlmConcurrencyErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ResetLlmConcurrencyError = ResetLlmConcurrencyErrors[keyof ResetLlmConcurrencyErrors];
+
+export type ResetLlmConcurrencyResponses = {
+  /**
+   * Successful Response
+   */
+  200: LlmConcurrencyResponse;
+};
+
+export type ResetLlmConcurrencyResponse =
+  ResetLlmConcurrencyResponses[keyof ResetLlmConcurrencyResponses];
+
+export type GetLlmConcurrencyData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path?: never;
+  query?: never;
+  url: "/v1/default/llm-concurrency";
+};
+
+export type GetLlmConcurrencyErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetLlmConcurrencyError = GetLlmConcurrencyErrors[keyof GetLlmConcurrencyErrors];
+
+export type GetLlmConcurrencyResponses = {
+  /**
+   * Successful Response
+   */
+  200: LlmConcurrencyResponse;
+};
+
+export type GetLlmConcurrencyResponse =
+  GetLlmConcurrencyResponses[keyof GetLlmConcurrencyResponses];
+
+export type UpdateLlmConcurrencyData = {
+  body: LlmConcurrencyUpdate;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path?: never;
+  query?: never;
+  url: "/v1/default/llm-concurrency";
+};
+
+export type UpdateLlmConcurrencyErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type UpdateLlmConcurrencyError =
+  UpdateLlmConcurrencyErrors[keyof UpdateLlmConcurrencyErrors];
+
+export type UpdateLlmConcurrencyResponses = {
+  /**
+   * Successful Response
+   */
+  200: LlmConcurrencyResponse;
+};
+
+export type UpdateLlmConcurrencyResponse =
+  UpdateLlmConcurrencyResponses[keyof UpdateLlmConcurrencyResponses];
+
 export type MetricsEndpointMetricsGetData = {
   body?: never;
   path?: never;
@@ -5661,6 +7333,10 @@ export type GetGraphData = {
 };
 
 export type GetGraphErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -5726,6 +7402,30 @@ export type ListMemoriesData = {
      */
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     /**
+     * Time Field
+     *
+     * Time axis to filter and order by. `created_at` / `updated_at` = ingest and last-write time; `mentioned_at` / `occurred_start` / `occurred_end` = event time. Defaults to `created_at` when only `start_date`/`end_date` are given. Filtering and ordering both follow `time_field`, and rows with no value on that column are excluded — so `total` counts only rows carrying that timestamp, and can be 0 on a bank that is not empty.
+     */
+    time_field?:
+      | "created_at"
+      | "updated_at"
+      | "mentioned_at"
+      | "occurred_start"
+      | "occurred_end"
+      | null;
+    /**
+     * Start Date
+     *
+     * Filter from this ISO datetime (inclusive)
+     */
+    start_date?: string | null;
+    /**
+     * End Date
+     *
+     * Filter until this ISO datetime (exclusive)
+     */
+    end_date?: string | null;
+    /**
      * Limit
      */
     limit?: number;
@@ -5738,6 +7438,10 @@ export type ListMemoriesData = {
 };
 
 export type ListMemoriesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -5792,6 +7496,42 @@ export type DryRunExtractMemoriesResponses = {
 
 export type DryRunExtractMemoriesResponse =
   DryRunExtractMemoriesResponses[keyof DryRunExtractMemoriesResponses];
+
+export type PreviewPromptData = {
+  body: PromptPreviewRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/prompts/preview";
+};
+
+export type PreviewPromptErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type PreviewPromptError = PreviewPromptErrors[keyof PreviewPromptErrors];
+
+export type PreviewPromptResponses = {
+  /**
+   * Successful Response
+   */
+  200: PromptPreviewResponse;
+};
+
+export type PreviewPromptResponse = PreviewPromptResponses[keyof PreviewPromptResponses];
 
 export type GetMemoryData = {
   body?: never;
@@ -6057,6 +7797,10 @@ export type GetAgentStatsData = {
 
 export type GetAgentStatsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6140,6 +7884,10 @@ export type GetMemoriesTimeseriesData = {
 
 export type GetMemoriesTimeseriesErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6191,6 +7939,10 @@ export type ListEntitiesData = {
 
 export type ListEntitiesErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6239,6 +7991,10 @@ export type GetEntityGraphData = {
 };
 
 export type GetEntityGraphErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -6368,7 +8124,7 @@ export type ListMentalModelsData = {
     /**
      * Detail
      *
-     * Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)
+     * Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.
      */
     detail?: "metadata" | "content" | "full";
     /**
@@ -6384,6 +8140,10 @@ export type ListMentalModelsData = {
 };
 
 export type ListMentalModelsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -6746,6 +8506,10 @@ export type GetKnowledgeBaseTreeData = {
 
 export type GetKnowledgeBaseTreeErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6859,6 +8623,10 @@ export type ExportKnowledgeBaseData = {
 
 export type ExportKnowledgeBaseErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6908,6 +8676,10 @@ export type SearchKnowledgeBaseData = {
 };
 
 export type SearchKnowledgeBaseErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -7091,6 +8863,10 @@ export type ListDirectivesData = {
 };
 
 export type ListDirectivesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -7296,6 +9072,24 @@ export type ListDocumentsData = {
      */
     tags_match?: string;
     /**
+     * Time Field
+     *
+     * Time axis to filter and order by: `created_at` (when the document first arrived) or `updated_at` (its last write, the default ordering). Filtering and ordering both follow `time_field`, and rows with no value on that column are excluded — so `total` counts only rows carrying that timestamp, and can be 0 on a bank that is not empty.
+     */
+    time_field?: "created_at" | "updated_at" | null;
+    /**
+     * Start Date
+     *
+     * Filter from this ISO datetime (inclusive)
+     */
+    start_date?: string | null;
+    /**
+     * End Date
+     *
+     * Filter until this ISO datetime (exclusive)
+     */
+    end_date?: string | null;
+    /**
      * Limit
      */
     limit?: number;
@@ -7308,6 +9102,10 @@ export type ListDocumentsData = {
 };
 
 export type ListDocumentsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -7585,6 +9383,10 @@ export type ListTagsData = {
 
 export type ListTagsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -7687,6 +9489,10 @@ export type ListOperationsData = {
 };
 
 export type ListOperationsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -7983,6 +9789,159 @@ export type AddBankBackgroundResponses = {
 export type AddBankBackgroundResponse =
   AddBankBackgroundResponses[keyof AddBankBackgroundResponses];
 
+export type ListBankAliasesData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases";
+};
+
+export type ListBankAliasesErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListBankAliasesError = ListBankAliasesErrors[keyof ListBankAliasesErrors];
+
+export type ListBankAliasesResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankAliasesResponse;
+};
+
+export type ListBankAliasesResponse = ListBankAliasesResponses[keyof ListBankAliasesResponses];
+
+export type CreateBankAliasData = {
+  body: CreateBankAliasRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases";
+};
+
+export type CreateBankAliasErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CreateBankAliasError = CreateBankAliasErrors[keyof CreateBankAliasErrors];
+
+export type CreateBankAliasResponses = {
+  /**
+   * Successful Response
+   */
+  201: BankAliasesResponse;
+};
+
+export type CreateBankAliasResponse = CreateBankAliasResponses[keyof CreateBankAliasResponses];
+
+export type DeleteBankAliasData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Alias
+     */
+    alias: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases/{alias}";
+};
+
+export type DeleteBankAliasErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DeleteBankAliasError = DeleteBankAliasErrors[keyof DeleteBankAliasErrors];
+
+export type DeleteBankAliasResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankAliasesResponse;
+};
+
+export type DeleteBankAliasResponse = DeleteBankAliasResponses[keyof DeleteBankAliasResponses];
+
+export type SetBankAliasPrimaryData = {
+  body: SetBankAliasPrimaryRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Alias
+     */
+    alias: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases/{alias}";
+};
+
+export type SetBankAliasPrimaryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type SetBankAliasPrimaryError = SetBankAliasPrimaryErrors[keyof SetBankAliasPrimaryErrors];
+
+export type SetBankAliasPrimaryResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankAliasesResponse;
+};
+
+export type SetBankAliasPrimaryResponse =
+  SetBankAliasPrimaryResponses[keyof SetBankAliasPrimaryResponses];
+
 export type DeleteBankData = {
   body?: never;
   headers?: {
@@ -8093,7 +10052,12 @@ export type CreateOrUpdateBankResponse =
   CreateOrUpdateBankResponses[keyof CreateOrUpdateBankResponses];
 
 export type ImportBankTemplateData = {
-  body?: never;
+  /**
+   * Manifest
+   *
+   * Bank template manifest
+   */
+  body: BankTemplateManifest;
   headers?: {
     /**
      * Authorization
@@ -8155,6 +10119,10 @@ export type ExportBankTemplateData = {
 };
 
 export type ExportBankTemplateErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -8306,6 +10274,252 @@ export type ExportDocumentsResponses = {
 
 export type ExportDocumentsResponse = ExportDocumentsResponses[keyof ExportDocumentsResponses];
 
+export type ExportBankTransferData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Include Data
+     *
+     * Carry the memories and everything backing them
+     */
+    include_data?: boolean;
+    /**
+     * Include Bank Config
+     *
+     * Carry the bank's config overrides, directives and webhooks
+     */
+    include_bank_config?: boolean;
+    /**
+     * Include History
+     *
+     * Carry audit_log and llm_requests
+     */
+    include_history?: boolean;
+    /**
+     * Document Id
+     *
+     * Document id(s); omit for the whole bank
+     */
+    document_id?: Array<string> | null;
+  };
+  url: "/v1/default/banks/{bank_id}/transfer/export";
+};
+
+export type ExportBankTransferErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ExportBankTransferError = ExportBankTransferErrors[keyof ExportBankTransferErrors];
+
+export type ExportBankTransferResponses = {
+  /**
+   * Successful Response
+   */
+  202: BankTransferSubmitResponse;
+};
+
+export type ExportBankTransferResponse =
+  ExportBankTransferResponses[keyof ExportBankTransferResponses];
+
+export type ImportBankTransferData = {
+  body: BodyImportBankTransfer;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Mode
+     *
+     * restore (into a fresh bank) | merge (into this bank)
+     */
+    mode?: string;
+    /**
+     * Target Bank Id
+     *
+     * restore mode: the bank to create; defaults to the archive's source bank
+     */
+    target_bank_id?: string | null;
+    /**
+     * Document Conflict
+     *
+     * merge mode: skip | replace | new-id
+     */
+    document_conflict?: string;
+    /**
+     * Include Data
+     *
+     * restore mode: carry the memories and everything backing them (default true)
+     */
+    include_data?: boolean | null;
+    /**
+     * Include Bank Config
+     *
+     * restore mode: restore the bank's config overrides, directives and webhooks (default true)
+     */
+    include_bank_config?: boolean | null;
+    /**
+     * Include History
+     *
+     * restore mode: carry audit_log and llm_requests (default false)
+     */
+    include_history?: boolean | null;
+  };
+  url: "/v1/default/banks/{bank_id}/transfer/import";
+};
+
+export type ImportBankTransferErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ImportBankTransferError = ImportBankTransferErrors[keyof ImportBankTransferErrors];
+
+export type ImportBankTransferResponses = {
+  /**
+   * Successful Response
+   */
+  202: BankTransferSubmitResponse;
+};
+
+export type ImportBankTransferResponse =
+  ImportBankTransferResponses[keyof ImportBankTransferResponses];
+
+export type CloneBankData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query: {
+    /**
+     * Target Bank Id
+     *
+     * Bank to create; must not already exist
+     */
+    target_bank_id: string;
+    /**
+     * Include Data
+     *
+     * Copy the memories, what backs them, and the mental models and knowledge pages synthesized from them
+     */
+    include_data?: boolean;
+    /**
+     * Include Bank Config
+     *
+     * Copy the bank's config overrides, directives and webhooks
+     */
+    include_bank_config?: boolean;
+    /**
+     * Include History
+     *
+     * Copy audit_log and llm_requests
+     */
+    include_history?: boolean;
+  };
+  url: "/v1/default/banks/{bank_id}/clone";
+};
+
+export type CloneBankErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CloneBankError = CloneBankErrors[keyof CloneBankErrors];
+
+export type CloneBankResponses = {
+  /**
+   * Successful Response
+   */
+  202: BankTransferSubmitResponse;
+};
+
+export type CloneBankResponse = CloneBankResponses[keyof CloneBankResponses];
+
+export type GetBankAttachmentData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Attachment Id
+     */
+    attachment_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/attachments/{attachment_id}";
+};
+
+export type GetBankAttachmentErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetBankAttachmentError = GetBankAttachmentErrors[keyof GetBankAttachmentErrors];
+
+export type GetBankAttachmentResponses = {
+  /**
+   * Attachment bytes
+   */
+  200: Blob | File;
+};
+
+export type GetBankAttachmentResponse =
+  GetBankAttachmentResponses[keyof GetBankAttachmentResponses];
+
 export type DownloadFileData = {
   body?: never;
   headers?: {
@@ -8337,8 +10551,10 @@ export type DownloadFileResponses = {
   /**
    * Stored file
    */
-  200: unknown;
+  200: Blob | File;
 };
+
+export type DownloadFileResponse = DownloadFileResponses[keyof DownloadFileResponses];
 
 export type GetBankTemplateSchemaData = {
   body?: never;
@@ -8405,11 +10621,28 @@ export type ListObservationScopesData = {
      */
     bank_id: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of scopes to return
+     */
+    limit?: number;
+    /**
+     * Offset
+     *
+     * Offset for pagination
+     */
+    offset?: number;
+  };
   url: "/v1/default/banks/{bank_id}/observations/scopes";
 };
 
 export type ListObservationScopesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -8428,6 +10661,48 @@ export type ListObservationScopesResponses = {
 
 export type ListObservationScopesResponse =
   ListObservationScopesResponses[keyof ListObservationScopesResponses];
+
+export type PreviewConsolidationStrategiesData = {
+  body: ConsolidationStrategiesPreviewRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/consolidation-strategies/preview";
+};
+
+export type PreviewConsolidationStrategiesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type PreviewConsolidationStrategiesError =
+  PreviewConsolidationStrategiesErrors[keyof PreviewConsolidationStrategiesErrors];
+
+export type PreviewConsolidationStrategiesResponses = {
+  /**
+   * Successful Response
+   */
+  200: ConsolidationStrategiesPreview;
+};
+
+export type PreviewConsolidationStrategiesResponse =
+  PreviewConsolidationStrategiesResponses[keyof PreviewConsolidationStrategiesResponses];
 
 export type RecoverConsolidationData = {
   body?: never;
@@ -8565,6 +10840,10 @@ export type GetBankConfigData = {
 
 export type GetBankConfigErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -8672,11 +10951,28 @@ export type ListWebhooksData = {
      */
     bank_id: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of webhooks to return
+     */
+    limit?: number;
+    /**
+     * Offset
+     *
+     * Offset for pagination
+     */
+    offset?: number;
+  };
   url: "/v1/default/banks/{bank_id}/webhooks";
 };
 
 export type ListWebhooksErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -9038,6 +11334,10 @@ export type ListAuditLogsData = {
 
 export type ListAuditLogsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -9086,6 +11386,10 @@ export type AuditLogStatsData = {
 };
 
 export type AuditLogStatsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -9196,6 +11500,10 @@ export type ListLlmRequestsData = {
 
 export type ListLlmRequestsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -9244,6 +11552,10 @@ export type LlmRequestStatsData = {
 };
 
 export type LlmRequestStatsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */

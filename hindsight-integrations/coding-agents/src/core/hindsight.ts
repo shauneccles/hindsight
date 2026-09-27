@@ -6,12 +6,20 @@
  * creates knowledge pages. Nothing here knows about opencode/claude-code/etc.
  */
 import {
+  type BankOverrides,
   buildPageTrigger,
-  CODING_BANK_STRUCTURE,
-  CODING_BANK_TEMPLATE,
+  codingBankManifest,
+  type CustomPagesConfig,
+  type CurrentPageTrigger,
   PAGE_MAX_TOKENS,
   pagesFor,
+  type PagesConfig,
+  pageScopeRule,
   type PageTrigger,
+  pageTriggerDrifted,
+  pageTriggerFor,
+  pageTriggerPatch,
+  type RetainExtractionMode,
 } from "./missions";
 import { pool, semverGte, sleep } from "./util";
 import type { RetainStamp } from "./retain-stamp";
@@ -25,7 +33,7 @@ export interface KnowledgeNode {
   description?: string;
   /** The page's EFFECTIVE refresh policy, on servers new enough to report it (#3572). Absent
    *  everywhere else, which `seedPages()` reads as "unknown, leave it alone". */
-  trigger?: { tags_match?: string };
+  trigger?: CurrentPageTrigger;
   children?: KnowledgeNode[];
 }
 
@@ -33,7 +41,45 @@ export interface KnowledgeNode {
  * How consolidation scopes the observations a retained memory feeds (`observation_scopes` on the
  * retain API). The scalar modes are the server's; a `string[][]` declares the scopes explicitly.
  */
-export type ObservationScopes = "shared" | "combined" | "per_tag" | "all_combinations" | string[][];
+export type ObservationScopes =
+  | "shared"
+  | "combined"
+  | "per_tag"
+  | "all_combinations"
+  | "per_source"
+  | string[][];
+
+/**
+ * `per_source` is resolved HERE, per document, and never reaches the server: it expands to the
+ * global scope plus one named for that document's own `source:` tag.
+ *
+ * It cannot be expressed as configuration. The server treats an explicit scope list as
+ * unconditional — consolidation returns it verbatim without filtering it against the memory's own
+ * tags — so a configured `[[], ["source:git"], ["source:chat"]]` writes EVERY document into all
+ * three, and the `source:git` scope fills up with beliefs built from chat transcripts. Only a
+ * per-document decision separates "what the commits say" from "what was discussed".
+ *
+ * `per_tag` would split on the right axis but also on every other one: it reinstates the per-agent
+ * `harness:` fork that `shared` exists to prevent, and any volatile tag (a session id in
+ * `retainTags`) becomes its own scope, which is the fragmentation bug itself. Reading only
+ * `source:` is what keeps this safe.
+ *
+ * A document may carry more than one source tag — the commit-message seed is both `source:git` and
+ * `source:git-log`, because the cold-repo check filters on `source:git` — so every distinct one
+ * gets a scope. Taking all of them, sorted, is the only rule that needs no arbitrary tie-break and
+ * does not silently depend on the order the caller assembled its tags in.
+ *
+ * The empty scope is always first and always present, so the untagged observations that knowledge
+ * pages read (they match with `tags_match: "all"`) keep being written exactly as under `shared`.
+ */
+export function resolveRetainScopes(
+  tags: string[] | undefined,
+  configured: ObservationScopes
+): ObservationScopes {
+  if (configured !== "per_source") return configured;
+  const sources = [...new Set((tags ?? []).filter((t) => t.startsWith("source:")))].sort();
+  return [[], ...sources.map((s) => [s])];
+}
 
 /**
  * One global scope for everything this plugin writes.
@@ -55,14 +101,22 @@ export interface ClientOpts {
   apiToken?: string;
   bank: string;
   /** Repository this bank is about, named in every seeded page's query (`pageScopeRule`). Only
-   *  `seedPages()` reads it; it falls back to the bank id, which carries the repo name in the
-   *  default `coding-agent::{gitProject}` template. */
+   *  `seedPages()` reads it. Undefined when no single repository is (a shared static bank, a path
+   *  map, a bank several repos are renamed onto) — the query then names the BANK, which is the
+   *  only stable subject such a bank has. Must be a property of the bank and never of the calling
+   *  session's cwd: see `bankProjectName` (#4146). */
   project?: string;
   log?: (msg: string) => void;
   /** Cap on concurrent retain-related requests (drain op polls, deepen pools). Default 10. */
   maxParallelRetains?: number;
   /** Observation scoping for every retain this client sends. Default `DEFAULT_OBSERVATION_SCOPES`. */
   observationScopes?: ObservationScopes;
+  /** Pages one knowledge-page search returns. Default `DEFAULT_PAGE_SEARCH_LIMIT`. Lives on the
+   *  client so every caller — the hook's injection and the MCP tool — shares one value. */
+  pageSearchLimit?: number;
+  /** Recall-body overrides, merged key-by-key over `DEFAULT_RECALL_OPTIONS`. Passed through to
+   *  the API as given (`types`, `max_tokens`, `budget`, …); `query` is never overridable. */
+  recallOptions?: Record<string, unknown>;
   /** Re-read the bearer token from the LIVE config, for hosts that outlive their credential.
    *  `apiToken` alone is a construction-time snapshot: a long-lived host (dsh, Cline, Kilo, the
    *  MCP server, any persistent plugin) kept signing with it forever, so enabling auth or rotating
@@ -121,10 +175,88 @@ export class KnowledgePagesUnavailableError extends Error {
   }
 }
 
+/**
+ * Does this 404 mean the server has no knowledge-base API, rather than "that bank does not exist yet"?
+ *
+ * The two are indistinguishable by status, and conflating them latched the knowledge-page capability
+ * off for the whole process on the FIRST session in a new bank — the bank is minted by the first
+ * retain, so a session-start page read always precedes it (#4607).
+ *
+ * It matches the ENDPOINT-missing shape (FastAPI answers an unrouted path with exactly
+ * `{"detail":"Not Found"}`), deliberately NOT the bank-missing wording. Matching the bank error
+ * instead would hang the fix on a message the API is free to rephrase, and the day it did, #4607
+ * would come back with no test failing. This way a reworded bank error simply fails to match: the
+ * capability stays unknown and the next call retries, which is the safe direction to be wrong in.
+ */
+async function isEndpointMissing(r: Response): Promise<boolean> {
+  try {
+    // Consumes the body, which is safe: every 404 caller below returns without reading it.
+    const j = (await r.json()) as { detail?: unknown };
+    return (
+      String(j?.detail ?? "")
+        .trim()
+        .toLowerCase() === "not found"
+    );
+  } catch {
+    // No JSON body at all (a proxy's HTML 404, a bare gateway response). Our API always answers
+    // bank-not-found in JSON, so this is not it — latch, as this code did before the fix.
+    return true;
+  }
+}
+
 const TERMINAL = new Set(["completed", "failed", "cancelled", "error"]);
 
 /** Default cap on concurrent retain-related requests; configurable via `maxParallelRetains`. */
+/**
+ * A reflect that failed on the SERVER's side of the wire: our deadline expired or the server
+ * answered non-2xx. `status` is undefined for a timeout. Transport errors (connection refused,
+ * DNS) are NOT wrapped — they mean the server is unreachable, so no other endpoint would answer
+ * either.
+ */
+export class ReflectError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | undefined,
+    readonly timedOut: boolean,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+    this.name = "ReflectError";
+  }
+
+  /** A timeout or a 5xx means reflect's synthesis (the slow LLM path) broke, while the cheap
+   *  retrieval endpoints may still answer — worth falling back. A 4xx will fail the same way on
+   *  every endpoint (auth, missing bank), so it is not. */
+  get fallbackEligible(): boolean {
+    return this.timedOut || (this.status !== undefined && this.status >= 500);
+  }
+}
+
 export const DEFAULT_MAX_PARALLEL_RETAINS = 10;
+/** Knowledge pages returned by one search — the hook's injection and the agent-facing
+ *  `hindsight_search_knowledge_pages` tool both get this, so tuning it moves both.
+ *
+ *  Ten, not three. Three was set when the page roster was injected wholesale and search was a
+ *  rarely-used fallback; search is now the way in, and a repo's pages are narrow by design, so the
+ *  decision one turn needs is routinely split across two of them ("Pricing decisions" AND
+ *  "Conventions") and a three-hit cut drops one. Ten snippets is a few hundred tokens on a call the
+ *  agent made deliberately. */
+export const DEFAULT_PAGE_SEARCH_LIMIT = 10;
+/**
+ * The recall body this client sends when `recallOptions` overrides nothing — one object rather
+ * than a field per parameter, so a new recall parameter needs no plumbing here.
+ *
+ * Observations are the consolidated layer, so they are the best answer per token; a bank whose
+ * consolidation is off never grows any, and recalling only observations there returns nothing.
+ * Such a bank sets `{"types": ["world", "experience"]}`, or `{"types": null}` for every type.
+ * The budget stays low and entities are excluded because this runs inside a hook window.
+ */
+export const DEFAULT_RECALL_OPTIONS: Record<string, unknown> = {
+  types: ["observation"],
+  budget: "low",
+  max_tokens: 2000,
+  include: { entities: null },
+};
 
 /** How long drain() pauses between poll cycles when the API did not rate-limit (429). */
 const POLL_CYCLE_MS = 5000;
@@ -143,9 +275,6 @@ const RETRY_AFTER_FLOOR_MS = 10 * 1000;
  */
 const RETRY_AFTER_CEILING_MS = 60 * 1000;
 
-/** Bank-level missions the template seeds once and then leaves alone (#2492). */
-const MISSION_FIELDS = ["reflect_mission", "retain_mission", "observations_mission"] as const;
-
 export class HindsightClient {
   readonly apiUrl: string;
   /** The credential the NEXT request will sign with — NOT the one the config file holds. The two
@@ -162,6 +291,8 @@ export class HindsightClient {
   private readonly log: (msg: string) => void;
   readonly maxParallelRetains: number;
   readonly observationScopes: ObservationScopes;
+  readonly pageSearchLimit: number;
+  readonly recallOptions: Record<string, unknown>;
 
   constructor(o: ClientOpts) {
     this.apiUrl = o.apiUrl.replace(/\/$/, "");
@@ -172,6 +303,11 @@ export class HindsightClient {
     this.log = o.log ?? (() => {});
     this.maxParallelRetains = o.maxParallelRetains || DEFAULT_MAX_PARALLEL_RETAINS;
     this.observationScopes = o.observationScopes ?? DEFAULT_OBSERVATION_SCOPES;
+    this.pageSearchLimit = o.pageSearchLimit || DEFAULT_PAGE_SEARCH_LIMIT;
+    // Merged once here, not per call, and copied rather than aliased: the default is a
+    // module-level object, and handing every client the same reference makes one caller's
+    // mutation everyone's.
+    this.recallOptions = { ...DEFAULT_RECALL_OPTIONS, ...o.recallOptions };
   }
 
   /** The credential in use, for diagnostics. Never log or report the VALUE — booleans only. */
@@ -237,14 +373,15 @@ export class HindsightClient {
     method: string,
     url: string,
     body?: unknown,
-    tolerate: number[] = []
+    tolerate: number[] = [],
+    timeoutMs = 15_000
   ): Promise<Response> {
     // Hard cap on EVERY request: a stalled server (pool deadlock, network) must degrade to a
     // memoryless turn — never hang a host that awaits us (opencode blocks its BOOT on plugin init).
     const r = await this.fetchWithAuth(url, {
       method,
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (r.status === 429 && !tolerate.includes(429))
       throw new RateLimitedError(retryAfterMs(r.headers.get("retry-after")));
@@ -274,7 +411,7 @@ export class HindsightClient {
       // Sent on EVERY retain, including the server default `combined`, so the scoping a bank's
       // observations were built under is a property of the write rather than of whichever server
       // version happened to process it. Servers older than 0.4.15 ignore the field.
-      observation_scopes: this.observationScopes,
+      observation_scopes: resolveRetainScopes(tags, this.observationScopes),
     };
     if (opts.timestamp) item.timestamp = opts.timestamp;
     if (opts.metadata) item.metadata = opts.metadata;
@@ -319,11 +456,14 @@ export class HindsightClient {
    * Set. Powers the incremental git-sync's "what's already ingested?" check — since git commits are stored
    * with document_id `git:<sha>`, the returned Set lets a caller diff a ref's commits against memory.
    */
-  async listDocumentIds(tag: string): Promise<Set<string>> {
+  async listDocumentIds(
+    tag: string,
+    tagsMatch: "all" | "all_strict" = "all"
+  ): Promise<Set<string>> {
     const ids = new Set<string>();
     const limit = 500;
     for (let offset = 0; ; offset += limit) {
-      const q = `?tags=${encodeURIComponent(tag)}&tags_match=all&limit=${limit}&offset=${offset}`;
+      const q = `?tags=${encodeURIComponent(tag)}&tags_match=${tagsMatch}&limit=${limit}&offset=${offset}`;
       const r = await this.req("GET", this.bankUrl(`/documents${q}`));
       let items: { id?: string }[] = [];
       let total = 0;
@@ -340,56 +480,76 @@ export class HindsightClient {
     return ids;
   }
 
-  /** Configure the bank: POST the coding bank template manifest to /import (missions, retain
-   *  strategies, entity labels), then seed knowledge pages when the server supports them. Both
-   *  halves are idempotent, so the deepen engine can re-run this every pass. Creates the bank if
-   *  missing; legacy servers continue with the template-only path. */
-  async configureBank(opts: { reset?: boolean; pageTrigger?: PageTrigger } = {}): Promise<void> {
+  /** Configure the bank: POST the coding bank manifest to /import (missions, retain strategies,
+   *  entity labels), then seed knowledge pages when the server supports them. Both halves are
+   *  idempotent and ADDITIVE — nothing the bank already says is overwritten (#3927), bar the
+   *  extraction mode of the plugin's own strategies, which follows its config (#4560) — so
+   *  the deepen engine can re-run this every pass. Creates the bank if missing; legacy servers
+   *  continue with the template-only path.
+   *
+   *  `manage: false` skips the config half entirely, for a bank whose owner shapes it themselves.
+   *  That bank should then define the strategies this plugin writes under (`git`, `gitlog`,
+   *  `conversation`, `document`, `survey`): an unknown strategy name is not an error server-side,
+   *  it just falls back to the bank's own config, so the miss is silent. */
+  async configureBank(
+    opts: {
+      reset?: boolean;
+      pageTrigger?: PageTrigger;
+      /** Which pages to seed and with what query — see RawConfig.pages. */
+      pages?: PagesConfig;
+      /** Pages of the user's own to seed alongside them — see RawConfig.customPages. */
+      customPages?: CustomPagesConfig;
+      manage?: boolean;
+      /** Extraction mode for the plugin's own strategies — see RawConfig.retainExtractionMode. */
+      extractionMode?: RetainExtractionMode;
+    } = {}
+  ): Promise<void> {
     if (opts.reset) {
       await this.req("DELETE", this.bankUrl());
       this.log(`[bank] reset ${this.bank}`);
     }
-    // Seed the missions ONCE. After that they belong to whoever set them — see CODING_BANK_STRUCTURE.
-    const seeded = opts.reset ? false : await this.hasBankMissions();
-    await this.req(
-      "POST",
-      this.bankUrl("/import"),
-      seeded ? CODING_BANK_STRUCTURE : CODING_BANK_TEMPLATE
-    );
-    this.log(
-      seeded
-        ? `[bank] structure applied to ${this.bank}: entity_labels {knowledge}, ` +
-            `strategies {git, gitlog, conversation, document} — missions left as configured`
-        : `[bank] template applied to ${this.bank}: missions, entity_labels {knowledge}, ` +
-            `strategies {git, gitlog, conversation, document}`
-    );
-    await this.seedPages(opts.pageTrigger);
+    if (opts.manage === false) {
+      this.log(`[bank] manageBankConfig: false — leaving ${this.bank}'s configuration alone`);
+    } else {
+      // What the bank ALREADY overrides decides what is left to write: the missions are seeded once
+      // and then belong to whoever set them (#2492), and every other field is added only where the
+      // bank is silent (#3927) — bar the extraction mode of the plugin's own strategies, which is
+      // re-synced to `extractionMode` (#4560). A reset just deleted the bank, so there is nothing to read.
+      const manifest = codingBankManifest(
+        opts.reset ? undefined : await this.readBankOverrides(),
+        opts.extractionMode
+      );
+      if (!manifest) {
+        this.log(`[bank] ${this.bank} already carries the coding structure — nothing to apply`);
+      } else {
+        await this.req("POST", this.bankUrl("/import"), manifest);
+        this.log(`[bank] applied to ${this.bank}: ${Object.keys(manifest.bank).sort().join(", ")}`);
+      }
+    }
+    await this.seedPages(opts.pageTrigger, opts.pages, opts.customPages);
   }
 
   /**
-   * Whether this bank already carries bank-level mission overrides — ours from an earlier seed, or
-   * the user's own edit. Either way they are not ours to overwrite.
+   * This bank's own config OVERRIDES, or undefined when there are none to read.
    *
-   * Reads the bank-scoped OVERRIDES, not the resolved config, so inherited global defaults don't
-   * read as "already set". A missing bank, or a deployment with the bank-config API switched off,
-   * answers false: there is nothing to preserve, and without that API a user cannot set per-bank
-   * missions in the first place.
+   * Deliberately the overrides and not the resolved config: an inherited global default is not
+   * something this bank's owner chose, so it must not read as "already set". `undefined` means the
+   * bank does not exist yet, or the deployment has the bank-config API switched off — in neither
+   * case can anything have been customised, so the caller seeds the full template.
    */
-  private async hasBankMissions(): Promise<boolean> {
+  private async readBankOverrides(): Promise<BankOverrides | undefined> {
     try {
       const r = await this.req("GET", this.bankUrl("/config"));
-      if (!r.ok) return false;
-      const j = (await r.json()) as { overrides?: Record<string, unknown> };
-      return MISSION_FIELDS.some((f) => {
-        const v = j.overrides?.[f];
-        return typeof v === "string" && v.trim() !== "";
-      });
+      if (!r.ok) return undefined;
+      const j = (await r.json()) as { overrides?: BankOverrides };
+      return j.overrides ?? {};
     } catch {
-      return false;
+      return undefined;
     }
   }
 
-  /** Delete one document (cascades its memory units/links). Used by deepen's self-cleanup. */
+  /** Explicitly delete one document (and its cascaded memory units/links). Background sync must
+   *  never use this as a cleanup primitive: a document id alone does not prove repository ownership. */
   async deleteDocument(documentId: string): Promise<void> {
     await this.req("DELETE", this.bankUrl(`/documents/${encodeURIComponent(documentId)}`));
   }
@@ -462,7 +622,7 @@ export class HindsightClient {
   /**
    * Reflect: synthesized, root-cause answer over the bank. Bounded so a slow server never hangs a
    * caller — but `timeoutMs` is REQUIRED, deliberately: the right deadline differs by an order of
-   * magnitude between the automatic hook (25s, to fit the host's window) and the agent-invoked
+   * magnitude between the automatic hook (20s, to fit the host's window) and the agent-invoked
    * tool (minutes, on a populated bank). This used to default to 120s, which silently overrode the
    * tool's configured window and aborted every high-budget synthesis mid-flight (#3590).
    */
@@ -475,12 +635,64 @@ export class HindsightClient {
         body: JSON.stringify({ query, budget: opts.budget ?? "high" }),
         signal: ctrl.signal,
       });
-      if (!resp.ok) throw new Error(`reflect ${resp.status}${this.authHint(resp.status)}`);
+      // Keep the server's body: a bare "reflect 500" in the diag trail is undebuggable after the fact.
+      if (!resp.ok)
+        throw new ReflectError(
+          `reflect ${resp.status} ${(await resp.text()).slice(0, 1000)}${this.authHint(resp.status)}`,
+          resp.status,
+          false
+        );
       const data = (await resp.json()) as { text?: string };
       return (data.text || "").trim();
+    } catch (e) {
+      // Our own deadline surfaces as a generic "This operation was aborted"; name it.
+      if (ctrl.signal.aborted)
+        throw new ReflectError(`reflect timed out after ${opts.timeoutMs}ms`, undefined, true, {
+          cause: e,
+        });
+      throw e;
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * Raw recall with no LLM in the loop, so it still answers when reflect's synthesis times out or
+   * 5xxs. The body is `recallOptions` (consolidated observations by default) — a bank that grows
+   * no observations widens it rather than getting nothing back. Returns the texts in rank order.
+   *
+   * The name predates `recallOptions` (the observation type used to be hardcoded here) and is
+   * kept deliberately: this is the client's published surface, so renaming it would break
+   * importers for a cosmetic gain. The doc above is the contract, not the name.
+   */
+  async recallObservations(query: string, opts: { timeoutMs: number }): Promise<string[]> {
+    const r = await this.req(
+      "POST",
+      this.bankUrl("/memories/recall"),
+      // `query` is applied AFTER the spread: everything else is the caller's to override, but a
+      // config that could replace the goal with a fixed string would silently recall for the
+      // wrong question on every turn.
+      { ...this.recallOptions, query },
+      [],
+      opts.timeoutMs
+    );
+    if (r.status === 404) return [];
+    const j = (await r.json()) as { results?: { text?: string }[] };
+    return (j.results ?? []).map((x) => (x.text ?? "").trim()).filter(Boolean);
+  }
+
+  /**
+   * Latch `knowledgePagesSupported = false` iff this response really means the endpoint is absent.
+   * Returns whether it latched. A bank-not-found 404 is NOT a capability verdict — it is the
+   * expected answer before the bank's first retain — so it must never cache a negative (#4607).
+   *
+   * Only 404 is tested: `req` throws on every other non-ok status it was not told to tolerate, so
+   * the 405/501 this used to check for never reach a caller in the first place.
+   */
+  private async pagesUnsupported(r: Response): Promise<boolean> {
+    if (r.status !== 404 || !(await isEndpointMissing(r))) return false;
+    this.knowledgePagesSupported = false;
+    return true;
   }
 
   /**
@@ -490,10 +702,10 @@ export class HindsightClient {
   async tree(): Promise<KnowledgeNode[]> {
     if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
     const r = await this.req("GET", this.bankUrl("/knowledge-base/tree"));
-    if ([404, 405, 501].includes(r.status)) {
-      this.knowledgePagesSupported = false;
-      throw new KnowledgePagesUnavailableError();
-    }
+    if (await this.pagesUnsupported(r)) throw new KnowledgePagesUnavailableError();
+    // Bank not created yet: it genuinely has no pages, and the capability stays UNKNOWN so the
+    // next call (after the first retain mints the bank) asks again instead of short-circuiting.
+    if (r.status === 404) return [];
     this.knowledgePagesSupported = true;
     try {
       return ((await r.json()) as { roots?: KnowledgeNode[] }).roots ?? [];
@@ -552,17 +764,37 @@ export class HindsightClient {
    *  hindsight_search_knowledge_pages. */
   async searchKnowledgePages(
     query: string,
-    limit = 3
-  ): Promise<{ id: string; name: string; snippet: string; score: number }[]> {
+    opts: { limit?: number; timeoutMs?: number } = {}
+  ): Promise<
+    { id: string; name: string; source_query?: string; snippet: string; score: number }[]
+  > {
     if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
-    const q = `?q=${encodeURIComponent(query)}&limit=${limit}`;
-    const r = await this.req("GET", this.bankUrl(`/knowledge-base/search${q}`));
+    const q = `?q=${encodeURIComponent(query)}&limit=${opts.limit ?? this.pageSearchLimit}`;
+    const r = await this.req(
+      "GET",
+      this.bankUrl(`/knowledge-base/search${q}`),
+      undefined,
+      [],
+      opts.timeoutMs
+    );
+    // Routed through the same check as every other page endpoint. Without it a server with no
+    // knowledge-base API parsed its own 404 body into zero hits and reported "nothing matched"
+    // forever, which reads as an empty bank rather than a missing feature.
+    if (await this.pagesUnsupported(r)) throw new KnowledgePagesUnavailableError();
+    if (r.status === 404) return []; // bank not created yet — no pages to match
     const j = (await r.json()) as {
-      results?: { id: string; name: string; snippet?: string; score?: number }[];
+      results?: {
+        id: string;
+        name: string;
+        source_query?: string | null;
+        snippet?: string;
+        score?: number;
+      }[];
     };
     return (j.results ?? []).map((x) => ({
       id: x.id,
       name: x.name,
+      ...(x.source_query ? { source_query: x.source_query } : {}),
       snippet: x.snippet ?? "",
       score: x.score ?? 0,
     }));
@@ -579,8 +811,15 @@ export class HindsightClient {
    * `source_query` re-syncs onto the live page instead of orphaning its synthesized content —
    * which is how `pageScopeRule`'s repo name reaches banks seeded by an earlier version.
    */
-  async seedPages(pageTrigger: PageTrigger = buildPageTrigger()): Promise<void> {
-    const pages = pagesFor(this.project ?? this.bank);
+  async seedPages(
+    pageTrigger: PageTrigger = buildPageTrigger(),
+    pagesConfig: PagesConfig = {},
+    customPages: CustomPagesConfig = {}
+  ): Promise<void> {
+    // The bank id is the fallback subject, not a degraded one: for a bank no single repository
+    // owns it is the only name that stays put across sessions, and under the default
+    // `coding-agent::{gitProject}` template `project` is always set, so it never applies there.
+    const pages = pagesFor(this.project ?? this.bank, pagesConfig, customPages);
     const existing = new Map<string, KnowledgeNode>();
     let roots: KnowledgeNode[];
     try {
@@ -597,6 +836,7 @@ export class HindsightClient {
     }
     let created = 0;
     let updated = 0;
+    let vanished = 0; // deleted under us mid-run — neither re-synced nor unchanged
     for (const page of pages) {
       const hit = existing.get(page.name.toLowerCase());
       const body = {
@@ -604,17 +844,22 @@ export class HindsightClient {
         source_query: page.source_query,
         tags: page.tags,
         max_tokens: PAGE_MAX_TOKENS,
-        trigger: pageTrigger,
+        // Resolved HERE, not in `buildPageTrigger`: a hashed cron (`H`) needs the page's identity,
+        // and one trigger is built per session for all of them.
+        trigger: pageTriggerFor(pageTrigger, this.bank, page.name),
       };
       if (!hit) {
         // 409 = another deepen run seeded this name between our tree read and this POST. That is
         // the outcome we wanted anyway, so tolerate it rather than failing the whole run.
         const r = await this.req("POST", this.bankUrl("/knowledge-base/pages"), body, [409]);
-        if ([404, 405, 501].includes(r.status)) {
-          this.knowledgePagesSupported = false;
+        if (await this.pagesUnsupported(r)) {
           this.log(
             `[bank] knowledge pages unavailable on ${this.apiUrl}; continuing without pages`
           );
+          return;
+        }
+        if (r.status === 404) {
+          this.log(`[bank] ${this.bank} does not exist yet; pages seed on the next session`);
           return;
         }
         if (r.status !== 409) created++;
@@ -622,39 +867,102 @@ export class HindsightClient {
         const sourceDrift = hit.description !== page.source_query;
         // Older servers omit trigger from the tree, so an absent value means unknown rather
         // than drift. Those servers also reject a trigger-only PATCH as an empty update.
-        const triggerDrift =
-          hit.trigger != null && hit.trigger.tags_match !== pageTrigger.tags_match;
+        const triggerDrift = hit.trigger != null && pageTriggerDrifted(hit.trigger, body.trigger);
         if (!sourceDrift && !triggerDrift) continue;
 
         // The name IS the match key, so it can't drift; the source query and the trigger can.
-        // The trigger is re-sent when the server reports it drifting, because it is the only way
-        // a policy change reaches a page that already exists. Servers that do not report a page's
+        // The trigger is re-sent on ANY difference in the policy this plugin states — the refresh
+        // schedule included, not just `tags_match` as before — because that is the only way a
+        // changed default reaches a bank that was seeded under the old one (the hourly staggered
+        // schedule that replaced auto-refresh would otherwise apply to new repos only). The
+        // config is therefore the source of truth for these pages: a trigger edited in the
+        // control plane is re-synced back on the next session, and a repo that wants a different
+        // policy sets `pageTriggerType`/`pageTriggerCron`. Servers that do not report a page's
         // trigger leave its policy unknown; source-query drift can still be reconciled safely.
         const patch: { trigger?: PageTrigger; source_query?: string; tags?: string[] } = {};
         if (sourceDrift) {
           patch.source_query = page.source_query;
           patch.tags = page.tags;
+          // Say so. This replaces a query edited through the API or the control plane, which used
+          // to happen silently and read as the edit never having saved (#4460).
+          this.log(
+            `[bank] re-syncing "${page.name}" to its configured source_query — set ` +
+              `pages[${JSON.stringify(page.name)}].source_query to keep your own wording`
+          );
         }
-        if (triggerDrift) patch.trigger = pageTrigger;
+        // The page's OWN resolved trigger (a hashed cron differs per page), not the shared one.
+        if (triggerDrift) patch.trigger = pageTriggerPatch(body.trigger);
         const r = await this.req(
           "PATCH",
           this.bankUrl(`/knowledge-base/nodes/${encodeURIComponent(hit.id)}`),
           patch
         );
-        if ([404, 405, 501].includes(r.status)) {
-          this.knowledgePagesSupported = false;
+        if (await this.pagesUnsupported(r)) {
           this.log(
             `[bank] knowledge pages unavailable on ${this.apiUrl}; continuing without pages`
           );
           return;
         }
+        // The node vanished under us (a concurrent delete). Skip it — the remaining pages are
+        // still worth syncing, and the run's summary line is still worth logging.
+        if (r.status === 404) {
+          vanished++;
+          continue;
+        }
         updated++;
       }
     }
+    const initiatives = await this.resyncInitiativeTriggers(roots, pageTrigger);
     this.log(
-      `[bank] knowledge pages seeded on ${this.bank}: ${created} created, ${updated} re-synced, ` +
-        `${pages.length - created - updated} unchanged`
+      `[bank] knowledge pages seeded on ${this.bank} (scoped to ${this.project ?? this.bank}): ` +
+        `${created} created, ${updated} re-synced, ` +
+        `${pages.length - created - updated - vanished} unchanged` +
+        (vanished ? `, ${vanished} deleted under us` : "") +
+        (initiatives ? `, ${initiatives} initiative pages re-synced` : "")
     );
+  }
+
+  /**
+   * Bring the captured initiative pages onto the same refresh policy as the seeded taxonomy.
+   *
+   * `captureInitiative` stamps this very trigger when it creates a page, so on a bank seeded under
+   * an older default they are the same drift as the taxonomy — and on a real repo they are most of
+   * it: five taxonomy pages against one page per initiative, each an LLM synthesis per
+   * consolidation under the auto-refresh that used to be the default (#3506).
+   *
+   * Only the trigger is touched. Their `name` and `source_query` are written once, from the
+   * initiative's own title, and re-stating either would rebuild a page whose question never
+   * changed. The tree read above is reused rather than re-fetched.
+   */
+  private async resyncInitiativeTriggers(
+    roots: KnowledgeNode[],
+    pageTrigger: PageTrigger
+  ): Promise<number> {
+    const folder = roots.find(
+      (n) => n.kind === "folder" && (n.name || "").toLowerCase() === "initiatives"
+    );
+    let updated = 0;
+    for (const page of folder?.children ?? []) {
+      // No trigger reported = policy unknown, not divergent (a server older than #3572).
+      if (page.kind !== "page" || page.trigger == null) continue;
+      const desired = pageTriggerFor(pageTrigger, this.bank, page.name);
+      if (!pageTriggerDrifted(page.trigger, desired)) continue;
+      const r = await this.req(
+        "PATCH",
+        this.bankUrl(`/knowledge-base/nodes/${encodeURIComponent(page.id)}`),
+        { trigger: pageTriggerPatch(desired) }
+      );
+      // 404 only: `req` throws on every other non-ok status it was not told to tolerate, so the
+      // 405/501 this used to test for never arrive (see `pagesUnsupported`). No latch here — a
+      // node that has gone missing says nothing about the server's capabilities, and nothing about
+      // the pages after it either, so skip it rather than abandoning the rest of the re-sync (this
+      // `break`ed while the status still carried a server-wide meaning). If it is the BANK that
+      // went rather than one node, this costs one wasted PATCH per initiative page instead of one
+      // total — bounded by the folder's size, and the next session re-syncs from scratch anyway.
+      if (r.status === 404) continue;
+      updated++;
+    }
+    return updated;
   }
 
   /** URL/id-safe slug: lowercase, non-alphanumerics → "-", trim dashes, cap length; fallback "initiative". */
@@ -697,12 +1005,22 @@ export class HindsightClient {
     let pageId = args.relatesToPageId;
     if (!pageId) {
       const folderId = await this.ensureFolder("Initiatives");
+      // Same subject scoping and budget as the seeded pages: an initiative page synthesizes from
+      // the same bank, which also holds facts about the dependencies this repo merely uses, and
+      // "the project's memory" alone never said WHICH project (#3476). `max_tokens` is stated for
+      // the same reason `seedPages` states it — leaving it implicit pins these pages to whatever
+      // the server's page default happens to be, which is only coincidentally PAGE_MAX_TOKENS.
+      const subject = this.project ?? this.bank;
       const r = await this.req("POST", this.bankUrl("/knowledge-base/pages"), {
         name: args.title,
-        source_query: `Summarize the "${args.title}" initiative: what is being built or changed and why, and its current state — drawn from the project's memory.`,
+        source_query:
+          `Summarize the "${args.title}" initiative: what is being built or changed and why, ` +
+          `and its current state — drawn from the project's memory.` +
+          pageScopeRule(subject),
         parent_id: folderId,
         tags: ["knowledge:feature-work"],
-        trigger: args.pageTrigger ?? buildPageTrigger(),
+        max_tokens: PAGE_MAX_TOKENS,
+        trigger: pageTriggerFor(args.pageTrigger ?? buildPageTrigger(), this.bank, args.title),
       });
       try {
         const j = (await r.json()) as { page_id?: string; id?: string };

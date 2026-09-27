@@ -6,6 +6,13 @@ from datetime import datetime, timezone
 
 import pytest
 
+# These read `result.trace["retrieval_results"]` and assert an entry per ARM (method_name ==
+# "graph"). That structure is produced by the engine running the arms itself; a store that answers
+# a whole recall in one hop runs them internally and reports phases ("arms", "fuse", "trim"), not
+# one entry per arm -- so there is nothing here to assert against for such a store, and the arm
+# behaviour is covered by the extension's own recall suite instead.
+pytestmark = pytest.mark.memory_backend_incompatible
+
 from hindsight_api.engine.memory_engine import Budget
 from hindsight_api.engine.search.tracer import SearchTracer
 
@@ -25,6 +32,28 @@ def test_rrf_trace_preserves_flattened_source_ranks():
     )
 
     assert tracer.rrf_merged[0].source_ranks == {"semantic_rank": 1, "bm25_rank": 2}
+
+
+def test_trace_timestamp_records_the_query_anchor():
+    """The trace reports the as-of anchor the ranking used, not when it was built (#4217)."""
+    anchor = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    tracer = SearchTracer(query="test", budget=10, max_tokens=100, query_timestamp=anchor)
+    tracer.start()
+
+    trace = tracer.finalize([])
+
+    assert trace.query.timestamp == anchor
+
+
+def test_trace_timestamp_falls_back_to_now_without_an_anchor():
+    """With no caller anchor the trace still reports a usable execution time."""
+    before = datetime.now(timezone.utc)
+    tracer = SearchTracer(query="test", budget=10, max_tokens=100)
+    tracer.start()
+
+    trace = tracer.finalize([])
+
+    assert before <= trace.query.timestamp <= datetime.now(timezone.utc)
 
 
 @pytest.mark.asyncio
@@ -54,7 +83,8 @@ async def test_search_with_trace(memory, request_context):
             request_context=request_context,
         )
 
-        # Search with tracing enabled
+        # Search with tracing enabled, anchored to an explicit as-of date
+        question_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
         search_result = await memory.recall_async(
             bank_id=bank_id,
             query="Who works at Google?",
@@ -62,6 +92,7 @@ async def test_search_with_trace(memory, request_context):
             budget=Budget.LOW,  # 20,
             max_tokens=512,
             enable_trace=True,
+            question_date=question_date,
             request_context=request_context,
         )
 
@@ -77,6 +108,8 @@ async def test_search_with_trace(memory, request_context):
         assert trace["query"]["query_text"] == "Who works at Google?"
         assert trace["query"]["budget"] == 100  # Budget.LOW = 100
         assert trace["query"]["max_tokens"] == 512
+        # The anchor the caller asked for, not the moment the trace was built (#4217)
+        assert trace["query"]["timestamp"] == question_date
         assert len(trace["query"]["query_embedding"]) > 0, "Query embedding should be populated"
 
         # Verify entry points
@@ -92,14 +125,20 @@ async def test_search_with_trace(memory, request_context):
             assert visit["node_id"], "Visit should have node_id"
             assert visit["text"], "Visit should have text"
             assert visit["weights"]["final_weight"] >= 0, "Weight should be non-negative"
-            # Entry points should have no parent
-            if visit["is_entry_point"]:
-                assert visit["parent_node_id"] is None
-                assert visit["link_type"] is None
-            else:
-                # Non-entry points should have parent info (unless they're isolated)
-                # But we allow None parent if the node was reached differently
-                pass
+
+        # Retrieval is parallel and fused, so the trace carries no traversal
+        # vocabulary: link-follow counters and pruning decisions were removed
+        # rather than reported as a constant zero (issue #3817).
+        summary_keys = set(trace["summary"])
+        assert not summary_keys & {
+            "total_nodes_pruned",
+            "temporal_links_followed",
+            "semantic_links_followed",
+            "entity_links_followed",
+        }, "Structurally-zero counters should be gone from the summary"
+        assert "pruned" not in trace
+        for visit in trace["visits"]:
+            assert not set(visit) & {"parent_node_id", "link_type", "link_weight", "neighbors_explored"}
 
         # Verify summary
         assert trace["summary"]["total_nodes_visited"] == len(trace["visits"])
@@ -119,7 +158,6 @@ async def test_search_with_trace(memory, request_context):
         print(f"  - Query: {trace['query']['query_text']}")
         print(f"  - Entry points: {len(trace['entry_points'])}")
         print(f"  - Nodes visited: {trace['summary']['total_nodes_visited']}")
-        print(f"  - Nodes pruned: {trace['summary']['total_nodes_pruned']}")
         print(f"  - Results returned: {trace['summary']['results_returned']}")
         print(f"  - Duration: {trace['summary']['total_duration_seconds']:.3f}s")
 

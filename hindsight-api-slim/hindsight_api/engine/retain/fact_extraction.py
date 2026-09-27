@@ -10,23 +10,30 @@ import json
 import logging
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from ..llm_interface import ProviderContentPolicyError, ProviderRateLimitResetError
-from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output
+from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output, sanitize_value
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
-from ..structured_output import strict_json_schema
+from ..structured_output import provider_json_schema, strict_json_schema
+from . import attachment_content
+
+if TYPE_CHECKING:
+    from .attachment_store import RetainAttachmentLoader
 from .entity_labels import (
     EntityLabelsConfig,
     MapField,
     build_labels_lookup,
     build_labels_model,
     is_label_entity,
+    label_tag_keys,
     parse_entity_labels,
+    split_label_tags,
 )
 
 
@@ -54,7 +61,7 @@ def _extract_map_entities(
                         validated_entities,
                         existing_texts_lower,
                     )
-        elif map_field.type == "multi-values":
+        elif map_field.type in ("multi-values", "multi-text"):
             vals = field_val if isinstance(field_val, list) else [field_val]
             for v in vals:
                 if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
@@ -169,6 +176,37 @@ class Fact(BaseModel):
     # Optional structured data
     entities: list[str] | None = None
     causal_relations: list["CausalRelation"] | None = None
+    # 1-based indices into the chunk's attachments, exactly as the extractor
+    # attributed them. Only meaningful against the chunk they came from, so they
+    # are resolved to ids by _attachment_ids_for rather than stored.
+    from_attachments: list[int] | None = None
+
+    @field_validator("fact")
+    @classmethod
+    def sanitize_fact_text(cls, value: str) -> str:
+        # Structured JSON parsing turns a model's ``\udXXX`` escape into a
+        # surrogate only after raw-output cleanup, so scrub the final text at
+        # the shared immediate/batch extraction boundary before storage or embedding (#3729).
+        # ``LLMProvider.call`` already scrubs the response this is built from; this is the
+        # storage-side guarantee for any text that reaches ``Fact`` by another route.
+        return _sanitize_text(value) or ""
+
+    @field_validator("entities")
+    @classmethod
+    def sanitize_entity_names(cls, value: list[str] | None) -> list[str] | None:
+        # Entity names are model-authored too, and they are not merely metadata: they
+        # are appended to the very string that gets embedded (``augment_texts_with_dates``)
+        # and joined into the ``text_signals`` column feeding BM25. A surrogate in a name
+        # crashes exactly where one in ``fact`` does. Names that sanitize away entirely
+        # are dropped rather than stored blank.
+        if value is None:
+            return None
+        cleaned_names = []
+        for name in value:
+            cleaned = _sanitize_text(name) or ""
+            if cleaned.strip():
+                cleaned_names.append(cleaned)
+        return cleaned_names
 
 
 class CausalRelation(BaseModel):
@@ -178,6 +216,22 @@ class CausalRelation(BaseModel):
     relation_type: Literal["caused_by"] = Field(
         description="How this fact relates to the target: 'caused_by' = this fact was caused by the target"
     )
+
+
+# ISO-8601-ish calendar timestamp. Deliberately permissive about precision
+# (date only, date+time, optional seconds/fraction, optional Z or UTC offset)
+# and strict about everything else, so a grammar-constrained model cannot put
+# prose in a timestamp field -- under constrained decoding a description is not
+# a constraint, only the grammar is.
+#
+# NOT baked into the models below: the JSON Schema ``pattern`` keyword is only
+# usable on backends that accept it (see DEFAULT_LLM_SUPPORTS_STRING_PATTERN --
+# Bedrock 400s on schema keywords outside its allowlist). It is layered on at
+# schema-build time by _with_iso_timestamp_pattern() when the operator opts in.
+ISO_TIMESTAMP_PATTERN = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}"
+    r"([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?)?$"
+)
 
 
 class FactCausalRelation(BaseModel):
@@ -229,6 +283,15 @@ class ExtractedFact(BaseModel):
     @classmethod
     def ensure_entities_list(cls, v):
         return _coerce_entity_strings(v)
+
+    from_attachments: list[int] | None = Field(
+        default=None,
+        description=(
+            "Numbers of the attachments this fact's information came from, as listed under "
+            "ATTACHMENTS. Leave empty for facts drawn from the surrounding text. Only list an "
+            "attachment when the fact could not be stated without looking at it."
+        ),
+    )
 
 
 class FactExtractionResponse(BaseModel):
@@ -379,6 +442,15 @@ class ExtractedFactVerbose(BaseModel):
     def ensure_entities_list(cls, v):
         return _coerce_entity_strings(v)
 
+    from_attachments: list[int] | None = Field(
+        default=None,
+        description=(
+            "Numbers of the attachments this fact's information came from, as listed under "
+            "ATTACHMENTS. Leave empty for facts drawn from the surrounding text. Only list an "
+            "attachment when the fact could not be stated without looking at it."
+        ),
+    )
+
 
 class FactExtractionResponseVerbose(BaseModel):
     """Response for verbose fact extraction."""
@@ -419,6 +491,15 @@ class ExtractedFactNoCausal(BaseModel):
     @classmethod
     def ensure_entities_list(cls, v):
         return _coerce_entity_strings(v)
+
+    from_attachments: list[int] | None = Field(
+        default=None,
+        description=(
+            "Numbers of the attachments this fact's information came from, as listed under "
+            "ATTACHMENTS. Leave empty for facts drawn from the surrounding text. Only list an "
+            "attachment when the fact could not be stated without looking at it."
+        ),
+    )
 
 
 class FactExtractionResponseNoCausal(BaseModel):
@@ -576,7 +657,114 @@ def _iter_recursive_splits(text: str, max_chars: int, separators: list[str]) -> 
     yield from _flush()
 
 
-def iter_chunks(text: str, max_chars: int, structured_chunk_size: int | None = None) -> Iterator[str]:
+@dataclass(frozen=True)
+class _ChunkSegment:
+    """One run of a document body: either prose, or a single image placeholder."""
+
+    text: str
+    is_image: bool
+
+
+def _iter_placeholder_segments(text: str) -> Iterator[_ChunkSegment]:
+    """Split ``text`` into prose / image-placeholder runs, in order."""
+    cursor = 0
+    for match in attachment_content.PLACEHOLDER_RE.finditer(text):
+        if match.start() > cursor:
+            yield _ChunkSegment(text=text[cursor : match.start()], is_image=False)
+        yield _ChunkSegment(text=match.group(0), is_image=True)
+        cursor = match.end()
+    if cursor < len(text):
+        yield _ChunkSegment(text=text[cursor:], is_image=False)
+
+
+def _iter_image_aware_chunks(
+    text: str,
+    max_chars: int,
+    *,
+    max_attachments_per_chunk: int,
+) -> Iterator[str]:
+    """Chunk text that carries image placeholders, keeping each image with its prose.
+
+    ``max_chars`` bounds the *text*: a placeholder costs only the ~22 characters
+    it occupies, and the image behind it costs nothing against this budget. An
+    earlier version charged each image a large slice of the budget, reasoning
+    that the image consumes model context too. That was wrong in a way the
+    feature cannot afford: an article reading "here are the screenshots:"
+    followed by ten images had the introduction split away from every one of
+    them, and two images could not even share a chunk. The real constraint is
+    how many images one request may carry, which is ``max_attachments_per_chunk``.
+
+    Packing is greedy and left-to-right, and an over-long run of prose is split
+    against the room that is *left* rather than the whole budget, so the images
+    already buffered keep the first piece of it. That is what makes both
+    orderings work — prose-then-image, and image-then-prose, which a caller
+    writes when the pictures come first and the explanation follows.
+
+    Idempotent, like :func:`chunk_text`: every chunk this yields is within both
+    budgets, so re-chunking one returns it unchanged and ``chunk_id`` stays stable
+    across re-ingests (issue #2301).
+    """
+    # Below this, splitting against the leftover room would shred the run into
+    # fragments to save one partial line; flush and use the full budget instead.
+    minimum_useful_room = max(max_chars // 4, 1)
+
+    buffered: list[str] = []
+    used = 0
+    images = 0
+
+    def _flush() -> Iterator[str]:
+        nonlocal buffered, used, images
+        if buffered:
+            packed = "".join(buffered).strip()
+            buffered = []
+            used = 0
+            images = 0
+            if packed:
+                yield packed
+
+    def _append(piece: str, is_image: bool) -> None:
+        nonlocal used, images
+        buffered.append(piece)
+        used += len(piece)
+        images += 1 if is_image else 0
+
+    for segment in _iter_placeholder_segments(text):
+        if segment.is_image:
+            if buffered and (used + len(segment.text) > max_chars or images + 1 > max_attachments_per_chunk):
+                yield from _flush()
+            _append(segment.text, is_image=True)
+            continue
+
+        if used + len(segment.text) <= max_chars:
+            _append(segment.text, is_image=False)
+            continue
+
+        # The run does not fit whole. Split it with the ordinary sentence-aware
+        # splitter — whose boundaries delta retain already matches — against the
+        # room left in the open chunk, so its first piece can join whatever is
+        # buffered instead of the buffer being flushed on its own.
+        room = max_chars - used
+        keep_open = bool(buffered) and room >= minimum_useful_room
+        if not keep_open:
+            # Nothing worth joining, or too little room to be worth it: close the
+            # chunk and split against the full budget.
+            yield from _flush()
+        budget = room if keep_open else max_chars
+        for piece in _iter_recursive_splits(segment.text, budget, _RECURSIVE_TEXT_SEPARATORS):
+            if buffered and used + len(piece) > max_chars:
+                yield from _flush()
+            _append(piece, is_image=False)
+
+    yield from _flush()
+
+
+def iter_chunks(
+    text: str,
+    max_chars: int,
+    structured_chunk_size: int | None = None,
+    *,
+    max_attachments_per_chunk: int | None = None,
+) -> Iterator[str]:
     """Stream the chunks of ``text``, in order — the lazy form of :func:`chunk_text`.
 
     Yields exactly what ``chunk_text`` returns, one chunk at a time, so a caller that
@@ -587,6 +775,14 @@ def iter_chunks(text: str, max_chars: int, structured_chunk_size: int | None = N
 
     See :func:`chunk_text` for what the chunking itself guarantees.
     """
+    # Image-bearing text is budgeted differently (the images cost context too), so
+    # it takes its own path. Text with no placeholders — every document retained
+    # before inline images existed, and every text-only one after — reaches the
+    # code below unchanged, byte for byte.
+    if max_attachments_per_chunk is not None and attachment_content.contains_attachment(text):
+        yield from _iter_image_aware_chunks(text, max_chars, max_attachments_per_chunk=max_attachments_per_chunk)
+        return
+
     # If text is small enough, return as-is
     if len(text) <= max_chars:
         yield text
@@ -594,9 +790,12 @@ def iter_chunks(text: str, max_chars: int, structured_chunk_size: int | None = N
 
     structured_limit = structured_chunk_size if structured_chunk_size is not None else max_chars
 
-    # Try to parse as JSON conversation array
+    # Try to parse as JSON conversation array. Sanitize the decoded value once:
+    # json.loads turns a harmless ASCII ``\ud83d`` escape (half an emoji) into a real
+    # lone surrogate, which the conversation chunks below re-serialize verbatim and
+    # which then breaks every UTF-8 encode: chunk hashing, embedding, the insert.
     try:
-        parsed = json.loads(text)
+        parsed = sanitize_value(json.loads(text))
     except (json.JSONDecodeError, ValueError):
         parsed = None
 
@@ -627,7 +826,13 @@ def iter_chunks(text: str, max_chars: int, structured_chunk_size: int | None = N
     yield from _iter_recursive_splits(text, max_chars, _RECURSIVE_TEXT_SEPARATORS)
 
 
-def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = None) -> list[str]:
+def chunk_text(
+    text: str,
+    max_chars: int,
+    structured_chunk_size: int | None = None,
+    *,
+    max_attachments_per_chunk: int | None = None,
+) -> list[str]:
     """
     Split text into chunks, preserving conversation structure when possible.
 
@@ -650,11 +855,21 @@ def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = No
         max_chars: Target maximum characters per chunk
         structured_chunk_size: Maximum characters for a single JSONL line or
             conversation turn to keep whole. Defaults to ``max_chars``.
+        max_attachments_per_chunk: Cap on images in one chunk. ``None`` (the default)
+            means the caller applies no image handling, and text carrying image
+            placeholders is chunked as ordinary text.
 
     Returns:
         List of text chunks, roughly under max_chars
     """
-    return list(iter_chunks(text, max_chars, structured_chunk_size=structured_chunk_size))
+    return list(
+        iter_chunks(
+            text,
+            max_chars,
+            structured_chunk_size=structured_chunk_size,
+            max_attachments_per_chunk=max_attachments_per_chunk,
+        )
+    )
 
 
 def _iter_conversation_chunks(turns: list[dict], max_chars: int, structured_limit: int) -> Iterator[str]:
@@ -815,13 +1030,28 @@ def _iter_jsonl_chunks(text: str, max_chars: int, structured_limit: int) -> Iter
 # FACT EXTRACTION PROMPTS
 # =============================================================================
 
+# Retain's wording of the preserve-the-source-language rule; the selection between it
+# and an explicit output language belongs to default_language_section(), which documents
+# the invariant. Without it, fact extraction runs on an all-English prompt and a
+# multilingual model drifts to English (or, per #181, to an unrelated language entirely)
+# on non-English input. Consolidation carries the equivalent rule, making "preserve the
+# source language" the pipeline-wide default.
+#
+# Stated plainly rather than as a "detect the language, then STRICTLY never switch"
+# procedure (discussion #4283). That earlier wording made a separate detection step of it,
+# and gpt-5.6-luna got the step wrong on English coding-agent transcripts — French or
+# Russian facts in ~18% of runs; this one holds English in 30/30. It names no language on
+# purpose: a variant mapping "English input gives English facts, Italian input gives
+# Italian facts" also fixed luna, but pushed gemini-2.5-flash-lite to translate Japanese
+# into English in 10/10 runs (the #181 priming effect). Shorter too: 31 tokens, from 67.
+_DEFAULT_LANGUAGE_RULE = """LANGUAGE: Write every fact in the same language and script as the input text. Never translate. Names, identifiers, code, and quoted text stay verbatim."""
+
+
 # Base prompt template (shared by concise and custom modes)
 # Uses {extraction_guidelines} placeholder for mode-specific instructions
 _BASE_FACT_EXTRACTION_PROMPT = """Extract SIGNIFICANT facts from text. Be SELECTIVE - only extract facts worth remembering long-term.
 
-LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
-
-{retain_mission_section}{extraction_guidelines}
+{language_section}{retain_mission_section}{extraction_guidelines}
 
 ══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - BE CONCISE
@@ -864,6 +1094,9 @@ Use "Event Date" from input as reference for relative dates.
   "yesterday" → write the resolved date (e.g. "on November 12, 2024"), NOT the word "yesterday"
   "last night", "this morning", "today", "tonight" → convert to the resolved absolute date
 - For events: set occurred_start AND occurred_end (same for point events)
+- Coarse dates (only a year, or only a month, is stated): span the WHOLE period —
+  "in 2015" → 2015-01-01 to 2015-12-31, "in March 2026" → 2026-03-01 to 2026-03-31.
+  Never collapse to the period's first day or to the Event Date, current year included.
 - For conversation facts: NO occurred dates
 
 ══════════════════════════════════════════════════════════════════════════
@@ -908,6 +1141,10 @@ _CONCISE_EXAMPLES = """
 EXAMPLES (shown in English for illustration; for non-English input, ALL output values MUST be in the input language)
 ══════════════════════════════════════════════════════════════════════════
 
+The examples below demonstrate output format and selectivity only. Never emit
+their facts, entities, or dates unless those details also appear in the actual
+input text being processed.
+
 Example 1 - Selective extraction (Event Date: June 10, 2024):
 Input: "Hey! How's it going? Good morning! So I'm planning my wedding - want a small outdoor ceremony. Just got back from Emily's wedding, she married Sarah at a rooftop garden. It was nice weather. I grabbed a coffee on the way."
 
@@ -935,6 +1172,7 @@ an experience or person."""
 
 # Assembled concise prompt
 CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines=_CONCISE_GUIDELINES,
     examples=_CONCISE_EXAMPLES,
@@ -942,6 +1180,7 @@ CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 
 # Custom prompt uses same base but without examples
 CUSTOM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines="{custom_instructions}",
     examples="",  # No examples for custom mode
@@ -963,6 +1202,7 @@ RULES:
 - fact_type: use "world" for user preferences, rules, corrections, constraints, traits, and other objective facts, even when stated during an assistant interaction. Use "assistant" only for actions or experiences the assistant/agent actually performed."""
 
 VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines=_VERBATIM_GUIDELINES,
     examples="",
@@ -972,9 +1212,7 @@ VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 # Verbose extraction prompt - detailed, comprehensive facts (legacy mode)
 VERBOSE_FACT_EXTRACTION_PROMPT = """Extract facts from text into structured format with FIVE required dimensions - BE EXTREMELY DETAILED.
 
-LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
-
-{retain_mission_section}══════════════════════════════════════════════════════════════════════════
+{language_section}{retain_mission_section}══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - ALL FIVE DIMENSIONS REQUIRED - MAXIMUM VERBOSITY
 ══════════════════════════════════════════════════════════════════════════
 
@@ -1052,6 +1290,14 @@ For EVENTS (fact_kind="event") - MUST SET BOTH occurred_start AND occurred_end:
 - Always include the day name (Monday, Tuesday, etc.) in the 'when' field
 - Set occurred_start AND occurred_end to WHEN IT HAPPENED (not when mentioned)
 - For single-day/point events: set occurred_end = occurred_start (same timestamp)
+- COARSE DATES (the text states only a year, or only a month): set occurred_start and
+  occurred_end to the FULL SPAN of that period, so the range says how precisely the date
+  is actually known:
+    "in 2015"        → occurred_start="2015-01-01T00:00:00", occurred_end="2015-12-31T23:59:59"
+    "in March 2026"  → occurred_start="2026-03-01T00:00:00", occurred_end="2026-03-31T23:59:59"
+  Do NOT collapse a coarse date to the first day of the period, and do NOT resolve it to the
+  Event Date — even when the period is the current year. A year-only date is not a precise
+  date; recording it as one makes the memory claim a day it never stated.
 
 For CONVERSATIONS (fact_kind="conversation"):
 - General info, preferences, ongoing states → NO occurred dates
@@ -1105,6 +1351,8 @@ def _append_map_fields_prompt(fields: dict[str, "MapField"], lines: list[str], i
         if map_field.type == "map" and map_field.fields:
             lines.append(f"{pad}• {field_name} (object){field_desc}")
             _append_map_fields_prompt(map_field.fields, lines, indent + 4)
+        elif map_field.type == "multi-text":
+            lines.append(f"{pad}• {field_name} (list of free text, [] if none){field_desc}")
         elif map_field.type == "multi-values":
             vals = ", ".join(v.value for v in map_field.values if v.value)
             type_hint = f"multi-values: {vals}" if vals else "multi-values"
@@ -1114,6 +1362,25 @@ def _append_map_fields_prompt(fields: dict[str, "MapField"], lines: list[str], i
             lines.append(f"{pad}• {field_name} (one of: {vals}){field_desc}")
         else:
             lines.append(f"{pad}• {field_name} (text){field_desc}")
+
+
+def build_free_form_entities_instruction(free_form_entities: bool) -> str:
+    """The one line `entities_allow_free_form` decides, inside the entity-labels section.
+
+    Shared with the prompt preview, which reports this line as its own block so the
+    flag is visible as something shaping the prompt rather than hiding inside the
+    labels text. The section only exists when labels are configured, so with none the
+    flag changes nothing.
+    """
+    if free_form_entities:
+        return (
+            "Classify each fact using the structured 'labels' field below. "
+            "Continue extracting regular named entities in the 'entities' field."
+        )
+    return (
+        "Classify each fact using the structured 'labels' field below. "
+        "Do NOT add regular named entities — labels-only mode."
+    )
 
 
 def _build_labels_prompt_section(labels_cfg: EntityLabelsConfig | list | None, free_form_entities: bool = True) -> str:
@@ -1132,10 +1399,7 @@ def _build_labels_prompt_section(labels_cfg: EntityLabelsConfig | list | None, f
     if not labels_cfg.attributes:
         return ""
 
-    if free_form_entities:
-        entities_instruction = "Classify each fact using the structured 'labels' field below. Continue extracting regular named entities in the 'entities' field."
-    else:
-        entities_instruction = "Classify each fact using the structured 'labels' field below. Do NOT add regular named entities — labels-only mode."
+    entities_instruction = build_free_form_entities_instruction(free_form_entities)
 
     lines = [
         "\n\n══════════════════════════════════════════════════════════════════════════",
@@ -1159,6 +1423,9 @@ def _build_labels_prompt_section(labels_cfg: EntityLabelsConfig | list | None, f
         if attr.type == "text":
             # Free-text: no predefined values — LLM writes any relevant string or null
             lines.append(f"- {attr.key} (free text or null): {attr.description}")
+        elif attr.type == "multi-text":
+            # Open vocabulary: no predefined values — LLM writes as many strings as the content warrants
+            lines.append(f"- {attr.key} (list of free text, empty list if none): {attr.description}")
         else:
             mode = "multi-value (list)" if attr.type == "multi-values" else "single value or null"
             lines.append(f"- {attr.key} ({mode}): {attr.description}")
@@ -1195,7 +1462,97 @@ def _build_labels_prompt_section(labels_cfg: EntityLabelsConfig | list | None, f
     return "\n".join(lines)
 
 
-def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
+def _with_iso_timestamp_pattern(fact_class: type[BaseModel]) -> type[BaseModel]:
+    """Re-declare occurred_start/occurred_end with an ISO-timestamp ``pattern``.
+
+    Layered on rather than declared on the models so the constraint only reaches
+    backends that can take it. Constraining the Pydantic model (instead of
+    post-processing the serialized schema) is what makes this uniform across
+    providers: Gemini is handed the response model itself, not a schema dict.
+    """
+    constrained: dict[str, Any] = {}
+    for name in ("occurred_start", "occurred_end"):
+        constrained[name] = (
+            str | None,
+            Field(
+                default=None,
+                pattern=ISO_TIMESTAMP_PATTERN,
+                description=fact_class.model_fields[name].description,
+            ),
+        )
+    return create_model(f"{fact_class.__name__}IsoTimestamps", __base__=fact_class, **constrained)
+
+
+#: Appended to the extraction prompt when the dimensions are optional, so the
+#: instructions cannot keep asking for a placeholder the schema no longer wants.
+OPTIONAL_DIMENSIONS_SECTION = """
+
+══════════════════════════════════════════════════════════════════════════
+OPTIONAL FIELDS
+══════════════════════════════════════════════════════════════════════════
+
+"when", "where", "who" and "why" may be null. Write null — not "N/A" — when the
+text states no value for the fact you are writing, and never carry over a value
+the text states about a different subject.
+"""
+
+
+def _null_instead_of_na(text: str) -> str:
+    """Swap the "N/A" placeholder instruction for "null", changing nothing else.
+
+    A mechanical substitution on purpose. An earlier attempt rewrote these
+    descriptions properly ("explicitly stated for THIS fact … never invent a
+    motive") and that is not the harmless tightening it looks like: `why` stopped
+    absorbing the request behind an agent's action, so "the user asked me to
+    refactor X" came back as its own separate world fact and flipped the
+    experience/world balance in test_fact_extraction_agent_experience. The flag
+    exists to make the value optional, not to restate what the fields mean.
+    """
+    return text.replace("'N/A'", "null").replace('"N/A"', "null")
+
+
+def _with_optional_dimensions(fact_class: type[BaseModel]) -> type[BaseModel]:
+    """Re-declare when/where/who/why as nullable, keeping the keys required.
+
+    Layered on at schema-build time rather than declared on the models, for the
+    same reason as the timestamp pattern: the default path then serializes
+    byte-identically to before, and only a server that opted in sees the change.
+
+    Under strict structured output every declared property is required, so a model
+    asked for `when` on a fact the text gives no date for has no legal way to say
+    "not stated" — it must emit a string, and the nearest plausible one is whatever
+    the surrounding text mentions (#4457). Making the value nullable gives it a
+    legal answer. Note this is not a guarantee: a model that wants to say the date
+    can still write it into `what` instead, which is what it did here on
+    gemini-3.1-flash-lite. It removes the pressure; it does not police the output.
+    """
+    optional: dict[str, Any] = {}
+    for name in ("when", "where", "who", "why"):
+        existing = fact_class.model_fields.get(name)
+        # Verbatim extraction has no `why` — it only collects metadata.
+        if existing is None:
+            continue
+        described = existing.description
+        optional[name] = (
+            str | None,
+            Field(default=None, description=_null_instead_of_na(described) if described else described),
+        )
+    return create_model(f"{fact_class.__name__}OptionalDimensions", __base__=fact_class, **optional)
+
+
+@dataclass(frozen=True)
+class ExtractionPrompt:
+    """Prebuilt extraction system prompt and Pydantic response schema.
+
+    Hoisted outside the per-chunk loop to avoid repeatedly formatting prompt templates
+    and dynamically re-generating Pydantic models via create_model() for every individual chunk.
+    """
+
+    system_prompt: str
+    response_schema: type[BaseModel]
+
+
+def _build_extraction_prompt_and_schema(config) -> ExtractionPrompt:
     """
     Build extraction prompt and response schema based on config.
 
@@ -1204,7 +1561,7 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     This enables JSON schema enforcement for structured outputs.
 
     Returns:
-        Tuple of (prompt, response_schema)
+        ExtractionPrompt containing system_prompt and response_schema
     """
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
@@ -1215,36 +1572,35 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     # CachedContent serves every bank, and the mission rides in the per-request
     # user message via _retain_mission_preamble(). The {retain_mission_section}
     # placeholder is kept (templates still reference it) but always empty here.
-    from hindsight_api.engine.prompt_utils import escape_for_prompt
+    from hindsight_api.engine.prompt_utils import default_language_section, escape_for_prompt
 
     retain_mission_section = ""
 
-    # Select base prompt based on extraction mode
-    if extraction_mode == "custom":
-        if not config.retain_custom_instructions:
-            base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(
-                retain_mission_section=retain_mission_section,
-            )
-        else:
-            base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(
-                retain_mission_section=retain_mission_section,
-                custom_instructions=escape_for_prompt(config.retain_custom_instructions),
-            )
+    # Mirrors build_consolidation_system_prompt(). This toggle may change the cacheable
+    # prefix — it is low-cardinality and keyed by the cache fingerprint.
+    language_section = default_language_section(_DEFAULT_LANGUAGE_RULE, config.llm_output_language)
+
+    # Select base prompt based on extraction mode. The modes differ in which constant they
+    # name, not in how it is filled: only the custom template references
+    # {custom_instructions}, and ``str.format`` ignores a keyword no template mentions, so
+    # all four can be filled by one call.
+    custom_instructions = ""
+    if extraction_mode == "custom" and config.retain_custom_instructions:
+        base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
+        custom_instructions = escape_for_prompt(config.retain_custom_instructions)
     elif extraction_mode == "verbose":
-        prompt = VERBOSE_FACT_EXTRACTION_PROMPT.format(
-            retain_mission_section=retain_mission_section,
-        )
+        base_prompt = VERBOSE_FACT_EXTRACTION_PROMPT
     elif extraction_mode == "verbatim":
-        prompt = VERBATIM_FACT_EXTRACTION_PROMPT.format(
-            retain_mission_section=retain_mission_section,
-        )
+        base_prompt = VERBATIM_FACT_EXTRACTION_PROMPT
     else:
+        # Concise is the default, and also what custom mode falls back to with no
+        # instructions configured — there is nothing to substitute into the custom template.
         base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-        prompt = base_prompt.format(
-            retain_mission_section=retain_mission_section,
-        )
+    prompt = base_prompt.format(
+        language_section=language_section,
+        retain_mission_section=retain_mission_section,
+        custom_instructions=custom_instructions,
+    )
 
     # Add causal relationships section if enabled
     # Verbatim mode never uses causal relations (no fact text to relate causally)
@@ -1258,6 +1614,42 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     else:
         base_fact_class = ExtractedFactNoCausal
         base_response_class = FactExtractionResponseNoCausal
+
+    # Constrain the timestamp fields when the backend accepts JSON Schema
+    # `pattern`. Off by default: it stops a grammar-constrained model from
+    # reasoning inside a timestamp string (and burning the whole completion
+    # budget doing it), but backends that validate schemas against an allowlist
+    # reject the request outright. See DEFAULT_LLM_SUPPORTS_STRING_PATTERN.
+    if config.llm_supports_string_pattern:
+        base_fact_class = _with_iso_timestamp_pattern(base_fact_class)
+        base_response_class = create_model(
+            f"{base_response_class.__name__}IsoTimestamps",
+            # Carry the wrapper's field description across — it is part of the
+            # schema the model sees.
+            facts=(
+                list[base_fact_class],  # type: ignore[valid-type]
+                Field(description=base_response_class.model_fields["facts"].description),
+            ),
+        )
+
+    # Let a fact leave the four descriptive dimensions empty instead of filling
+    # them with "N/A". Off by default — it changes what a capable model returns,
+    # see DEFAULT_RETAIN_OPTIONAL_FACT_DIMENSIONS.
+    if config.retain_optional_fact_dimensions:
+        base_fact_class = _with_optional_dimensions(base_fact_class)
+        base_response_class = create_model(
+            f"{base_response_class.__name__}OptionalDimensions",
+            facts=(
+                list[base_fact_class],  # type: ignore[valid-type]
+                Field(description=base_response_class.model_fields["facts"].description),
+            ),
+        )
+        # The FACT FORMAT block still spells out '"N/A" if none' per field, which
+        # would contradict the section below and the schema. Same mechanical swap
+        # as the field descriptions get. It also rewrites an "N/A" a custom
+        # instruction happens to contain, which is the intended reading of the
+        # flag: this server does not use that placeholder.
+        prompt = _null_instead_of_na(prompt) + OPTIONAL_DIMENSIONS_SECTION
 
     # Add entity labels section if configured and build dynamic schema
     entity_labels_raw = config.entity_labels
@@ -1311,7 +1703,62 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
             DynamicResponse = create_model("LabelsResponse", facts=(list[DynamicFact], ...))  # type: ignore[valid-type]
             response_schema = DynamicResponse
 
-    return prompt, response_schema
+    return ExtractionPrompt(system_prompt=prompt, response_schema=response_schema)
+
+
+@dataclass(frozen=True)
+class ChunkPromptParts:
+    """Exactly what one extraction call sends: both messages plus the response schema.
+
+    Both messages are kept because the bank's retain mission is deliberately absent
+    from ``system_prompt`` — see :func:`_retain_mission_preamble`. A preview that
+    showed only the system prompt would show a configured mission as missing.
+    """
+
+    system_prompt: str
+    user_message: str
+    response_schema: type[BaseModel]
+
+
+def build_chunk_prompt_parts(
+    config,
+    *,
+    chunk: str,
+    chunk_index: int = 0,
+    total_chunks: int = 1,
+    event_date: datetime | None = None,
+    context: str = "",
+    metadata: dict[str, str] | None = None,
+    agent_name: str | None = None,
+    extraction_prompt: ExtractionPrompt | None = None,
+) -> ChunkPromptParts:
+    """Render the extraction messages for one chunk without calling the LLM.
+
+    The single place both the extraction path and the prompt-preview endpoint go
+    through, so a preview always reflects the real request.
+
+    When ``extraction_prompt`` is provided, reuses the precomputed system prompt and
+    response schema (hoisted outside the chunk loop to eliminate per-chunk create_model()
+    calls and repeated template formatting). When omitted, builds them on demand from
+    ``config``, guaranteeing standalone and preview callers remain self-contained.
+    """
+    if extraction_prompt is None:
+        extraction_prompt = _build_extraction_prompt_and_schema(config)
+    user_message = _build_user_message(
+        chunk,
+        chunk_index,
+        total_chunks,
+        event_date,
+        context,
+        metadata,
+        agent_name,
+        mission_preamble=_retain_mission_preamble(config),
+    )
+    return ChunkPromptParts(
+        system_prompt=extraction_prompt.system_prompt,
+        user_message=user_message,
+        response_schema=extraction_prompt.response_schema,
+    )
 
 
 def _retain_mission_preamble(config) -> str:
@@ -1332,6 +1779,31 @@ def _retain_mission_preamble(config) -> str:
         "══════════════════════════════════════════════════════════════════════════\n\n"
         f"{retain_mission}\n\n"
     )
+
+
+def _attachment_ids_for(fact: "Fact", chunk_text: str) -> list[str]:
+    """Resolve the extractor's attachment numbers to this chunk's attachment ids.
+
+    Attachments are numbered 1..n in the prompt in the order they appear in the
+    chunk, so the mapping is just that order. It follows *occurrences*, not
+    distinct attachments: `build_prompt_parts` emits one part per placeholder, so
+    an attachment used twice in a chunk really is two of the numbered things the
+    model was shown, and counting it once here would shift every later number.
+
+    Numbers outside the range are dropped: a hallucinated "4" for a chunk
+    carrying two attachments should attach nothing rather than guess at one. The
+    result is deduplicated, since two occurrences of one attachment are one edge.
+    """
+    numbers = fact.from_attachments or []
+    if not numbers:
+        return []
+    ordered = list(attachment_content.iter_placeholder_ids(chunk_text or ""))
+    return list(dict.fromkeys(ordered[n - 1] for n in numbers if 1 <= n <= len(ordered)))
+
+
+def _numbering_phrase(count: int) -> str:
+    """How to name the attachments in the prompt: "1" for one, "1 to N" beyond."""
+    return "1" if count <= 1 else f"1 to {count}"
 
 
 def _build_user_message(
@@ -1382,13 +1854,48 @@ def _build_user_message(
                 'statements to that speaker and classify them as "world", not "assistant".'
             )
 
-    return f"""{mission_preamble}Extract facts from the following text chunk.
+    # Attachments are spliced into this message in place of their placeholders
+    # (see build_prompt_parts), so by the time the model reads it the picture is
+    # simply there — with nothing telling it to look. The prompt otherwise says
+    # "text chunk" and "Text:" throughout, which reads as an instruction to
+    # extract from the prose; a screenshot whose button label appeared nowhere in
+    # that prose was routinely ignored. Naming the attachments is what puts their
+    # content in scope.
+    attachment_section = ""
+    attachment_count = sum(1 for _ in attachment_content.iter_placeholder_ids(sanitized_chunk or ""))
+    if attachment_count:
+        attachment_section = (
+            "\n\nATTACHMENTS: this chunk contains one or more attachments (images, PDFs, other "
+            "files), each shown inline at the exact position it occupies in the source. Read them. "
+            "Facts stated only in an attachment — a button's label, a value in a table, the boxes "
+            "of a diagram, text on a page — are as extractable as facts stated in the prose, and "
+            "are often the point of the document. Attribute each attachment to the sentences "
+            'around it: an image that follows "click the button shown:" is that button.\n'
+            "When an attachment carries structured data — a chart, a table, a form, a "
+            "spreadsheet — the data IS the document: give each row, bar, slice or labelled "
+            "value its own fact, carrying its label, its exact figure, AND how it is drawn — "
+            "its colour, and where it sits in the order (leftmost, third bar, bottom row). "
+            'Someone reading the chart asks about "the green bar" or "the bottom row", never '
+            "about the internal label, so a fact without those is unreachable no matter how "
+            "accurate it is. Do not summarize the series: a summary keeps the two or three "
+            "values it happens to name and silently discards every other one, which is the "
+            "bulk of what the attachment was showing. Record what the whole thing is as well "
+            "— its title, its units, the period it covers, how many items it plots, and what "
+            "each colour in its legend stands for.\n"
+            f"They are numbered {_numbering_phrase(attachment_count)} in the order they appear "
+            "above. For each fact, set 'from_attachments' to the number(s) of the attachments it "
+            "came from, and leave it empty when the fact is stated in the text. This is what lets "
+            "a reader see the picture a fact came from, so be accurate: list an attachment only "
+            "when the fact could not be stated without looking at it."
+        )
+
+    return f"""{mission_preamble}Extract facts from the following chunk.
 
 Chunk: {chunk_index + 1}/{total_chunks}
 Event Date: {event_date_str}
-Context: {sanitized_context}{metadata_section}{narrator_section}
+Context: {sanitized_context}{metadata_section}{narrator_section}{attachment_section}
 
-Text:
+Content:
 {sanitized_chunk}"""
 
 
@@ -1434,7 +1941,7 @@ def _build_request_body(batch_impl, config, prompt: str, user_message: str, resp
     # fallback, so the batch and streaming paths can't disagree.
     if hasattr(response_schema, "model_json_schema"):
         retain_strict_schema = config.llm_strict_schema_retain
-        schema = strict_json_schema(response_schema) if retain_strict_schema else response_schema.model_json_schema()
+        schema = strict_json_schema(response_schema) if retain_strict_schema else provider_json_schema(response_schema)
         request_body["response_format"] = {
             "type": "json_schema",
             "json_schema": {"name": "facts", "schema": schema, "strict": retain_strict_schema},
@@ -1460,8 +1967,11 @@ async def _extract_facts_from_chunk(
     context: str,
     llm_config: "LLMConfig",
     config,
-    agent_name: str = None,
+    agent_name: str | None = None,
     metadata: dict[str, str] | None = None,
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
+    extraction_prompt: ExtractionPrompt | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a single chunk (internal helper for parallel processing).
@@ -1475,24 +1985,43 @@ async def _extract_facts_from_chunk(
 
     logger = logging.getLogger(__name__)
 
-    # Build prompt and schema using helper function
-    prompt, response_schema = _build_extraction_prompt_and_schema(config)
+    # Assembled by the same helper the prompt-preview endpoint calls, so what the
+    # control plane shows for a candidate mission cannot drift from what is sent.
+    parts = build_chunk_prompt_parts(
+        config,
+        chunk=chunk,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
+        event_date=event_date,
+        context=context,
+        metadata=metadata,
+        agent_name=agent_name,
+        extraction_prompt=extraction_prompt,
+    )
+    prompt = parts.system_prompt
+    response_schema = parts.response_schema
+    user_message = parts.user_message
 
     # Check config for extraction mode and causal link extraction
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
-    # Build user message — the bank mission rides here (not in the cached prefix).
-    user_message = _build_user_message(
-        chunk,
-        chunk_index,
-        total_chunks,
-        event_date,
-        context,
-        metadata,
-        agent_name,
-        mission_preamble=_retain_mission_preamble(config),
-    )
+    # Swap image placeholders for the images themselves, in place. Done on the
+    # fully assembled message rather than on the chunk so the surrounding prompt
+    # scaffolding is byte-identical to the text-only path, and a chunk with no
+    # images comes back as the same plain string it always was.
+    user_content: Any = user_message
+    if attachment_loader is not None and attachment_content.contains_attachment(user_message):
+        loaded = await attachment_loader.load(list(attachment_content.iter_placeholder_ids(user_message)))
+        user_content = attachment_content.build_prompt_parts(user_message, loaded)
+        # This is the only kind of chunk that needs to *see*, so it is the only
+        # one that pays for a vision model. Every text-only chunk stays on the
+        # retain LLM — which is the point of the slot: one screenshot in a
+        # document used to force the entire bank onto a vision-capable model.
+        # `vlm_config` is None when unconfigured, and resolves to the retain LLM
+        # when it is set but not overridden, so both cases are a no-op here.
+        if vlm_config is not None:
+            llm_config = vlm_config
 
     # Opt into context caching when the provider supports it. The prompt and
     # response_schema are bank-agnostic (the mission lives in the user message),
@@ -1522,8 +2051,11 @@ async def _extract_facts_from_chunk(
     )
     # OUTER content-validation attempts (re-prompts on malformed JSON). Follows the
     # same `N + 1` convention as the providers' transport-retry loops — N retries after
-    # the initial request — so a zero budget still performs one request (#2731). The raw
-    # budget is forwarded unchanged to llm_config.call(), which owns transport retries.
+    # the initial request — so a zero budget still performs one request (#2731).
+    # Transport retries are NOT forwarded per call: the retain LLM is built with this
+    # same budget as its default, and in a multi-LLM chain each member may override
+    # it (``HINDSIGHT_API_LLM_<n>_MAX_RETRIES``). A per-call value would win over the
+    # member's own and hand every member the same budget.
     outer_attempts = llm_max_retries + 1
     last_error: Exception | None = None
 
@@ -1540,22 +2072,22 @@ async def _extract_facts_from_chunk(
             )
 
             call_kwargs: dict[str, Any] = dict(
-                messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
+                messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_content}],
                 response_format=response_schema,
                 scope="retain_extract_facts",
                 temperature=config.llm_temperature_retain,
                 strict_schema=config.llm_strict_schema_retain,
                 max_completion_tokens=config.retain_max_completion_tokens,
-                max_retries=llm_max_retries,
                 initial_backoff=initial_backoff,
                 max_backoff=max_backoff,
                 skip_validation=True,  # Get raw JSON, we'll validate leniently
-                return_usage=True,
             )
             if cached_prefix_name is not None:
                 call_kwargs["cached_prefix"] = cached_prefix_name
 
-            extraction_response_json, call_usage = await llm_config.call(**call_kwargs)
+            extraction_call = await llm_config.call(**call_kwargs)
+            extraction_response_json = extraction_call.content
+            call_usage = extraction_call.usage
             usage = usage + call_usage  # Aggregate usage across retries
 
             # Lenient parsing of facts from raw JSON
@@ -1723,7 +2255,7 @@ async def _extract_facts_from_chunk(
                                 if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
                                     continue
                                 label_str = f"{group.key}:{v.strip()}"
-                                if group.type == "text":
+                                if group.type in ("text", "multi-text"):
                                     if label_str.lower() not in existing_texts_lower:
                                         validated_entities.append(label_str)
                                         existing_texts_lower.add(label_str.lower())
@@ -1785,6 +2317,9 @@ async def _extract_facts_from_chunk(
                 # Set mentioned_at to the event_date (when the conversation/document occurred),
                 # or None when the caller opted into no timestamp.
                 fact_data["mentioned_at"] = event_date.isoformat() if event_date is not None else None
+                attributed = get_value("from_attachments")
+                if attributed:
+                    fact_data["from_attachments"] = [n for n in attributed if isinstance(n, int)]
 
                 # Build Fact model instance
                 try:
@@ -1864,8 +2399,11 @@ async def _extract_facts_with_auto_split(
     context: str,
     llm_config: LLMConfig,
     config,
-    agent_name: str = None,
+    agent_name: str | None = None,
     metadata: dict[str, str] | None = None,
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
+    extraction_prompt: ExtractionPrompt | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a chunk with automatic splitting if output exceeds token limits.
@@ -1883,6 +2421,12 @@ async def _extract_facts_with_auto_split(
         config: Resolved HindsightConfig for this bank
         agent_name: Optional agent name (memory owner)
         metadata: Optional document metadata key-value pairs
+        attachment_loader: Resolves the chunk's image placeholders back to bytes, or None
+            when the caller has no images to resolve. Carried through the split
+            recursion so a half-chunk keeps the images it still references.
+        vlm_config: Optional vision-capable LLMConfig for chunks with attachments.
+        extraction_prompt: Optional precomputed extraction prompt and response schema,
+            forwarded down the chunk execution and recursive split tree.
 
     Returns:
         Tuple of (facts list, token usage) extracted from the chunk (possibly from sub-chunks)
@@ -1903,6 +2447,9 @@ async def _extract_facts_with_auto_split(
             config=config,
             agent_name=agent_name,
             metadata=metadata,
+            attachment_loader=attachment_loader,
+            vlm_config=vlm_config,
+            extraction_prompt=extraction_prompt,
         )
     except OutputTooLongError:
         # Output exceeded token limits - split the chunk and retry. Conversation
@@ -1938,6 +2485,9 @@ async def _extract_facts_with_auto_split(
                 config=config,
                 agent_name=agent_name,
                 metadata=metadata,
+                attachment_loader=attachment_loader,
+                vlm_config=vlm_config,
+                extraction_prompt=extraction_prompt,
             ),
             _extract_facts_with_auto_split(
                 chunk=second_half,
@@ -1949,6 +2499,9 @@ async def _extract_facts_with_auto_split(
                 config=config,
                 agent_name=agent_name,
                 metadata=metadata,
+                attachment_loader=attachment_loader,
+                vlm_config=vlm_config,
+                extraction_prompt=extraction_prompt,
             ),
         ]
 
@@ -1970,10 +2523,13 @@ async def extract_facts_from_text(
     text: str,
     event_date: datetime | None,
     llm_config: LLMConfig,
-    agent_name: str,
     config,
     context: str = "",
     metadata: dict[str, str] | None = None,
+    agent_name: str | None = None,
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
+    extraction_prompt: ExtractionPrompt | None = None,
 ) -> tuple[list[Fact], list[tuple[str, int]], TokenUsage]:
     """
     Extract semantic facts from conversational or narrative text using LLM.
@@ -1988,10 +2544,21 @@ async def extract_facts_from_text(
         text: Input text (conversation, article, etc.)
         event_date: Reference date for resolving relative times
         llm_config: LLM configuration to use
-        agent_name: Agent name (memory owner)
         config: Resolved HindsightConfig for this bank
         context: Context about the conversation/document
-        metadata: Optional document metadata key-value pairs
+        metadata: Optional document metadata key-value pairs. Also selects the
+            chain member when the retain LLM uses the "metadata" strategy.
+        agent_name: Optional narrator to prime the prompt with ("Narrator: {name}").
+            Retain never sets it — see the caller in retain/orchestrator.py — and the
+            dry-run endpoint's field that does is deprecated in favour of ``context``.
+        attachment_loader: Resolves inline image placeholders back to bytes so the model
+            sees each image in position. None means the text carries no images (or
+            the caller has no store to resolve them from), and every chunk is sent
+            as plain text exactly as before.
+        vlm_config: Optional vision-capable LLMConfig for chunks with attachments.
+        extraction_prompt: Optional precomputed extraction prompt and response schema.
+            When provided, reuses the already compiled system prompt and Pydantic model
+            across all chunks in this text. When omitted, compiles them once from config.
 
     Returns:
         Tuple of (facts, chunks, usage) where:
@@ -1999,10 +2566,25 @@ async def extract_facts_from_text(
         - chunks: List of tuples (chunk_text, fact_count) for each chunk
         - usage: Aggregated token usage across all LLM calls
     """
+    # Metadata routing binds the member here rather than at the operation level:
+    # one call to this function is one retain item, so its metadata is
+    # unambiguous, and every chunk it fans out below shares that one item's
+    # classification. A chain in any other mode (or an item matching no route)
+    # returns the wrapper unchanged.
+    route_for = getattr(llm_config, "route_for", None)
+    if route_for is not None:
+        llm_config = route_for(metadata)
+
+    # Build prompt and schema once for all chunks in this text (eliminates redundant
+    # dynamic create_model() and AST traversals across parallel chunks)
+    if extraction_prompt is None:
+        extraction_prompt = _build_extraction_prompt_and_schema(config)
+
     chunks = chunk_text(
         text,
         max_chars=config.retain_chunk_size,
         structured_chunk_size=config.retain_structured_chunk_size,
+        max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
     )
 
     # Log chunk count before starting LLM requests
@@ -2029,6 +2611,9 @@ async def extract_facts_from_text(
             config=config,
             agent_name=agent_name,
             metadata=metadata,
+            attachment_loader=attachment_loader,
+            vlm_config=vlm_config,
+            extraction_prompt=extraction_prompt,
         )
         for i, chunk in enumerate(chunks)
     ]
@@ -2104,7 +2689,7 @@ async def extract_facts_from_text(
 # Import types for the orchestration layer (note: ExtractedFact here is different from the Pydantic model above)
 
 from .types import CausalRelation as CausalRelationType
-from .types import ChunkMetadata, RetainContent
+from .types import ChunkMetadata, ExtractionResult, RetainContent
 from .types import ExtractedFact as ExtractedFactType
 
 logger = logging.getLogger(__name__)
@@ -2149,12 +2734,11 @@ async def _write_batch_extraction_errors(
 async def extract_facts_from_contents_batch_api(
     contents: list[RetainContent],
     llm_config,
-    agent_name: str,
     config,
     pool=None,
     operation_id: str | None = None,
     schema: str | None = None,
-) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
+) -> ExtractionResult:
     """
     Extract facts using LLM Batch API (OpenAI/Groq).
 
@@ -2164,17 +2748,16 @@ async def extract_facts_from_contents_batch_api(
     Args:
         contents: List of RetainContent objects to process
         llm_config: LLM configuration with batch API support
-        agent_name: Name of the agent
         config: Resolved HindsightConfig for this bank
         pool: Database connection pool (for storing batch state)
         operation_id: Async operation ID (for crash recovery)
         schema: Database schema (for multi-tenant support)
 
     Returns:
-        Tuple of (extracted_facts, chunks_metadata, usage)
+        An ExtractionResult carrying the facts, their chunk metadata, and token usage.
     """
     if not contents:
-        return [], [], TokenUsage()
+        return ExtractionResult([], [], TokenUsage())
 
     logger.info(f"Using Batch API for fact extraction ({len(contents)} contents)")
 
@@ -2258,13 +2841,14 @@ async def extract_facts_from_contents_batch_api(
     batch_requests = []
 
     # Build prompt and schema once (same for all chunks)
-    prompt, response_schema = _build_extraction_prompt_and_schema(config)
+    extraction_prompt = _build_extraction_prompt_and_schema(config)
 
     for content_index, item in enumerate(contents):
         chunks = chunk_text(
             item.content,
             max_chars=config.retain_chunk_size,
             structured_chunk_size=config.retain_structured_chunk_size,
+            max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
         )
 
         for chunk_index_in_content, chunk in enumerate(chunks):
@@ -2281,19 +2865,24 @@ async def extract_facts_from_contents_batch_api(
                 item.event_date,
                 item.context,
                 item.metadata or None,
-                agent_name,
                 mission_preamble=_retain_mission_preamble(config),
             )
 
             # Build request body using helper function
-            request_body = _build_request_body(batch_impl, config, prompt, user_message, response_schema)
+            request_body = _build_request_body(
+                batch_impl,
+                config,
+                extraction_prompt.system_prompt,
+                user_message,
+                extraction_prompt.response_schema,
+            )
 
             batch_requests.append(
                 {"custom_id": custom_id, "method": "POST", "url": "/v1/chat/completions", "body": request_body}
             )
 
     if not batch_requests and not batch_id:  # No requests and not resuming
-        return [], [], TokenUsage()
+        return ExtractionResult([], [], TokenUsage())
 
     # Step 2: Submit batch (skip if resuming)
     if not batch_id:
@@ -2363,7 +2952,10 @@ async def extract_facts_from_contents_batch_api(
     logger.info(f"Batch {batch_id} completed in {elapsed:.0f}s, retrieving results")
 
     # Step 4: Retrieve results
-    batch_results = await batch_impl.retrieve_batch_results(batch_id)
+    # Batch results are downloaded straight from the provider's output file, so they
+    # never pass through ``LLMProvider.call`` and miss the scrub it applies. Sanitize
+    # them here so the batch path gets the same guarantee as the sync one (#3729).
+    batch_results = sanitize_value(await batch_impl.retrieve_batch_results(batch_id))
 
     # Map results by custom_id
     results_by_id = {result["custom_id"]: result for result in batch_results}
@@ -2564,7 +3156,7 @@ async def extract_facts_from_contents_batch_api(
                             if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
                                 continue
                             label_str = f"{group.key}:{v.strip()}"
-                            if group.type == "text":
+                            if group.type in ("text", "multi-text"):
                                 if label_str.lower() not in existing_texts_lower:
                                     validated_entities.append(label_str)
                                     existing_texts_lower.add(label_str.lower())
@@ -2614,6 +3206,9 @@ async def extract_facts_from_contents_batch_api(
             # Set mentioned_at to the event_date (when the conversation/document occurred),
             # or None when the caller opted into no timestamp.
             fact_data["mentioned_at"] = event_date.isoformat() if event_date is not None else None
+            attributed = get_value("from_attachments")
+            if attributed:
+                fact_data["from_attachments"] = [n for n in attributed if isinstance(n, int)]
 
             try:
                 fact = Fact(fact=combined_text, fact_type=fact_type, **fact_data)
@@ -2673,6 +3268,7 @@ async def extract_facts_from_contents_batch_api(
                 ),
                 content_index=chunk_meta.content_index,
                 chunk_index=chunk_meta.chunk_index,
+                attachment_ids=_attachment_ids_for(fact_from_llm, chunk_meta.chunk_text),
                 context=content.context,
                 mentioned_at=content.event_date,
                 metadata=content.metadata,
@@ -2693,13 +3289,13 @@ async def extract_facts_from_contents_batch_api(
 
     logger.info(f"Batch API extracted {len(extracted_facts)} facts from {len(all_chunks_info)} chunks")
 
-    return extracted_facts, chunks_metadata, total_usage
+    return ExtractionResult(extracted_facts, chunks_metadata, total_usage)
 
 
 def _extract_facts_chunks(
     contents: list[RetainContent],
     config,
-) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
+) -> ExtractionResult:
     """
     chunks mode: no LLM call, no entity extraction.
 
@@ -2716,6 +3312,7 @@ def _extract_facts_chunks(
             content.content,
             config.retain_chunk_size,
             structured_chunk_size=config.retain_structured_chunk_size,
+            max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
         )
         for chunk in chunks:
             chunks_metadata.append(
@@ -2728,11 +3325,20 @@ def _extract_facts_chunks(
             )
             extracted_facts.append(
                 ExtractedFactType(
-                    fact_text=chunk,
+                    # The chunk text is copied verbatim into the fact, so its
+                    # attachment placeholders would otherwise be recalled as
+                    # memory text — a content hash presented to a user as
+                    # knowledge. The chunk itself keeps the placeholder (that is
+                    # what carries position), and the machine-readable handle
+                    # rides on the response's `attachments`, not in the fact.
+                    fact_text=attachment_content.describe_placeholders(chunk),
                     fact_type="world",
                     entities=[],
                     content_index=content_index,
                     chunk_index=global_chunk_idx,
+                    # No extractor to attribute here: the fact is the whole
+                    # chunk, so everything the chunk carries belongs to it.
+                    attachment_ids=list(dict.fromkeys(attachment_content.iter_placeholder_ids(chunk))),
                     context=content.context,
                     mentioned_at=content.event_date,
                     metadata=content.metadata,
@@ -2743,18 +3349,19 @@ def _extract_facts_chunks(
             global_chunk_idx += 1
 
     _add_temporal_offsets(extracted_facts, contents)
-    return extracted_facts, chunks_metadata, TokenUsage()
+    return ExtractionResult(extracted_facts, chunks_metadata, TokenUsage())
 
 
 async def extract_facts_from_contents(
     contents: list[RetainContent],
     llm_config,
-    agent_name: str,
     config,
     pool=None,
     operation_id: str | None = None,
     schema: str | None = None,
-) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
+    attachment_loader: "RetainAttachmentLoader | None" = None,
+    vlm_config: "LLMConfig | None" = None,
+) -> ExtractionResult:
     """
     Extract facts from multiple content items in parallel.
 
@@ -2769,17 +3376,18 @@ async def extract_facts_from_contents(
     Args:
         contents: List of RetainContent objects to process
         llm_config: LLM configuration for fact extraction
-        agent_name: Name of the agent (for agent-related fact detection)
         config: Resolved HindsightConfig for this bank
         pool: Database connection pool (passed to batch API for state storage)
         operation_id: Async operation ID (passed to batch API for crash recovery)
         schema: Database schema (passed to batch API for multi-tenant support)
+        attachment_loader: Resolves inline image placeholders back to bytes for the
+            extraction prompt. None when the retain carries no images.
 
     Returns:
-        Tuple of (extracted_facts, chunks_metadata, usage)
+        An ExtractionResult carrying the facts, their chunk metadata, and token usage.
     """
     if not contents:
-        return [], [], TokenUsage()
+        return ExtractionResult([], [], TokenUsage())
 
     # chunks mode: skip LLM entirely, store each chunk as-is
     # Must come before the batch-API check so no LLM queue/locks are acquired
@@ -2788,9 +3396,9 @@ async def extract_facts_from_contents(
 
     # Route to batch API if enabled
     if config.retain_batch_enabled:
-        return await extract_facts_from_contents_batch_api(
-            contents, llm_config, agent_name, config, pool, operation_id, schema
-        )
+        return await extract_facts_from_contents_batch_api(contents, llm_config, config, pool, operation_id, schema)
+
+    extraction_prompt = _build_extraction_prompt_and_schema(config)
 
     # Step 1: Create parallel fact extraction tasks
     fact_extraction_tasks = []
@@ -2801,9 +3409,11 @@ async def extract_facts_from_contents(
             event_date=item.event_date,
             context=item.context,
             llm_config=llm_config,
-            agent_name=agent_name,
             config=config,
             metadata=item.metadata or None,
+            attachment_loader=attachment_loader,
+            vlm_config=vlm_config,
+            extraction_prompt=extraction_prompt,
         )
         fact_extraction_tasks.append(task)
 
@@ -2873,6 +3483,7 @@ async def extract_facts_from_contents(
                     ),
                     content_index=content_index,
                     chunk_index=chunk_global_idx,
+                    attachment_ids=_attachment_ids_for(fact_from_llm, chunk_text),
                     context=content.context,
                     # mentioned_at: always the event_date (when the conversation/document occurred)
                     mentioned_at=content.event_date,
@@ -2895,7 +3506,7 @@ async def extract_facts_from_contents(
     # Step 6: Auto-tag facts from label groups with tag=True
     _inject_label_tags(extracted_facts, config)
 
-    return extracted_facts, chunks_metadata, total_usage
+    return ExtractionResult(extracted_facts, chunks_metadata, total_usage)
 
 
 def _collapse_to_verbatim(facts: list[ExtractedFactType], chunks: list[ChunkMetadata]) -> list[ExtractedFactType]:
@@ -2906,13 +3517,21 @@ def _collapse_to_verbatim(facts: list[ExtractedFactType], chunks: list[ChunkMeta
     this collapses them: keeps the first fact as representative, overrides its
     fact_text with the raw chunk text, and merges entities from any extra facts.
     """
-    chunk_text_map = {c.chunk_index: c.chunk_text for c in chunks}
+    # describe_placeholders for the same reason as chunks mode: verbatim copies the
+    # chunk into the fact, and a raw ⟦hs-att:...⟧ token is not knowledge.
+    chunk_text_map = {c.chunk_index: attachment_content.describe_placeholders(c.chunk_text) for c in chunks}
+    # The fact becomes the entire chunk, so per-fact attribution no longer means
+    # anything here: everything the chunk carries is part of this one fact.
+    chunk_attachment_map = {
+        c.chunk_index: list(dict.fromkeys(attachment_content.iter_placeholder_ids(c.chunk_text))) for c in chunks
+    }
     seen: dict[int, ExtractedFactType] = {}
     result: list[ExtractedFactType] = []
 
     for fact in facts:
         if fact.chunk_index not in seen:
             fact.fact_text = chunk_text_map.get(fact.chunk_index, fact.fact_text)
+            fact.attachment_ids = chunk_attachment_map.get(fact.chunk_index, fact.attachment_ids)
             seen[fact.chunk_index] = fact
             result.append(fact)
         else:
@@ -2998,11 +3617,11 @@ def _inject_label_tags(facts: list[ExtractedFactType], config) -> None:
     labels_cfg = parse_entity_labels(config.entity_labels)
     if not labels_cfg:
         return
-    tag_group_keys = {g.key.lower() for g in labels_cfg.attributes if g.tag}
+    tag_group_keys = label_tag_keys(labels_cfg)
     if not tag_group_keys:
         return
     for fact in facts:
-        label_tags = [e for e in fact.entities if ":" in e and e.split(":", 1)[0].lower() in tag_group_keys]
+        label_tags = split_label_tags(fact.entities, tag_group_keys)
         if label_tags:
             existing = set(fact.tags)
             fact.tags = fact.tags + [t for t in label_tags if t not in existing]

@@ -7,7 +7,7 @@ API stability even if internal models change.
 """
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -130,6 +130,35 @@ class TokenUsage(BaseModel):
         )
 
 
+class LLMCallResult(BaseModel):
+    """What one ``LLMInterface.call`` produced: the response, and what it cost.
+
+    ``call`` used to return either the bare response or a ``(response, usage)``
+    tuple depending on a ``return_usage: bool`` argument — a boolean that changed
+    the return type, which is why all fourteen implementations were annotated
+    ``-> Any`` and neither shape was ever checked. Callers that wanted the cost
+    unpacked two names; callers that did not got the response directly, and
+    nothing could tell you at the call site which you were looking at.
+
+    Returning this unconditionally mirrors ``call_with_tools``, which has always
+    returned a named ``LLMToolCallResult``. Usage is always available, so a caller
+    that wants to record cost no longer has to change the call's return type to
+    get it.
+    """
+
+    content: Any = Field(
+        default=None,
+        description=(
+            "The parsed response when a response_format was given, otherwise the text content. "
+            "Typed Any because the parsed shape is the caller's own response_format model."
+        ),
+    )
+    usage: TokenUsage = Field(
+        default_factory=TokenUsage,
+        description="Tokens this call consumed. Zero-valued when the provider reports none.",
+    )
+
+
 class ExtractedFact(BaseModel):
     """A single candidate fact produced by dry-run extraction (no resolution/links/persistence).
 
@@ -145,13 +174,47 @@ class ExtractedFact(BaseModel):
     entities: list[str] = Field(
         default_factory=list, description="Raw (unresolved) entity names mentioned in the fact."
     )
+    chunk_index: int | None = Field(
+        default=None,
+        description="Index into `chunks` of the chunk this fact came from; null if it could not be attributed.",
+    )
+    attachments: list["ExtractedFactAttachment"] = Field(
+        default_factory=list,
+        description="Attachments from user input that this fact is attributed to / associated with.",
+    )
+
+
+class ExtractedFactAttachment(BaseModel):
+    """An attachment from multimodal input associated with an extracted fact."""
+
+    block_index: int = Field(description="Index of the content block in user's input (0-based)")
+    type: Literal["image", "file"] = Field(
+        description="Content block type ('image' or 'file')",
+        title="AttachmentType",
+    )
+    media_type: str = Field(description="MIME media type of the attachment, e.g. 'image/png'")
+
+
+class ExtractionChunk(BaseModel):
+    """One chunk the extractor was handed, and how much it yielded."""
+
+    text: str = Field(description="The chunk as the extractor saw it.")
+    fact_count: int = Field(description="How many facts came out of this chunk.")
 
 
 class DryRunExtractionResult(BaseModel):
-    """Result of dry-run fact extraction: candidate facts plus aggregated LLM token usage."""
+    """Result of dry-run fact extraction: candidate facts, the chunks they came from,
+    and aggregated LLM token usage."""
 
     facts: list[ExtractedFact] = Field(
         default_factory=list, description="Candidate facts the retain step would extract."
+    )
+    chunks: list[ExtractionChunk] = Field(
+        default_factory=list,
+        description=(
+            "The chunks the input was cut into before extraction. Already computed on every "
+            "path; returned because `retain_chunk_size` is otherwise a number with no visible effect."
+        ),
     )
     usage: TokenUsage = Field(
         default_factory=TokenUsage, description="Aggregated token usage across the extraction LLM calls."
@@ -200,20 +263,52 @@ class RecallScores(BaseModel):
 
 
 class MinScores(BaseModel):
-    """Optional per-stage score floors for recall (all inclusive, AND-ed).
+    """Optional per-stage score floors for recall. Every floor is inclusive (``>=``).
 
-    ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into the SQL
-    arms (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
-    config for this request), so they prune weak matches before fusion. ``reranker``
-    and ``final`` are **post-query** filters applied to the scored results after
-    reranking. Any field left None imposes no floor; all-None (the default) means
-    no score filtering.
+    The four floors act at two different levels, and the distinction decides what a
+    returned result is guaranteed to satisfy.
+
+    ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into their own
+    SQL arm (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
+    config for this request), so they prune weak matches before fusion. Each one
+    constrains **only the arm it names**. Recall fuses four arms — semantic, keyword,
+    graph and temporal — and a result reaches the response if *any* arm surfaced it,
+    so a returned result may legitimately carry ``null`` for a stage it was not
+    surfaced by, and results reached through the graph or temporal arm carry neither
+    ``semantic`` nor ``keyword``. A *non-null* score always clears its floor — the
+    gap is only ever a ``null``. Setting both does **not** restrict the response to
+    results that clear both: they are not a predicate over each fused result. This is
+    deliberate — an intersection would discard the strong single-arm matches that
+    hybrid retrieval exists to find (a paraphrase with no lexical overlap, an exact
+    identifier the embedding scores poorly).
+
+    ``reranker`` and ``final`` are **post-query** filters applied to every scored
+    result after fusion and reranking, so these *are* per-result predicates: a
+    returned result always clears them. Use them, not the retrieval floors, to make
+    recall abstain on low-confidence queries.
+
+    Any field left None imposes no floor; all-None (the default) means no score
+    filtering.
     """
 
-    semantic: float | None = Field(default=None, description="Retrieval-level: minimum vector similarity (0-1).")
-    keyword: float | None = Field(default=None, description="Retrieval-level: minimum keyword/full-text (BM25) score.")
-    reranker: float | None = Field(default=None, description="Post-query: minimum normalized reranker score (0-1).")
-    final: float | None = Field(default=None, description="Post-query: minimum final ranking score.")
+    semantic: float | None = Field(
+        default=None,
+        description="Retrieval-level, semantic arm only: minimum vector similarity (0-1). A result the semantic "
+        "arm did not surface reports `semantic: null` and is unaffected by this floor.",
+    )
+    keyword: float | None = Field(
+        default=None,
+        description="Retrieval-level, keyword arm only: minimum keyword/full-text (BM25) score. A result the "
+        "keyword arm did not surface reports `keyword: null` and is unaffected by this floor.",
+    )
+    reranker: float | None = Field(
+        default=None,
+        description="Post-query: minimum normalized reranker score (0-1). Applied to every returned result.",
+    )
+    final: float | None = Field(
+        default=None,
+        description="Post-query: minimum final ranking score. Applied to every returned result.",
+    )
 
 
 class TemporalWindow(BaseModel):
@@ -326,6 +421,11 @@ class MemoryFact(BaseModel):
         None,
         description="Recall scores from each pipeline stage (final/reranker/semantic/keyword). Not returned for source facts.",
     )
+    # Internal, never serialised: the short ids of the attachments this fact was drawn
+    # from, when the memories store returned them on the row. ``None`` means "not
+    # carried", and the HTTP layer then reads them from `memory_units` instead; a list
+    # (possibly empty) is resolved as-is, so a store that owns its rows is never asked twice.
+    attachment_ids: list[str] | None = Field(None, exclude=True)
 
 
 class ChunkInfo(BaseModel):
@@ -387,6 +487,11 @@ class RecallResult(BaseModel):
 
     results: list[MemoryFact] = Field(description="List of memory facts matching the query")
     trace: dict[str, Any] | None = Field(None, description="Trace information for debugging")
+    #: Per-stage timings, in microseconds, measured INSIDE a store that answered the whole recall
+    #: (``MemoriesExtension.full_recall``). ``None`` when the engine ran its own pipeline, where the
+    #: stages are already in the trace. Excluded from the API response — it exists so the recall
+    #: trace can still attribute time once the stages no longer run here.
+    store_stages: dict[str, int] | None = Field(default=None, exclude=True)
     entities: dict[str, "EntityState"] | None = Field(
         None, description="Entity states for entities mentioned in results (keyed by canonical name)"
     )
@@ -464,6 +569,14 @@ class ReflectResult(BaseModel):
     structured_output: dict[str, Any] | None = Field(
         default=None,
         description="Structured output parsed according to the provided response schema. Only present when response_schema was provided.",
+    )
+    structured_output_error: str | None = Field(
+        default=None,
+        description=(
+            "Why structured output could not be produced, when a response_schema was provided and the "
+            "extraction call failed. Absent when extraction succeeded, so a null structured_output "
+            "without this field means the answer held nothing matching the schema."
+        ),
     )
     usage: TokenUsage | None = Field(
         default=None,
@@ -555,3 +668,124 @@ class MentalModel(BaseModel):
     summary: str | None = Field(None, description="Generated summary based on relevant facts")
     summary_updated_at: str | None = Field(None, description="ISO format date when summary was last updated")
     created_at: str = Field(description="ISO format date when the mental model was created")
+
+
+STRATEGY_TAGS_MATCH_VALUES = ("all", "exact")
+
+
+class ConsolidationScopePattern(BaseModel):
+    """One rule of a consolidation strategy: tags, and how they must match.
+
+    ``tags`` may be empty — that is a rule still being filled in, which the editor
+    saves as typed and consolidation ignores. The type pins the *shape*, not
+    completeness: a string where the tag list belongs is rejected at the door
+    instead of being stored and silently ignored for the life of the bank.
+
+    Unknown keys are rejected too, but by :class:`StrictConsolidationStrategySpec`
+    on the write path rather than by ``extra="forbid"`` here: that would put
+    ``additionalProperties: false`` in the schema, which openapi-generator cannot
+    process ("Codegen Property not yet supported in getPydanticType").
+    """
+
+    tags: list[str] = Field(default_factory=list, description="fnmatch tag patterns, e.g. company:*")
+    # A plain nullable string, checked by the validator below, rather than an
+    # enum: both client generators choke on a nullable enum here — progenitor
+    # (Rust) fails on an inline one with TypeError(InvalidValue), and
+    # openapi-generator (Python) fails on `anyOf[$ref, null]` with "Codegen
+    # Property not yet supported in getPydanticType". A nullable string is the
+    # shape the rest of this spec uses, and both handle it.
+    #
+    # Optional rather than defaulting to "all" so a value written by the control
+    # plane survives export and import unchanged: a non-optional default would be
+    # filled in on the way out, and the stored config would grow a
+    # `"tags_match": "all"` the editor never wrote.
+    tags_match: str | None = Field(
+        default=None,
+        description='"all" (the default when omitted): the scope has every tag in the rule, other tags '
+        'allowed. "exact": exactly these tags and no others.',
+    )
+
+    @field_validator("tags_match")
+    @classmethod
+    def _known_mode(cls, value: str | None) -> str | None:
+        if value is not None and value not in STRATEGY_TAGS_MATCH_VALUES:
+            raise ValueError(f"must be one of {', '.join(STRATEGY_TAGS_MATCH_VALUES)}")
+        return value
+
+
+class ConsolidationStrategySpec(BaseModel):
+    """One `consolidation_strategies` entry: the rules it claims scopes with, and
+    the observation settings those scopes use. Every setting is optional; unset
+    ones come from the bank-wide values."""
+
+    scopes: list[ConsolidationScopePattern] = Field(
+        default_factory=list, description="Alternatives: the strategy claims a scope when any rule matches it"
+    )
+    observations_mission: str | None = None
+    max_observations_per_scope: int | None = None
+    consolidation_source_facts_max_tokens: int | None = None
+    consolidation_source_facts_max_tokens_per_observation: int | None = None
+
+
+class StrictConsolidationScopePattern(ConsolidationScopePattern):
+    """Validation-only: rejects unknown keys. Not used by any route, so it never
+    reaches the OpenAPI schema (see :class:`ConsolidationScopePattern`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class StrictConsolidationStrategySpec(ConsolidationStrategySpec):
+    """Validation-only twin of :class:`ConsolidationStrategySpec` that rejects
+    unknown keys — the "scope" for "scopes" typo that would otherwise be stored
+    and silently ignored for the life of the bank."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scopes: list[StrictConsolidationScopePattern] = Field(default_factory=list)
+
+
+class StrategyScopePreview(BaseModel):
+    """One existing observation scope in a consolidation-strategy preview."""
+
+    tags: list[str] = Field(description="The scope's tags (sorted)")
+    count: int = Field(description="Observations in this scope")
+    handled_by: int | None = Field(
+        description="Index of the strategy that actually applies to this scope (the first that claims it), "
+        "or null when no strategy does and Default applies"
+    )
+
+
+class StrategyRulePreview(BaseModel):
+    """What one rule (one entry of a strategy's `scopes`) matches among existing scopes."""
+
+    match_count: int = Field(description="Existing scopes this rule matches")
+    taken_count: int = Field(description="Of those, how many an earlier strategy wins, so this one has no effect")
+    observation_count: int = Field(description="Observations across the matching scopes")
+    samples: list[StrategyScopePreview] = Field(description="The most populous matching scopes, up to sample_limit")
+
+
+class StrategyPreview(BaseModel):
+    """Preview of one strategy, aligned by position with the request."""
+
+    active: bool = Field(description="False when the server would ignore this strategy (no usable rule, or no setting)")
+    claimed_count: int = Field(description="Existing scopes this strategy actually applies to")
+    rules: list[StrategyRulePreview] = Field(description="One entry per rule, aligned with the request")
+
+
+class DefaultScopesPreview(BaseModel):
+    """The scopes no strategy claims — they consolidate under the bank-wide settings."""
+
+    match_count: int
+    observation_count: int
+    samples: list[StrategyScopePreview]
+
+
+class ConsolidationStrategiesPreview(BaseModel):
+    """Which existing observation scopes each consolidation strategy would apply to."""
+
+    strategies: list[StrategyPreview]
+    default: DefaultScopesPreview
+    scopes_scanned: int = Field(description="Distinct scopes the preview was computed over")
+    complete: bool = Field(
+        description="False when the bank has more distinct scopes than the preview scans; counts are then lower bounds"
+    )

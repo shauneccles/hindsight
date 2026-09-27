@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Final, cast
 
 from .db_utils import acquire_with_retry
@@ -91,7 +92,7 @@ def _trigram_set(text: str) -> set[str]:
 def _trigram_set_similarity(ta: set[str], tb: set[str]) -> float:
     """Jaccard index of two already-computed trigram sets.
 
-    Split out from ``_trigram_similarity`` so callers that compare one name against many
+    Split out from ``trigram_similarity`` so callers that compare one name against many
     (the candidate scoring loop, the O(N^2) in-batch pass) build each set once instead of
     once per comparison — the loop runs up to ``entity_resolution_max_candidates`` times per
     mention on the retain hot path (GH-3211).
@@ -101,8 +102,13 @@ def _trigram_set_similarity(ta: set[str], tb: set[str]) -> float:
     return intersection / union if union else 0.0
 
 
-def _trigram_similarity(a: str, b: str) -> float:
+def trigram_similarity(a: str, b: str) -> float:
     """pg_trgm ``similarity(a, b)`` computed in-memory — the Jaccard index of the trigram sets.
+
+    Public because two subsystems share it: entity resolution here, and fuzzy tag matching in
+    ``search.tag_resolution``. One notion of "similar name" for both, so a change to it is a
+    deliberate change to both — see ``tests/test_entity_intrabatch_clustering.py``, which pins
+    the values against Postgres.
 
     Verified byte-for-byte against Postgres pg_trgm across emoji / accent / CJK / hyphen /
     apostrophe cases (issue #3107), so the merge cutoff calibrated on pg_trgm transfers exactly.
@@ -119,9 +125,38 @@ def _trigram_similarity(a: str, b: str) -> float:
 _MIN_TOKEN_SIMILARITY: Final[float] = 0.6
 
 
+@lru_cache(maxsize=100_000)
 def _tokens_match(a: str, b: str) -> bool:
-    """Whether two words are plausibly the same word — equal, an abbreviation of, or a near-miss."""
+    """Whether two words are plausibly the same word — equal, an abbreviation of, or a near-miss.
+
+    Memoized because the in-batch caller is quadratic in names and its pairs overwhelmingly repeat
+    the same words: 250 names of the shape "Acme Corporation Subsidiary 0001" produce 31k similar
+    pairs whose word comparisons are 90% duplicates, and caching them takes that filtering pass from
+    ~1.0s to ~0.27s of un-yielded CPU. Pure function of two short strings, so the cache is only a
+    speed-up; the bound is there to keep a pathological bank from growing it without limit.
+    """
     return a == b or a.startswith(b) or b.startswith(a) or SequenceMatcher(None, a, b).ratio() >= _MIN_TOKEN_SIMILARITY
+
+
+_DIGIT_RUN = re.compile(r"\d+(?:\.\d+)*")
+
+
+@lru_cache(maxsize=100_000)
+def _numbers_in(name: str) -> frozenset[str]:
+    """Find the numbers in a name ("UA0123" gives {"123"}, "4.0" gives {"4"}).
+
+    Memoized for the same reason as ``_tokens_match``: the in-batch caller compares each name
+    with many others.
+    """
+    numbers = []
+    for run in _DIGIT_RUN.findall(name):
+        parts = run.split(".")
+        parts[0] = parts[0].lstrip("0") or "0"
+        # Drop an all-zero part, but keep 3.10 distinct from 3.1.
+        if len(parts) == 2 and not parts[1].strip("0"):
+            parts.pop()
+        numbers.append(".".join(parts))
+    return frozenset(numbers)
 
 
 def _tokens_are_compatible(a: str, b: str) -> bool:
@@ -136,7 +171,18 @@ def _tokens_are_compatible(a: str, b: str) -> bool:
     Single-word names are exempt, and deliberately: with one token the whole-name check *is* the
     token check, and imposing this on top would reject real variants that have no long shared word
     to hide behind ("Nick"/"Nicolas" is 0.55).
+
+    Numbers get a stricter rule. A number names one specific thing, so "Room 101" and "Room 102"
+    are two rooms and not a typo, yet 101/102 is 0.67 by sequence ratio and passes the word cutoff.
+    When each name has a number the other lacks, they are two things, and single-word names are not
+    exempt from this ("UA123"/"UA124"). A first version required the numbers to match exactly, which
+    also split a name from its more specific form ("Q3 earnings"/"Q3 2024 earnings", "Boeing 737
+    MAX"/"Boeing 737 MAX 8"); when one name's numbers are a subset of the other's, the word check
+    decides as before, as it does when only one name has a number ("Python"/"Python 3").
     """
+    numbers_a, numbers_b = _numbers_in(a), _numbers_in(b)
+    if numbers_a - numbers_b and numbers_b - numbers_a:
+        return False
     ta, tb = _TRGM_WORD.findall(a.lower()), _TRGM_WORD.findall(b.lower())
     if len(ta) < 2 and len(tb) < 2:
         return True
@@ -194,16 +240,111 @@ def _cooccurrence_weight(degree: int) -> float:
     return 1.0 / math.sqrt(max(degree, 1))
 
 
+@dataclass(frozen=True, slots=True)
+class _PrefixIndexed:
+    """One name's trigram set, prepared for the prefix-filtering join.
+
+    ``prefix`` is the leading slice of the trigrams sorted rarest-first — the only tokens the
+    join indexes or probes on. ``input_index`` is the name's position in the caller's list, kept
+    so emitted pairs read in input order however the join happened to reach them.
+    """
+
+    size: int
+    prefix: list[str]
+    trigrams: set[str]
+    name: str
+    input_index: int
+
+
 def _find_intrabatch_similar_pairs(names: list[str], threshold: float) -> list[_SimilarNamePair]:
-    """Every pair of ``names`` whose in-memory trigram similarity meets ``threshold``. O(N^2) over a
-    small, capped set of new names — pure CPU, no DB round-trip."""
+    """Every pair of ``names`` whose in-memory trigram similarity meets ``threshold``.
+
+    Exactly the pairs the old O(N^2) double loop found — same Jaccard, same cutoff — reached by a
+    prefix-filtering set-similarity join rather than by comparing every pair. Sort each name's
+    trigrams rarest-first and index only the leading ``|A| - ceil(threshold * |A|) + 1`` of them:
+    two sets sharing none of those tokens cannot overlap enough to clear ``threshold``, so only
+    the pairs that survive the probe are verified. Each name's prefix is cut from its own size,
+    which is what makes the pruning lossless: a qualifying pair needs an overlap of at least
+    ``ceil(threshold * max(|A|, |B|))``, and the shorter set's prefix — cut for its own smaller
+    size — is longer than that bound demands, so the pair cannot slip past both prefixes.
+
+    On a batch of distinct names at the default 0.5 cutoff that verifies ~5% of the pairs: 3.9x
+    faster than the double loop at the ``_INTRABATCH_MAX_NAMES`` cap of 250, 8x at 1000 — see
+    ``benchmarks/micro/entity_resolver_bench.py``. Measured against the shape retain actually
+    produces (9,525 per-document name batches harvested from the LoCoMo and LongMemEval corpora,
+    median 58 distinct names, p95 156): 2.5x over the whole corpus, but the win is all in the
+    tail. Under ~50 names the index costs more than it saves — 0.55x at the smallest sizes,
+    which is 40 microseconds on a batch that takes 0.05ms either way — and half of real batches
+    are that small. A size threshold would buy back tens of microseconds on the median batch at
+    the price of a second code path, so there isn't one.
+
+    The pruning buys nothing when the names really are all alike — 250 names of the shape
+    "Acme Corporation Subsidiary 0001" probe into every bucket and pay the index on top of the
+    full quadratic verification, ~1.2x slower than the double loop. That worst case is ~29ms at
+    the cap, which is why there is one code path here instead of a size or shape heuristic — but
+    it is also why the cap should not be raised on the strength of the distinct-name numbers
+    alone: the same shape at 500 names costs ~156ms of un-yielded CPU.
+
+    ``threshold`` is validated to ``0 < t <= 1`` (``entity_intrabatch_merge_similarity``), so a
+    name with no trigrams at all — no word characters, e.g. "!!!" — can never reach it and is
+    left out of the join entirely.
+    """
+    if len(names) < 2:
+        return []
+
     trigrams = [_trigram_set(n) for n in names]
+
+    # How common each trigram is in this batch. Sorting each set by it puts the tokens that
+    # discriminate best up front, which is what keeps the indexed prefixes small.
+    freq: dict[str, int] = {}
+    for t in trigrams:
+        for tri in t:
+            freq[tri] = freq.get(tri, 0) + 1
+
+    indexed: list[_PrefixIndexed] = []
+    for input_index, (t, name) in enumerate(zip(trigrams, names)):
+        if not t:
+            continue
+        ordered = sorted(t, key=lambda tri: (freq[tri], tri))
+        prefix_len = len(ordered) - math.ceil(threshold * len(ordered)) + 1
+        indexed.append(
+            _PrefixIndexed(
+                size=len(ordered),
+                prefix=ordered[:prefix_len],
+                trigrams=t,
+                name=name,
+                input_index=input_index,
+            )
+        )
+
+    # Shortest set first — not for correctness (the prefixes are lossless in any order) but so
+    # that a probe only ever meets sets no larger than itself, which is what gives the size
+    # filter below something to reject. Ties break on input order, keeping the walk deterministic.
+    indexed.sort(key=lambda e: (e.size, e.input_index))
+
+    postings: dict[str, list[int]] = {}
     pairs: list[_SimilarNamePair] = []
-    for i in range(len(names)):
-        ti = trigrams[i]
-        for j in range(i + 1, len(names)):
-            if _trigram_set_similarity(ti, trigrams[j]) >= threshold:
-                pairs.append(_SimilarNamePair(name_a=names[i], name_b=names[j]))
+    for position, entry in enumerate(indexed):
+        candidates: set[int] = set()
+        for tri in entry.prefix:
+            candidates.update(postings.get(tri, ()))
+
+        # |b| >= threshold * |a| is implied by the Jaccard cutoff (the intersection can never
+        # exceed the smaller set), and rejects a candidate without touching its trigrams.
+        min_size = threshold * entry.size
+        for other_position in candidates:
+            other = indexed[other_position]
+            if other.size < min_size:
+                continue
+            intersection = len(entry.trigrams & other.trigrams)
+            union = entry.size + other.size - intersection
+            if union and (intersection / union) >= threshold:
+                first, second = (entry, other) if entry.input_index < other.input_index else (other, entry)
+                pairs.append(_SimilarNamePair(name_a=first.name, name_b=second.name))
+
+        for tri in entry.prefix:
+            postings.setdefault(tri, []).append(position)
+
     return pairs
 
 
@@ -308,7 +449,7 @@ def _canonical_cooccurrence_pairs(entity_list: list[str]) -> Iterator[tuple[str,
 
 @dataclass
 class _CooccurrencePair:
-    """A (entity_id_1, entity_id_2) pair observed in a retain batch (for post-txn flush)."""
+    """A (entity_id_1, entity_id_2) pair observed in a retain batch (for the post-commit flush)."""
 
     entity_id_1: str
     entity_id_2: str
@@ -982,10 +1123,26 @@ class EntityResolver:
     def _intrabatch_canonical_map(self, entities_to_create: list[_EntityToCreate]) -> dict[str, str]:
         """Map each non-label new name (lowercased) to its cluster's canonical spelling.
 
-        Uses in-memory trigram similarity (``_trigram_similarity``, verified equal to Postgres
+        Uses in-memory trigram similarity (``trigram_similarity``, verified equal to Postgres
         pg_trgm), so it is backend-agnostic — no DB round-trip on the retain hot path, and it runs
         identically on PostgreSQL, Oracle, and the pg_trgm-absent "full" fallback. Label entities
         are excluded so distinct label values stay separate (GH-1558).
+
+        A similar pair must also agree word by word (``_tokens_are_compatible``), the same second
+        gate the existing-entity path applies after its own trigram floor. Trigram similarity alone
+        lets a long shared word drown out a completely different short one, and "Dr John
+        Richardson" / "Dr Jane Richardson" is 0.65, comfortably over the 0.5 in-batch bar. Without
+        the word check two people who share a surname become one entity when they are named in the
+        same retain and stay two when they are not.
+
+        The word check runs on the pairs the trigram join returned, not inside it, so
+        ``_find_intrabatch_similar_pairs`` keeps its pure-Jaccard contract. That costs a second pass
+        over those pairs, which matters only where this pass is already at its worst: 250 names that
+        are all alike produce ~31k pairs, and checking them adds ~0.27s to the ~34ms join — ~1.0s
+        before ``_tokens_match`` was memoized. One more reason not to raise
+        ``_INTRABATCH_MAX_NAMES`` on the distinct-name numbers alone. If that tail ever needs to
+        come down, run the check inside the union-find instead, only for pairs whose roots differ —
+        same clusters, ~12x fewer checks on that shape.
         """
         rep_by_lower: dict[str, str] = {}
         count_by_lower: dict[str, int] = {}
@@ -1006,7 +1163,11 @@ class EntityResolver:
                 _INTRABATCH_MAX_NAMES,
             )
             return {}
-        pairs = _find_intrabatch_similar_pairs(list(rep_by_lower.values()), self._intrabatch_merge_similarity)
+        pairs = [
+            pair
+            for pair in _find_intrabatch_similar_pairs(list(rep_by_lower.values()), self._intrabatch_merge_similarity)
+            if _tokens_are_compatible(pair.name_a, pair.name_b)
+        ]
         if not pairs:
             return {}
         return _cluster_new_entity_names(rep_by_lower, count_by_lower, pairs)
@@ -1037,6 +1198,13 @@ class EntityResolver:
         resolved: list[ResolvedEntity | None] = [None] * len(entities_data)
         entities_to_update: list[_EntityStat] = []
         entities_to_create: list[_EntityToCreate] = []
+
+        # One trigram set per distinct candidate name for the whole batch. Mentions in a batch
+        # draw on heavily overlapping candidate lists, so the same canonical name was otherwise
+        # re-trigrammed once per mention that saw it. Filled lazily: a candidate the scoring
+        # loop never reaches (a label row, or a mention that resolves before scoring) costs
+        # nothing, and nothing is computed ahead of the yield points below (GH-3211).
+        candidate_trigram_map: dict[str, set[str]] = {}
         # Candidates scored since the last yield, counted across mentions so a
         # batch of many small candidate sets yields as often as one large set.
         scored_since_yield = 0
@@ -1155,7 +1323,11 @@ class EntityResolver:
                 # alone: SequenceMatcher stays load-bearing for typo variants that arrive
                 # with no co-occurrence context at all ("Dr Waler" -> "Dr Wall").
                 canonical_lower = canonical_name.lower()
-                name_trigram_similarity = _trigram_set_similarity(mention_trigrams, _trigram_set(canonical_name))
+                candidate_trigrams = candidate_trigram_map.get(canonical_name)
+                if candidate_trigrams is None:
+                    candidate_trigrams = _trigram_set(canonical_name)
+                    candidate_trigram_map[canonical_name] = candidate_trigrams
+                name_trigram_similarity = _trigram_set_similarity(mention_trigrams, candidate_trigrams)
                 if name_trigram_similarity < self._merge_min_similarity:
                     continue
 
@@ -1327,7 +1499,7 @@ class EntityResolver:
                         pending.append(_EntityStat(entity_id=str(entity_id), event_date=g.event_date))
 
         # Accumulate into the resolver's pending list; the orchestrator flushes
-        # these with await entity_resolver.flush_pending_stats() after the txn.
+        # these with await entity_resolver.flush_pending_stats() after the transaction.
         key = self._task_key()
         self._pending_stats.setdefault(key, []).extend(pending)
 
@@ -1422,7 +1594,6 @@ class EntityResolver:
         unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],
         bank_id: str | None = None,
         store_write: bool = True,
-        txn=None,
     ):
         """Store-owned variant of :meth:`link_units_to_entities_batch` that touches NO
         Postgres connection.
@@ -1441,11 +1612,6 @@ class EntityResolver:
         write-then-reattach) — so the store row is already correct and a second store write would
         be redundant. Co-occurrence still runs: it references only ``entities`` and is needed by the
         entity-graph endpoint and resolution's disambiguation signal regardless of who wrote the row.
-
-        ``txn`` is the caller's write-group handle. For a store that keeps the posting on the
-        memory, this re-writes rows the same write-group just created, so it belongs to that
-        group — see :meth:`MemoriesExtension.record_unit_entities`. It is only consulted when the
-        store write actually happens: under ``store_write=False`` there is no write to enrol.
         """
         if not unit_entity_pairs:
             return
@@ -1454,9 +1620,7 @@ class EntityResolver:
             (t[0], t[1], t[2] if len(t) >= 3 else None)  # type: ignore[misc]
             for t in unit_entity_pairs
         ]
-        return await self._link_units_to_entities_batch_impl(
-            None, normalized, bank_id, store_write=store_write, txn=txn
-        )
+        return await self._link_units_to_entities_batch_impl(None, normalized, bank_id, store_write=store_write)
 
     async def _link_units_to_entities_batch_impl(
         self,
@@ -1464,7 +1628,6 @@ class EntityResolver:
         unit_entity_pairs: list[tuple[str, str, datetime | None]],
         bank_id: str | None = None,
         store_write: bool = True,
-        txn=None,
     ):
         # Sorted bulk insert to prevent deadlocks from inconsistent lock ordering
         # across concurrent transactions on the unit_entities unique index.
@@ -1488,7 +1651,6 @@ class EntityResolver:
                 bank_id=bank_id,
                 unit_ids=unit_ids,
                 entity_ids=entity_ids,
-                txn=txn,
             )
 
         # Build maps keyed by unit_id:

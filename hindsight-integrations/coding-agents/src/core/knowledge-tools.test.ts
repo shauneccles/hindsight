@@ -150,7 +150,13 @@ describe("buildKnowledgeTools", () => {
   it("hindsight_search_knowledge_pages calls the server hybrid search and returns ranked hits", async () => {
     const client = stubClient({
       searchKnowledgePages: vi.fn(async () => [
-        { id: "p1", name: "Uploader guide", snippet: "Uploads retry with backoff…", score: 0.031 },
+        {
+          id: "p1",
+          name: "Uploader guide",
+          source_query: "How do uploads recover from failures?",
+          snippet: "Uploads retry with backoff…",
+          score: 0.031,
+        },
         { id: "p2", name: "Auth notes", snippet: "Tokens rotate daily.", score: 0.012 },
       ]),
     });
@@ -158,16 +164,70 @@ describe("buildKnowledgeTools", () => {
     const tool = findTool(tools, "hindsight_search_knowledge_pages");
     const result = await tool.handler({ query: "upload retries" });
     expect(result.isError).toBeFalsy();
-    expect(client.searchKnowledgePages).toHaveBeenCalledWith("upload retries", 3);
-    expect(JSON.parse(result.content[0].text)).toEqual([
+    // The tool passes no limit — the client's pageSearchLimit is the single source for it.
+    expect(client.searchKnowledgePages).toHaveBeenCalledWith("upload retries");
+    // No `score`: the server's RRF number tops out near 0.03, so a model reading it treats its best
+    // hit as 3% relevant. Rank order carries the ranking.
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.pages).toEqual([
       {
         page: "Uploader guide",
         page_id: "p1",
+        description: "How do uploads recover from failures?",
         snippet: "Uploads retry with backoff…",
-        score: 0.031,
       },
-      { page: "Auth notes", page_id: "p2", snippet: "Tokens rotate daily.", score: 0.012 },
+      { page: "Auth notes", page_id: "p2", snippet: "Tokens rotate daily." },
     ]);
+    // The credit reminder rides with the hits: the session guide has scrolled away by the time a
+    // search lands mid-session, and a paraphrased snippet otherwise gets absorbed uncredited.
+    expect(payload.crediting).toContain("From Hindsight memory");
+    expect(payload.crediting).toContain("paraphrased");
+  });
+
+  it("hindsight_read_knowledge_page returns the body once, with a dated field the model can judge", async () => {
+    const client = stubClient({
+      getPage: vi.fn(async () => ({
+        id: "p1",
+        name: "Pricing decisions",
+        description: "What has been decided about pricing?",
+        tags: ["type:knowledge-page"],
+        timestamp: "2026-09-17T10:00:00Z",
+        body: "The threshold is compared against the discounted subtotal.",
+        // The API also returns the SAME body with YAML frontmatter on top; passing the response
+        // through handed the model the page twice.
+        markdown:
+          "---\nname: Pricing decisions\n---\nThe threshold is compared against the discounted subtotal.",
+      })),
+    });
+    const tool = findTool(buildKnowledgeTools(client, "repo-a"), "hindsight_read_knowledge_page");
+    const result = await tool.handler({ page_id: "p1" });
+
+    expect(result.isError).toBeFalsy();
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      id: "p1",
+      name: "Pricing decisions",
+      description: "What has been decided about pricing?",
+      tags: ["type:knowledge-page"],
+      last_updated_at: "2026-09-17T10:00:00Z",
+      body: "The threshold is compared against the discounted subtotal.",
+    });
+  });
+
+  it("hindsight_read_knowledge_page falls back to the full markdown when a page has no body", async () => {
+    const client = stubClient({
+      getPage: vi.fn(async () => ({
+        id: "p2",
+        name: "Empty",
+        markdown: "---\nname: Empty\n---\n",
+      })),
+    });
+    const tool = findTool(buildKnowledgeTools(client, "repo-a"), "hindsight_read_knowledge_page");
+
+    expect(JSON.parse((await tool.handler({ page_id: "p2" })).content[0].text)).toEqual({
+      id: "p2",
+      name: "Empty",
+      body: "---\nname: Empty\n---\n",
+    });
   });
 
   it("hindsight_search_knowledge_pages returns isError:true when the server search throws", async () => {
@@ -376,20 +436,40 @@ describe("buildKnowledgeTools", () => {
     );
   });
 
-  it("hindsight_ingest_document falls back to 'doc' when the title has no safe characters", async () => {
-    const client = stubClient();
-    const tools = buildKnowledgeTools(client, "repo-a");
-    const tool = findTool(tools, "hindsight_ingest_document");
-    await tool.handler({ title: "!!!///???", content: "x" });
-    expect(client.retain).toHaveBeenCalledWith(
-      "x",
-      "ingested document",
-      "doc",
-      ["source:upload"],
-      "document",
-      {} // no harness in these tests: nothing to stamp
-    );
-  });
+  it.each([
+    ["测试问题17记忆文档一", "测试问题17记忆文档二"],
+    ["记忆文档一", "记忆文档二"],
+    ["Résumé", "Rèsumé"],
+    ["!!!///???", "???///!!!"],
+  ])(
+    "hindsight_ingest_document keeps distinct lossy titles: %s / %s",
+    async (title, otherTitle) => {
+      const documents = new Map<string, string>();
+      const client = stubClient({
+        retain: vi.fn(async (content: string, _context: string, documentId: string) => {
+          documents.set(documentId, content);
+        }),
+      });
+      const tool = findTool(buildKnowledgeTools(client, "repo-a"), "hindsight_ingest_document");
+      const first = JSON.parse(
+        (await tool.handler({ title, content: "first document" })).content[0].text
+      );
+      const second = JSON.parse(
+        (await tool.handler({ title: otherTitle, content: "second document" })).content[0].text
+      );
+      expect(first.ok).toBe(true);
+      expect(second.ok).toBe(true);
+      expect(first.doc_id).not.toBe(second.doc_id);
+      expect(documents.get(first.doc_id)).toBe("first document");
+      expect(documents.get(second.doc_id)).toBe("second document");
+
+      const updated = await tool.handler({ title, content: "updated first document" });
+      expect(JSON.parse(updated.content[0].text)).toEqual(first);
+      expect(documents.size).toBe(2);
+      expect(documents.get(first.doc_id)).toBe("updated first document");
+      expect(documents.get(second.doc_id)).toBe("second document");
+    }
+  );
 
   for (const name of [
     "hindsight_list_knowledge_pages",

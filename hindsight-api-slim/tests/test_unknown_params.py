@@ -1,97 +1,39 @@
-"""Tests for unknown parameter detection middleware (X-Ignored-Params header)."""
+"""Tests for unknown parameter detection (X-Ignored-Params header).
+
+These drive the REAL implementation -- `UnknownParamsRoute` plus the pure-ASGI
+`HttpObservabilityMiddleware` that turns the scope entry into a header. The file
+previously defined its own inline copy of the old `@app.middleware("http")`
+version, so it passed no matter what the shipped code did; the behaviour it
+describes is the contract, so the cases are unchanged and only the app under test
+is now the real one.
+"""
 
 import pytest
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
+from hindsight_api.api.observability import HttpObservabilityMiddleware
+from hindsight_api.api.unknown_params import UnknownParamsRoute
+
+
+class ItemRequest(BaseModel):
+    name: str
+    value: int = 0
+
+
+class AliasedRequest(BaseModel):
+    name: str
+    async_: bool = Field(default=False, alias="async")
+
 
 def _make_test_app() -> FastAPI:
-    """Create a minimal FastAPI app with the unknown params middleware."""
-    import json
-    import logging
-
+    """A minimal app wired exactly as `create_app` wires the real one."""
     app = FastAPI()
-    logger = logging.getLogger(__name__)
-
-    @app.middleware("http")
-    async def unknown_params_middleware(request, call_next):
-        from starlette.routing import Match
-
-        ignored_params: list[str] = []
-
-        if request.query_params:
-            for route in app.routes:
-                match, _ = route.matches(request.scope)
-                if match == Match.FULL:
-                    endpoint = getattr(route, "endpoint", None)
-                    if endpoint:
-                        import inspect
-
-                        sig = inspect.signature(endpoint)
-                        declared = set(sig.parameters.keys())
-                        path_params = set(getattr(route, "param_convertors", {}).keys()) | set(
-                            request.path_params.keys()
-                        )
-                        known_query = declared - path_params
-                        for name in request.query_params:
-                            if name not in known_query and name not in path_params:
-                                ignored_params.append(name)
-                    break
-
-        body_ignored: list[str] = []
-        content_type = request.headers.get("content-type", "")
-        if request.method in ("POST", "PUT", "PATCH") and "application/json" in content_type:
-            try:
-                body_bytes = await request.body()
-                if body_bytes:
-                    body_json = json.loads(body_bytes)
-                    if isinstance(body_json, dict):
-                        for route in app.routes:
-                            match, _ = route.matches(request.scope)
-                            if match == Match.FULL:
-                                endpoint = getattr(route, "endpoint", None)
-                                if endpoint:
-                                    import inspect
-
-                                    sig = inspect.signature(endpoint)
-                                    for param in sig.parameters.values():
-                                        ann = param.annotation
-                                        if isinstance(ann, type) and issubclass(ann, BaseModel):
-                                            known_fields = set(ann.model_fields.keys())
-                                            for field in ann.model_fields.values():
-                                                if isinstance(field.alias, str):
-                                                    known_fields.add(field.alias)
-                                            for key in body_json:
-                                                if key not in known_fields:
-                                                    body_ignored.append(key)
-                                            break
-                                break
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-
-        all_ignored = ignored_params + body_ignored
-        response = await call_next(request)
-
-        if all_ignored:
-            ignored_str = ", ".join(all_ignored)
-            logger.warning(
-                "Unknown parameters ignored: [%s] for %s %s",
-                ignored_str,
-                request.method,
-                request.url.path,
-            )
-            response.headers["X-Ignored-Params"] = ignored_str
-
-        return response
-
-    class ItemRequest(BaseModel):
-        name: str
-        value: int = 0
-
-    class AliasedRequest(BaseModel):
-        name: str
-        async_: bool = Field(default=False, alias="async")
+    # Must be set before any route is registered -- the route class is applied at
+    # registration time, not at request time.
+    app.router.route_class = UnknownParamsRoute
+    app.add_middleware(HttpObservabilityMiddleware)
 
     @app.get("/items")
     async def list_items(limit: int = 10, offset: int = 0):
@@ -177,3 +119,80 @@ class TestUnknownBodyFields:
         ignored = resp.headers["X-Ignored-Params"]
         assert "foo" in ignored
         assert "bar" in ignored
+
+
+class TestBankAliasRewrite:
+    """The route class rewrites an aliased ``bank_id`` before the endpoint reads it.
+
+    This is the single seam the whole bank-alias feature rests on: ~337
+    ``WHERE bank_id = $1`` queries across 36 modules never see the resolver, so if
+    the path param were still the alias by the time the endpoint runs, every one of
+    them would query for a bank that does not exist. The cases below pin FastAPI's
+    ordering -- route handler wrapper first, endpoint path params after -- so a
+    FastAPI upgrade that extracted path params earlier fails here loudly rather
+    than quietly serving the alias straight through to SQL.
+    """
+
+    @staticmethod
+    def _app(resolver) -> FastAPI:
+        app = FastAPI()
+        app.router.route_class = UnknownParamsRoute
+        app.state.resolve_bank_alias = resolver
+
+        @app.get("/v1/default/banks/{bank_id}/thing")
+        async def read_thing(bank_id: str):
+            # What every real endpoint does with it: hand it straight to the engine.
+            return {"bank_id": bank_id}
+
+        @app.get("/unscoped")
+        async def unscoped():
+            return {"ok": True}
+
+        return app
+
+    def test_alias_is_canonical_by_the_time_the_endpoint_runs(self):
+        async def resolver(_request, bank_id: str) -> str:
+            return "real-bank" if bank_id == "old-name" else bank_id
+
+        client = TestClient(self._app(resolver))
+        assert client.get("/v1/default/banks/old-name/thing").json()["bank_id"] == "real-bank"
+
+    def test_a_real_bank_id_is_passed_through_untouched(self):
+        async def resolver(_request, bank_id: str) -> str:
+            return bank_id
+
+        client = TestClient(self._app(resolver))
+        assert client.get("/v1/default/banks/real-bank/thing").json()["bank_id"] == "real-bank"
+
+    def test_routes_without_a_bank_never_call_the_resolver(self):
+        calls: list[str] = []
+
+        async def resolver(_request, bank_id: str) -> str:
+            calls.append(bank_id)
+            return bank_id
+
+        client = TestClient(self._app(resolver))
+        assert client.get("/unscoped").status_code == 200
+        assert calls == []
+
+    def test_a_failing_resolver_leaves_the_id_alone_rather_than_500ing(self):
+        """A lookup that cannot run must not turn a request for a real bank into an
+        error: the id it was given is exactly what it meant before aliases existed."""
+
+        async def resolver(_request, _bank_id: str) -> str:
+            raise RuntimeError("database is down")
+
+        client = TestClient(self._app(resolver))
+        resp = client.get("/v1/default/banks/real-bank/thing")
+        assert resp.status_code == 200
+        assert resp.json()["bank_id"] == "real-bank"
+
+    def test_no_resolver_configured_is_not_an_error(self):
+        app = FastAPI()
+        app.router.route_class = UnknownParamsRoute
+
+        @app.get("/v1/default/banks/{bank_id}/thing")
+        async def read_thing(bank_id: str):
+            return {"bank_id": bank_id}
+
+        assert TestClient(app).get("/v1/default/banks/b/thing").json()["bank_id"] == "b"

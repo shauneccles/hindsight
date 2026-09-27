@@ -2,19 +2,33 @@
 sidebar_position: 2
 ---
 
+
 # Retain: How Hindsight Stores Memories
 
 When you call `retain()`, Hindsight transforms conversations and documents into structured, searchable memories that preserve meaning and context.
 
 ## What Retain Does
 
-```mermaid
-graph LR
-    A[Your Content] --> B[Extract Facts]
-    B --> C[Identify Entities]
-    C --> D[Build Connections]
-    D --> E[Memory Bank]
-```
+**Figure: What Retain Does.** An animated diagram on the docs site; its narration, step by step:
+
+- **new facts**
+  1. You send content, a context that says who is speaking, and when it was said.
+  2. The original is kept as a document and split into chunks, so the exact passage can be handed back later.
+  3. An LLM reads each chunk and pulls out facts with what, when, where, who and why. It keeps the reason, not just the event. Each fact is embedded right away.
+  4. Entity resolution decides who each name is. It compares each name with the entities the bank already has. Neither is known yet, so both become new entities.
+  5. Entities are stored once, and every fact that mentions them points to them.
+  6. The facts are world facts: Bob is talking about Alice, not about the agent. Each keeps two times: when it happened and when Hindsight learned it.
+  7. Finally the facts are linked: through shared entities, closeness in time, similar meaning (from the embeddings), and cause and effect.
+  8. retain() is done. Observations are built from these facts later, in the background.
+- **same person, new name**
+  1. Two months later, Bob mentions “Alice C.”
+  2. Same path: stored as a new document, split into chunks…
+  3. …and read by the LLM. The fact names “Alice C.”, a name the bank has never seen.
+  4. The name is close to Alice Chen, and the same fact names the Zurich office she is already linked to. Together that is enough: same person.
+  5. No new entity is created: this mention of “Alice C.” counts as Alice Chen.
+  6. The fact keeps its own wording, but it points to Alice Chen, so it joins everything else about her. Ask about Alice later and you get all of it.
+  7. Its entity link ties it to the three facts from January.
+  8. Done: one more fact about the same Alice.
 
 ---
 
@@ -176,6 +190,94 @@ Tags enable visibility scoping—useful when one memory bank serves multiple use
 - **Tag filtering**: Filter during recall/reflect by tags
 
 See [Retain API](./api/retain) for code examples and [Recall API](./api/recall) for filtering options.
+
+---
+
+## Images and Files in Your Content
+
+A lot of what a document actually says lives in its pictures: the screenshot of
+the button an instruction refers to, the diagram holding an escalation path, the
+chart that *is* the data. `content` accepts an ordered list of blocks so those sit
+where they belong, instead of being summarised into a caption beforehand:
+
+```json
+{
+  "content": [
+    {"type": "text",  "text": "To reset the VPN, click the button shown:"},
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}},
+    {"type": "text",  "text": "...then reconnect."}
+  ]
+}
+```
+
+A plain string still works exactly as before — nothing about text-only retain
+changes.
+
+The point is **position**. Extraction sends the text and the pictures together,
+in order, so the model reads the screenshot beside the sentence that introduces
+it. "Click the button shown below" is meaningless on its own; next to the
+picture it becomes a fact that names the button.
+
+### What comes back
+
+Facts read naturally — `[image: image/png]` marks where an attachment was, never
+a content hash — and each memory carries the attachments **it was drawn from**,
+with a URL you can fetch:
+
+```json
+{
+  "text": "The escalation path for a stuck sync begins by contacting Tier 3 Platform.",
+  "attachments": [
+    {"id": "c414cd0e204d", "kind": "image", "media_type": "image/png",
+     "url": "/v1/default/banks/my-bank/attachments/c414cd0e204d"}
+  ]
+}
+```
+
+Facts that came from the prose have no `attachments`, even when the same document
+is full of pictures. So an attachment shown next to a memory means the model
+looked at it to produce that memory — it is evidence, not decoration.
+
+An observation carries the attachments of the facts it was consolidated from, so
+a screenshot still reaches you when recall or reflect answers from the
+observation rather than the raw fact. Reflect's `based_on` (with
+`include.facts`) returns each cited memory with its `attachments`, plus the
+`document_id`, `chunk_id`, `tags` and `metadata` it was stored with.
+
+### What to expect from charts and tables
+
+An attachment carrying structured data is transcribed rather than summarised:
+each row, bar or labelled value becomes its own fact, carrying its label, its
+figure, and how it is drawn. A chart therefore produces many more memories than a
+screenshot does — that is deliberate, since a summary of a twenty-bar chart keeps
+three values and silently drops seventeen, and later questions ask about the ones
+it dropped.
+
+Very dense pages are still sampled rather than exhausted: a single extraction pass
+over an infographic listing a hundred entries will capture a large share of them,
+not all of them.
+
+### Requirements
+
+- A model that can read images. By default that is the bank's retain model, but
+  it does not have to be: `HINDSIGHT_API_VLM_MODEL` names a **vision slot** used
+  only for the chunks that actually carry an attachment, leaving every text-only
+  chunk on the retain LLM. So a bank whose documents are mostly prose can keep a
+  cheap text model and pay for vision only where there is something to look at.
+- If that model cannot read images — or if Hindsight cannot tell, which is the
+  case for gateway backends serving mixed catalogues — the retain is refused
+  with `422` rather than dropping the attachment silently. See
+  [`HINDSIGHT_API_LLM_VISION`](configuration.md#llm-provider).
+- Batch retain (`HINDSIGHT_API_RETAIN_BATCH_ENABLED`) cannot carry attachments,
+  and also refuses with `422`.
+
+This is different from [`POST /files/retain`](configuration.md#file-processing),
+which converts a whole file to markdown as its **own** document. That is still the
+right tool for a scanned report you want parsed — but it separates the file from
+the prose that referred to it, which is exactly what inline attachments avoid.
+
+For storage, size limits and accepted media types, see
+[Inline attachments in retain](configuration.md#inline-attachments-in-retain).
 
 ---
 

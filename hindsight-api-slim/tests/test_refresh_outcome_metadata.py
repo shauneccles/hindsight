@@ -7,6 +7,7 @@ refresh_mental_model operation must let a monitoring layer distinguish
 ``result_metadata`` alone, without a follow-up content fetch.
 """
 
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import asyncio
 import uuid
 from dataclasses import dataclass, field
@@ -16,14 +17,23 @@ import pytest
 
 from hindsight_api.api.http import OperationResponse, OperationStatusResponse
 from hindsight_api.engine.memory_engine import MemoryEngine
+
+# Imported at module scope on purpose. test_reflect_tokenizer_lazy_load purges
+# ``hindsight_api.engine.reflect*`` from sys.modules, so a late import inside a
+# test can hand back a FRESHLY imported class whose identity no longer matches
+# the one memory_engine bound at its own import time — the ``except`` in
+# refresh_mental_model then misses, and the failure is recorded as
+# ``unexpected_error``. Importing here binds before any test can purge.
+from hindsight_api.engine.reflect import ReflectNoAnswerError, ReflectToolExecutionError
 from hindsight_api.worker.exceptions import RetryTaskAt
+from tests.conftest import stub_refresh_has_sources
 
 
 @pytest.fixture
 async def bank_with_model(memory: MemoryEngine, request_context):
     """Bank with one mental model, unique per test for xdist safety."""
     bank_id = f"test-refresh-meta-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)
     mm = await memory.create_mental_model(
         bank_id=bank_id,
         name="Outcome Meta Model",
@@ -95,6 +105,35 @@ async def test_completed_refresh_enriches_result_metadata(bank_with_model, reque
     assert meta["based_on_counts"] == {"world": 3, "mental-models": 1}
 
 
+@pytest.mark.asyncio
+async def test_a_preserved_legacy_placeholder_is_not_populated_content(bank_with_model, request_context, monkeypatch):
+    """An upgraded bank's placeholder body is not synthesis, however long it is.
+
+    Pages are created empty now, but a bank upgraded from a version that wrote
+    "Generating content..." still holds those rows, and a skipped refresh preserves
+    that body. ``populated_content`` exists so a monitoring layer can tell "refreshed
+    with real content" from "refreshed empty" without reading the document, and a
+    length check alone reports the placeholder as the former.
+    """
+    memory, bank_id, mm = bank_with_model
+
+    operation_id = await _submit_with_fake_refresh(
+        memory,
+        monkeypatch,
+        bank_id,
+        mm,
+        request_context,
+        _fake_refreshed("Generating content...", {}),
+    )
+
+    status = await memory.get_operation_status(
+        bank_id=bank_id, operation_id=operation_id, request_context=request_context
+    )
+    meta = status["result_metadata"]
+    assert meta["content_len"] == len("Generating content...")
+    assert meta["populated_content"] is False
+
+
 # ---------------------------------------------------------------------------
 # What the refresh did with the document (#3274)
 # ---------------------------------------------------------------------------
@@ -131,6 +170,7 @@ def _patch_reflect(monkeypatch, memory: MemoryEngine, *, text: str, facts: list[
         )
 
     monkeypatch.setattr(memory, "reflect_async", fake_reflect_async)
+    stub_refresh_has_sources(monkeypatch, memory)
 
 
 def _patch_delta_llm(monkeypatch, memory: MemoryEngine, *, returns) -> None:
@@ -140,9 +180,9 @@ def _patch_delta_llm(monkeypatch, memory: MemoryEngine, *, returns) -> None:
     async def fake_call(*, messages, **kwargs):
         if isinstance(returns, Exception):
             raise returns
-        return DeltaOperationList.model_validate({"operations": returns})
+        return LLMCallResult(content=DeltaOperationList.model_validate({"operations": returns}), usage=TokenUsage())
 
-    monkeypatch.setattr(memory._reflect_llm_config, "call", fake_call)
+    monkeypatch.setattr(memory._mental_model_refresh_llm_config, "call", fake_call)
 
 
 @dataclass
@@ -179,7 +219,7 @@ async def _refresh_operation_views(memory, bank_id, request_context) -> _Refresh
 async def delta_bank(memory: MemoryEngine, request_context):
     """Bank with one delta-mode mental model that already has a baseline document."""
     bank_id = f"test-refresh-outcome-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)
     mm = await memory.create_mental_model(
         bank_id=bank_id,
         name="Team Info",
@@ -211,7 +251,7 @@ async def test_preserved_and_rewritten_differ_only_by_outcome(memory: MemoryEngi
 
     for mode in ("delta", "full"):
         bank_id = f"test-refresh-outcome-{mode}-{uuid.uuid4().hex[:8]}"
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
         mm = await memory.create_mental_model(
             bank_id=bank_id,
             name="Team Info",
@@ -242,8 +282,11 @@ async def test_preserved_and_rewritten_differ_only_by_outcome(memory: MemoryEngi
     # ...and only the outcome tells them apart.
     assert preserved["outcome"] == "content_preserved_no_new_facts"
     assert rewritten["outcome"] == "content_written"
-    assert "failure_reason" not in preserved
-    assert "failure_reason" not in rewritten
+    # A finished refresh has no failure reason, and says so explicitly rather than
+    # leaving the field out: a retry runs on the same operation row, so a reason an
+    # earlier attempt wrote would otherwise survive into the attempt that succeeded.
+    assert preserved["failure_reason"] is None
+    assert rewritten["failure_reason"] is None
 
 
 def test_operation_outcome_is_a_superset_of_executor_outcome():
@@ -262,7 +305,7 @@ def test_operation_outcome_is_a_superset_of_executor_outcome():
     assert executor <= operation, f"executor outcomes missing from the operation vocabulary: {executor - operation}"
     # The persist path is the only source of the extra values; if that changes,
     # the comment on RefreshOperationOutcome needs to change with it.
-    assert operation - executor == {"refresh_failed_structured_output"}
+    assert operation - executor == {"refresh_failed_structured_output", "refresh_failed_error"}
 
 
 def test_unknown_outcome_reports_no_details_instead_of_raising():
@@ -358,6 +401,10 @@ class _OutcomeCase:
     expect_failure_reason: str | None = None
     expect_ops_applied: int = 0
     expect_ops_skipped: int = 0
+    # Reflect itself fails, before there is an executor run at all: the tool-failure
+    # (#2894) and no-answer (#2959) paths, which the refresh re-raises as a typed
+    # MentalModelRefreshError so they reach the operation like every other refusal.
+    reflect_raises: str | None = None
 
 
 _OUTCOME_CASES = [
@@ -460,6 +507,33 @@ _OUTCOME_CASES = [
         expect_failure_reason="structured_output_failed",
         why="the persist path refuses a document the executor already accepted — the one outcome a dry run cannot reach",
     ),
+    _OutcomeCase(
+        id="reflect_retrieval_failed",
+        mode="full",
+        reflect_text="",
+        reflect_raises="tool",
+        expect_outcome="refresh_failed_error",
+        expect_failure_reason="retrieval_failed",
+        why="a retrieval tool raised, so the run never gathered the evidence it was asked for (#2894)",
+    ),
+    _OutcomeCase(
+        id="unexpected_error",
+        mode="full",
+        reflect_text="",
+        reflect_raises="unexpected",
+        expect_outcome="refresh_failed_error",
+        expect_failure_reason="unexpected_error",
+        why="anything that escapes the refresh still has to leave a record (#2894)",
+    ),
+    _OutcomeCase(
+        id="reflect_produced_no_answer",
+        mode="full",
+        reflect_text="",
+        reflect_raises="answer",
+        expect_outcome="refresh_failed_error",
+        expect_failure_reason="no_answer",
+        why="reflect finished without an answer, so there is nothing to write (#2959)",
+    ),
 ]
 
 
@@ -468,7 +542,7 @@ _OUTCOME_CASES = [
 async def test_refresh_outcome_matrix(case: _OutcomeCase, memory: MemoryEngine, request_context, monkeypatch):
     """Each way a refresh can end reaches the operation record under its own name."""
     bank_id = f"test-outcome-{case.id.replace('_', '-')}-{uuid.uuid4().hex[:8]}"
-    await memory.get_bank_profile(bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)
     trigger: dict[str, Any] = {"mode": case.mode}
     if case.response_schema:
         trigger["response_schema"] = case.response_schema
@@ -481,7 +555,28 @@ async def test_refresh_outcome_matrix(case: _OutcomeCase, memory: MemoryEngine, 
         request_context=request_context,
     )
 
-    _patch_reflect(monkeypatch, memory, text=case.reflect_text, facts=case.facts)
+    if case.reflect_raises:
+        if case.reflect_raises == "tool":
+            exc: Exception = ReflectToolExecutionError(
+                "Reflect tool 'recall' failed on iteration 1: the store is unreachable"
+            )
+        elif case.reflect_raises == "unexpected":
+            # Not a shape the pipeline models — a provider that gave up, a store
+            # that went away. It is still a failed refresh.
+            exc = RuntimeError("the provider returned 503 three times")
+        else:
+            exc = ReflectNoAnswerError("Reflect's done tool returned no answer.")
+
+        async def reflect_fails(**kwargs):
+            raise exc
+
+        monkeypatch.setattr(memory, "reflect_async", reflect_fails)
+        # These cases are about what reflect does when it runs, so the bank has to
+        # look non-empty — otherwise the empty-scope short-circuit (#3875) skips the
+        # loop and the stub never raises.
+        stub_refresh_has_sources(monkeypatch, memory)
+    else:
+        _patch_reflect(monkeypatch, memory, text=case.reflect_text, facts=case.facts)
     _patch_delta_llm(monkeypatch, memory, returns=case.delta_returns)
     if case.unparseable_baseline:
         from hindsight_api.engine.reflect import structured_doc
@@ -491,14 +586,13 @@ async def test_refresh_outcome_matrix(case: _OutcomeCase, memory: MemoryEngine, 
 
         monkeypatch.setattr(structured_doc, "structured_document_from_stored", unreadable)
     if case.structured_output_fails:
-        import types
-
         from hindsight_api.engine.reflect import agent as reflect_agent
+        from hindsight_api.engine.reflect.models import StructuredOutputResult
 
         async def extraction_yields_nothing(answer, response_schema, llm_config, reflect_id, max_tokens=None):
-            return types.SimpleNamespace(
-                structured_output=None, input_tokens=0, output_tokens=0, cached_tokens=0, thoughts_tokens=0
-            )
+            # A failed extraction carries the reason (#4230); the refresh records it
+            # in the failure detail, so the fake must be the real result type.
+            return StructuredOutputResult(error="RuntimeError: simulated extraction failure")
 
         monkeypatch.setattr(reflect_agent, "_generate_structured_output", extraction_yields_nothing)
 
@@ -560,3 +654,46 @@ def test_outcome_matrix_covers_every_outcome_and_reason():
     # delta-not-applied guard sets a more specific reason. It is covered by
     # test_delta_failure_reason_narrows_the_fallback_vocabulary instead.
     assert covered_reasons == set(get_args(RefreshFailureReason)) - {"delta_not_applied"}
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_succeeds_clears_the_earlier_failure_reason(bank_with_model, request_context, monkeypatch):
+    """A refresh is retried on the same operation row, so its reason must not stick.
+
+    Observed live: an operation that failed with ``no_answer`` and then succeeded on
+    retry reported ``outcome=content_written`` alongside ``failure_reason=no_answer``.
+    Both writers merge into ``result_metadata``, so the success has to overwrite the
+    earlier reason rather than simply not write one.
+
+    Driven through the two writers directly: the worker's real retry only fires
+    after ``next_retry_at``, and a second submit folds into the pending row (#3487)
+    without re-running it, so neither reproduces a second attempt in-process.
+    """
+    memory, bank_id, mm = bank_with_model
+    from hindsight_api.engine.memory_engine import MentalModelRefreshError
+
+    operation_id = await _submit_with_fake_refresh(
+        memory, monkeypatch, bank_id, mm, request_context, _fake_refreshed("first attempt", {})
+    )
+
+    # Attempt 1 failed.
+    await memory._write_refresh_failure_metadata(
+        operation_id,
+        MentalModelRefreshError("no answer", outcome="refresh_failed_error", reason="no_answer"),
+    )
+    failed = await memory.get_operation_status(
+        bank_id=bank_id, operation_id=operation_id, request_context=request_context
+    )
+    assert failed["result_metadata"]["failure_reason"] == "no_answer"
+
+    # Attempt 2, on the same row, wrote a document.
+    await memory._write_refresh_outcome_metadata(
+        operation_id, _fake_refreshed("a real document", {}) | {"reflect_response": {"outcome": "content_written"}}
+    )
+    succeeded = await memory.get_operation_status(
+        bank_id=bank_id, operation_id=operation_id, request_context=request_context
+    )
+    assert succeeded["result_metadata"]["outcome"] == "content_written"
+    assert succeeded["result_metadata"]["failure_reason"] is None, (
+        "the earlier attempt's failure reason survived into the successful one"
+    )

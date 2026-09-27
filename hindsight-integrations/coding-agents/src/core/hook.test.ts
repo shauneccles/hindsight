@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config";
 import { buildHookOutput, runHook } from "./hook";
 import { diagFilePath } from "./diag";
+import { ReflectError } from "./hindsight";
 import { buildReflectQuery } from "./inject";
 
 let root: string;
@@ -16,6 +17,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -41,12 +43,19 @@ function makeClient(
     reflect: (query: string, opts: { budget?: string; timeoutMs: number }) => Promise<string>;
     listPages: () => Promise<unknown>;
     getPage: (pageId: string) => Promise<unknown>;
+    searchKnowledgePages: (
+      query: string,
+      opts?: { limit?: number; timeoutMs?: number }
+    ) => Promise<{ id: string; name: string; snippet: string }[]>;
+    recallObservations: (query: string, opts: { timeoutMs: number }) => Promise<string[]>;
   }> = {}
 ) {
   return {
     reflect: vi.fn(async () => "REFLECT_ANSWER"),
     listPages: vi.fn(async () => ({ items: [{ id: "p1", name: "Uploader guide" }] })),
     getPage: vi.fn(async () => ({ content: PAGE_CONTENT })),
+    searchKnowledgePages: vi.fn(async () => [] as { id: string; name: string; snippet: string }[]),
+    recallObservations: vi.fn(async () => [] as string[]),
     ...overrides,
   };
 }
@@ -109,7 +118,10 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     expect(client.reflect).not.toHaveBeenCalled();
-    expect(first.context).toBeUndefined();
+    // The guide is re-stated every turn now (pageRefreshEveryTurns defaults to
+    // 1), so context is never empty — what this test is about is that no MEMORY
+    // was injected on the deferred turn.
+    expect(first.context).not.toContain("<hindsight_memory>");
     expect(JSON.parse(readFileSync(cacheFile, "utf8")).deferInitialReflect).toBeUndefined();
 
     const second = await buildHookOutput({
@@ -123,7 +135,7 @@ describe("buildHookOutput", () => {
     expect(second.context).toContain("REFLECT_ANSWER");
   });
 
-  it("reflect rejection: caches '' (no retry next turn), no throw, no context at all", async () => {
+  it("reflect rejection: retried once on a later turn, then cached '' — no throw, no context", async () => {
     const cfg = resolveConfig({});
     const client = makeClient({
       reflect: vi.fn(async () => {
@@ -138,24 +150,56 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     // Reflect failed -> no reflect block; pages are never auto-injected -> nothing to inject.
-    expect(t1.context).toBeUndefined();
+    expect(t1.context).not.toContain("<hindsight_memory>");
     // ...but the turn is NOT silent: one line pointing at the diag trail (#3443).
     expect(t1.notice).toContain("no memory this turn");
     expect(t1.notice).toContain(diagFilePath());
-    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
+    // A failure is not an answer: nothing is cached, so a later turn can still get memory (#4607).
+    const afterT1 = JSON.parse(readFileSync(cacheFile, "utf8"));
+    expect(afterT1.reflectAnswer).toBeUndefined();
+    expect(afterT1.reflectAttempts).toBe(1);
 
+    const args = { harness: "claude-code", prompt: UNRELATED_PROMPT, cfg, client, cacheFile };
+    await buildHookOutput(args);
+    expect(client.reflect).toHaveBeenCalledTimes(2);
+    // Second failure exhausts the budget — now it IS cached, so a dead server costs 2 turns, not every turn.
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
+    await buildHookOutput(args);
+    expect(client.reflect).toHaveBeenCalledTimes(2);
+  });
+
+  it("reflect_failed records the bank, the deadline, and the server's full error body", async () => {
+    const diagFile = join(root, "diag.log");
+    vi.stubEnv("HINDSIGHT_DIAG_FILE", diagFile);
+    const body = `{"detail":"${"x".repeat(400)} upstream LLM rejected the turn"}`;
+    const client = {
+      ...makeClient({
+        reflect: vi.fn(async () => {
+          throw new Error(`reflect 500 ${body}`);
+        }),
+      }),
+      bank: "coding-agent::demo",
+    };
     await buildHookOutput({
       harness: "claude-code",
       prompt: UNRELATED_PROMPT,
-      cfg,
+      cfg: resolveConfig({}),
       client,
       cacheFile,
     });
-    // The failure is cached as "" — reflect is NOT retried on the next turn.
-    expect(client.reflect).toHaveBeenCalledTimes(1);
+
+    const failed = readFileSync(diagFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .find((entry) => entry.event === "reflect_failed");
+    expect(failed.bank).toBe("coding-agent::demo");
+    expect(failed.timeoutMs).toBe(20_000);
+    // Past describeError's default 200-char cut, where the root cause usually sits.
+    expect(failed.error).toContain("upstream LLM rejected the turn");
   });
 
-  it("the notice fires ONCE — the turn reflect failed, not on later turns", async () => {
+  it("the notice fires on the turns reflect ran, and stops once the retries are spent", async () => {
     const cfg = resolveConfig({});
     const client = makeClient({
       reflect: vi.fn(async () => {
@@ -164,7 +208,9 @@ describe("buildHookOutput", () => {
     });
     const args = { harness: "claude-code", prompt: UNRELATED_PROMPT, cfg, client, cacheFile };
     expect((await buildHookOutput(args)).notice).toContain("no memory this turn");
-    // Turn 2 does not re-run reflect, so re-announcing a failure it did not observe would nag.
+    // Turn 2 retries (and fails) — it observed the failure, so it says so.
+    expect((await buildHookOutput(args)).notice).toContain("no memory this turn");
+    // Turn 3 does not re-run reflect, so re-announcing a failure it did not observe would nag.
     expect((await buildHookOutput(args)).notice).toBeUndefined();
   });
 
@@ -180,11 +226,11 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     expect(result.notice).toBeUndefined();
-    expect(result.context).toBeUndefined();
+    expect(result.context).not.toContain("<hindsight_memory>");
   });
 
-  it("uses a bounded low-budget reflect and caps its timeout at 25000ms", async () => {
-    const cfg = resolveConfig({}); // reflectTimeoutMs default 120000
+  it("uses a bounded low-budget reflect with the 20000ms default timeout", async () => {
+    const cfg = resolveConfig({});
     const client = makeClient();
     await buildHookOutput({
       harness: "claude-code",
@@ -195,12 +241,13 @@ describe("buildHookOutput", () => {
     });
     expect(client.reflect).toHaveBeenCalledWith(buildReflectQuery("the prompt"), {
       budget: "low",
-      timeoutMs: 25000,
+      timeoutMs: 20000,
     });
   });
 
-  it("uses the configured reflect timeout when it is below the 25s cap", async () => {
-    const cfg = resolveConfig({ reflectTimeoutMs: 5000 });
+  // #4398: a raised reflectTimeoutMs used to be silently clamped to a hardcoded 20s.
+  it.each([5000, 30000])("uses the configured reflect timeout as-is (%ims)", async (ms) => {
+    const cfg = resolveConfig({ reflectTimeoutMs: ms });
     const client = makeClient();
     await buildHookOutput({
       harness: "claude-code",
@@ -211,8 +258,278 @@ describe("buildHookOutput", () => {
     });
     expect(client.reflect).toHaveBeenCalledWith(buildReflectQuery("the prompt"), {
       budget: "low",
-      timeoutMs: 5000,
+      timeoutMs: ms,
     });
+  });
+
+  describe("reflect fallback (timeout / 5xx)", () => {
+    const timedOut = () => new ReflectError("reflect timed out after 20000ms", undefined, true);
+    const serverError = () => new ReflectError("reflect 502 bad gateway", 502, false);
+    const HIT = { id: "kp-1", name: "Upload retries", snippet: "200ms  jitter\nwindow" };
+
+    it("timeout -> injects matching knowledge pages, skips recall, caches it (no retry)", async () => {
+      const client = makeClient({
+        reflect: vi.fn(async () => {
+          throw timedOut();
+        }),
+        searchKnowledgePages: vi.fn(async () => [HIT]),
+      });
+      const args = {
+        harness: "claude-code",
+        prompt: MATCHING_PROMPT,
+        cfg: resolveConfig({}),
+        client,
+        cacheFile,
+      };
+
+      const t1 = await buildHookOutput(args);
+
+      // No limit argument: it comes from the client's pageSearchLimit.
+      expect(client.searchKnowledgePages).toHaveBeenCalledWith(MATCHING_PROMPT, {
+        timeoutMs: expect.any(Number),
+      });
+      expect(client.recallObservations).not.toHaveBeenCalled();
+      expect(t1.context).toContain("<hindsight_memory>");
+      expect(t1.context).toContain("- Upload retries (kp-1): 200ms jitter window");
+      expect(t1.context).toContain("hindsight_read_knowledge_page");
+      // The turn got memory, so it stays silent — the details live in the diag trail.
+      expect(t1.notice).toBeUndefined();
+
+      const t2 = await buildHookOutput(args);
+      expect(client.reflect).toHaveBeenCalledTimes(1);
+      expect(client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+      // Injected once, on the turn it ran — like a reflect answer.
+      expect(t2.context ?? "").not.toContain("Upload retries");
+    });
+
+    it("5xx with no matching page -> raw recall of observations is injected", async () => {
+      const client = makeClient({
+        reflect: vi.fn(async () => {
+          throw serverError();
+        }),
+        recallObservations: vi.fn(async () => [
+          "Retries back off exponentially.",
+          "Tokens rotate daily.",
+        ]),
+      });
+
+      const out = await buildHookOutput({
+        harness: "claude-code",
+        prompt: MATCHING_PROMPT,
+        cfg: resolveConfig({}),
+        client,
+        cacheFile,
+      });
+
+      expect(client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+      expect(client.recallObservations).toHaveBeenCalledWith(MATCHING_PROMPT, {
+        timeoutMs: expect.any(Number),
+      });
+      expect(out.context).toContain("recalled from the bank");
+      expect(out.context).toContain("- Retries back off exponentially.\n- Tokens rotate daily.");
+      expect(out.notice).toBeUndefined();
+    });
+
+    it("a failing page search still falls through to observations", async () => {
+      const client = makeClient({
+        reflect: vi.fn(async () => {
+          throw timedOut();
+        }),
+        searchKnowledgePages: vi.fn(async () => {
+          throw new Error("knowledge pages unavailable");
+        }),
+        recallObservations: vi.fn(async () => ["An observation."]),
+      });
+
+      const out = await buildHookOutput({
+        harness: "claude-code",
+        prompt: MATCHING_PROMPT,
+        cfg: resolveConfig({}),
+        client,
+        cacheFile,
+      });
+
+      expect(out.context).toContain("- An observation.");
+    });
+
+    it("both empty -> no context, the usual no-memory notice, failure cached", async () => {
+      const client = makeClient({
+        reflect: vi.fn(async () => {
+          throw serverError();
+        }),
+      });
+
+      const out = await buildHookOutput({
+        harness: "claude-code",
+        prompt: MATCHING_PROMPT,
+        cfg: resolveConfig({}),
+        client,
+        cacheFile,
+      });
+
+      expect(client.recallObservations).toHaveBeenCalledTimes(1);
+      expect(out.context).not.toContain("<hindsight_memory>");
+      expect(out.notice).toContain("no memory this turn");
+      // Retryable: neither reflect nor the fallbacks produced memory, so a later turn may try again.
+      expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBeUndefined();
+    });
+
+    it("4xx or a transport error does NOT fall back: every endpoint would fail the same way", async () => {
+      for (const err of [new ReflectError("reflect 401", 401, false), new Error("fetch failed")]) {
+        rmSync(cacheFile, { force: true });
+        const client = makeClient({
+          reflect: vi.fn(async () => {
+            throw err;
+          }),
+        });
+        const out = await buildHookOutput({
+          harness: "claude-code",
+          prompt: MATCHING_PROMPT,
+          cfg: resolveConfig({}),
+          client,
+          cacheFile,
+        });
+        expect(client.searchKnowledgePages).not.toHaveBeenCalled();
+        expect(client.recallObservations).not.toHaveBeenCalled();
+        expect(out.notice).toContain("no memory this turn");
+      }
+    });
+
+    it("records each fallback step in the diag trail", async () => {
+      const diagFile = join(root, "diag.log");
+      vi.stubEnv("HINDSIGHT_DIAG_FILE", diagFile);
+      const client = makeClient({
+        reflect: vi.fn(async () => {
+          throw timedOut();
+        }),
+        recallObservations: vi.fn(async () => ["An observation."]),
+      });
+
+      await buildHookOutput({
+        harness: "claude-code",
+        prompt: MATCHING_PROMPT,
+        cfg: resolveConfig({}),
+        client,
+        cacheFile,
+      });
+
+      const events = readFileSync(diagFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(events.find((e) => e.event === "reflect_fallback_pages")?.count).toBe(0);
+      expect(events.find((e) => e.event === "reflect_fallback_observations")?.count).toBe(1);
+    });
+  });
+
+  it("autoInject pages: injects page-search hits once, never reflects or recalls", async () => {
+    const client = makeClient({
+      searchKnowledgePages: vi.fn(async () => [
+        { id: "p1", name: "Uploader guide", snippet: "retry backoff 200ms jitter" },
+      ]),
+    });
+    const cfg = resolveConfig({ autoInject: "pages" });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: MATCHING_PROMPT,
+      cfg,
+      client,
+      cacheFile,
+    });
+    expect(client.reflect).not.toHaveBeenCalled();
+    expect(client.recallObservations).not.toHaveBeenCalled();
+    expect(out.context).toContain("<hindsight_memory>");
+    expect(out.context).toContain("Uploader guide (p1): retry backoff 200ms jitter");
+    expect(out.context).not.toContain("synthesis was unavailable");
+    expect(out.notice).toContain("Uploader guide");
+    const next = await buildHookOutput({
+      harness: "claude-code",
+      prompt: "next",
+      cfg,
+      client,
+      cacheFile,
+    });
+    expect(client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+    expect(next.context ?? "").not.toContain("<hindsight_memory>");
+  });
+
+  it("autoInject pages: a FAILED search is retried, an empty one is not", async () => {
+    // The retryability fix is not reflect-only. A page search that threw used to cache "" just
+    // like a search that matched nothing, so a transient blip cost the whole session (#4607).
+    const cfg = resolveConfig({ autoInject: "pages" });
+    const client = makeClient({
+      searchKnowledgePages: vi.fn(async () => {
+        throw new Error("search boom");
+      }),
+    });
+    const args = { harness: "claude-code", prompt: MATCHING_PROMPT, cfg, client, cacheFile };
+    await buildHookOutput(args);
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBeUndefined();
+    await buildHookOutput(args);
+    expect(client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+    // Budget spent — now it is cached, so a broken search costs 2 turns and then stops.
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
+    await buildHookOutput(args);
+    expect(client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+
+    // A search that RAN and matched nothing is an answer, not a failure: cached on the first turn.
+    rmSync(cacheFile, { force: true });
+    const empty = makeClient({ searchKnowledgePages: vi.fn(async () => []) });
+    const emptyArgs = { ...args, client: empty };
+    await buildHookOutput(emptyArgs);
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBe("");
+    await buildHookOutput(emptyArgs);
+    expect(empty.searchKnowledgePages).toHaveBeenCalledTimes(1);
+  });
+
+  it("autoInject recall: injects recalled observations, never reflects or searches pages", async () => {
+    const client = makeClient({
+      recallObservations: vi.fn(async () => ["Uploads retry 3 times."]),
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: MATCHING_PROMPT,
+      cfg: resolveConfig({ autoInject: "recall" }),
+      client,
+      cacheFile,
+    });
+    expect(client.reflect).not.toHaveBeenCalled();
+    expect(client.searchKnowledgePages).not.toHaveBeenCalled();
+    expect(out.context).toContain("- Uploads retry 3 times.");
+    expect(out.context).not.toContain("synthesis was unavailable");
+  });
+
+  it("autoInject recall: an EMPTY retrieval injects nothing and stays silent", async () => {
+    const client = makeClient({ recallObservations: vi.fn(async () => []) });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: MATCHING_PROMPT,
+      cfg: resolveConfig({ autoInject: "recall" }),
+      client,
+      cacheFile,
+    });
+    expect(out.context ?? "").not.toContain("<hindsight_memory>");
+    // Nothing to say is not a failure — announcing one would report a break on the sessions
+    // where the plugin worked and the bank was simply sparse.
+    expect(out.notice).toBeUndefined();
+  });
+
+  it("autoInject recall: a FAILED retrieval says so, like a failed reflect", async () => {
+    const client = makeClient({
+      recallObservations: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: MATCHING_PROMPT,
+      cfg: resolveConfig({ autoInject: "recall" }),
+      client,
+      cacheFile,
+    });
+    expect(out.context ?? "").not.toContain("<hindsight_memory>");
+    // These modes used to stay silent, so a memory-less turn looked identical to a healthy one.
+    expect(out.notice).toContain("no memory this turn");
   });
 
   it("autoReflect false: never calls reflect, injects no memory block", async () => {
@@ -294,7 +611,9 @@ describe("buildHookOutput", () => {
     });
     expect(result.context).toContain("REFLECT_ANSWER"); // reflect still injected
     expect(result.context).not.toContain(PAGES_HEADER);
-    expect(result.context).not.toContain("hindsight_read_knowledge_page");
+    // The tool NAME now appears in the every-turn guide, so the thing to assert
+    // is the absence of a page entry, not of the string.
+    expect(result.context).not.toContain("hindsight_read_knowledge_page p1");
   });
 
   it("injects the page-roster refresh only on cadence turns", async () => {
@@ -318,7 +637,7 @@ describe("buildHookOutput", () => {
       cacheFile,
     });
     expect(t2.context).toContain("<hindsight_knowledge_refresh>");
-    expect(t2.context).toContain("Uploader guide (p1)");
+    expect(t2.context).toContain("deliberately NOT listed here");
     // reflect block is NOT re-injected on cadence turns (injected once, on the reflect turn)
     expect(t2.context).not.toContain("REFLECT_ANSWER");
   });

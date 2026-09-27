@@ -16,6 +16,11 @@ export interface BankInfo {
   fact_count: number;
   last_document_at: string | null;
   last_write_at: string | null;
+  /** Aliases that matched the active search — why this bank is in the results. */
+  matched_aliases: string[];
+  /** The alias this bank is presented under, when one was promoted. Display only:
+   *  `bank_id` is still its identity everywhere else. */
+  display_alias: string | null;
 }
 
 interface BankContextType {
@@ -52,6 +57,8 @@ function toBankInfo(bank: any): BankInfo {
     fact_count: bank.fact_count ?? 0,
     last_document_at: bank.last_document_at ?? null,
     last_write_at: bank.last_write_at ?? null,
+    matched_aliases: bank.matched_aliases ?? [],
+    display_alias: bank.display_alias ?? null,
   };
 }
 
@@ -141,17 +148,22 @@ export function BankProvider({ children }: { children: React.ReactNode }) {
   const banks = bankInfos.map((b) => b.bank_id);
 
   // The selected bank is only in `bankInfos` if it happens to be on a loaded page, so
-  // its name is fetched directly — otherwise the header would fall back to the raw id
-  // for any bank sitting past the first page.
+  // its name is looked up through the id-filtered list — otherwise the header would
+  // fall back to the raw id for any bank sitting past the first page. (`q` is a
+  // substring match, hence the exact-id check on the result.)
   const [fetchedBankName, setFetchedBankName] = useState<string | null>(null);
-  const loadedBankName = bankInfos.find((b) => b.bank_id === currentBank)?.name ?? null;
+  // Same precedence as the selector rows: a promoted alias is the id an operator
+  // chose to present the bank under, so it outranks the deprecated free-text name.
+  const loaded = bankInfos.find((b) => b.bank_id === currentBank);
+  const loadedBankName = loaded?.display_alias ?? loaded?.name ?? null;
   useEffect(() => {
     if (!currentBank || loadedBankName) return;
     let cancelled = false;
     client
-      .getBankProfile(currentBank)
-      .then((profile) => {
-        if (!cancelled) setFetchedBankName(profile.name || null);
+      .listBanks({ q: currentBank, limit: 100 })
+      .then(({ banks }) => {
+        const match = banks.find((bank) => bank.bank_id === currentBank);
+        if (!cancelled) setFetchedBankName(match?.display_alias || match?.name || null);
       })
       .catch(() => {
         if (!cancelled) setFetchedBankName(null);

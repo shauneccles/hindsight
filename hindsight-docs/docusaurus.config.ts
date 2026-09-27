@@ -11,7 +11,7 @@ const ANNOUNCEMENT_BAR = 'Hindsight is State-of-the-Art on Memory for AI Agents 
 
 const config: Config = {
   title: 'Hindsight',
-  tagline: 'Hindsight: Agent Memory That Works Like Human Memory',
+  tagline: 'Hindsight: Agent Memory That Learns',
   favicon: 'img/favicon.png',
 
   future: {
@@ -193,6 +193,9 @@ const config: Config = {
   ],
 
   plugins: [
+    // Indexes src/pages/changelog/integrations/*.md at build time so the
+    // Integrations Hub knows which integrations have a changelog page.
+    './plugins/integration-changelogs',
     [
       '@docusaurus/plugin-content-docs',
       {
@@ -332,7 +335,7 @@ const config: Config = {
               customProps: { icon: 'lu-book-open' },
             },
             {
-              href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
+              href: 'https://vectorize.io/slack',
               label: 'Community',
               customProps: { icon: 'si-slack' },
             },
@@ -431,7 +434,7 @@ const config: Config = {
             },
             {
               label: 'Slack',
-              href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
+              href: 'https://vectorize.io/slack',
             },
             {
               label: 'Vectorize',

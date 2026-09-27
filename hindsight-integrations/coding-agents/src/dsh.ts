@@ -42,7 +42,13 @@ export const inject = ["agents"];
 
 interface DshSession {
   readonly header: { readonly id: string; readonly cwd?: string; readonly origin?: string };
-  readonly events: readonly DshSessionEvent[];
+  /**
+   * Legacy in-memory event log. Present on DeepSeek Harness < alpha.4; removed in alpha.4+.
+   * Prefer {@link snapshotEvents} when available.
+   */
+  readonly events?: readonly DshSessionEvent[];
+  /** Public accessor on DeepSeek Harness alpha.4+ (replaces the removed `events` property). */
+  snapshotEvents?(): readonly DshSessionEvent[];
 }
 
 interface DshAgent {
@@ -53,7 +59,7 @@ interface DshAgent {
 interface DshUserMessage {
   role: "user";
   content: { type: string; text?: string }[];
-  source: { kind: string; plugin?: string; form?: string };
+  source: { kind: string; form?: string };
   id?: string;
 }
 
@@ -124,6 +130,17 @@ const workspaces = new Map<string, Workspace | null>();
  */
 const liveAgents = new Map<string, DshAgent>();
 
+/**
+ * Prefer `session.snapshotEvents()` (DeepSeek Harness alpha.4+); fall back to the legacy
+ * `session.events` property so older hosts keep working. Missing both yields an empty log —
+ * which is exactly the alpha.4 breakage when callers still read `events` alone.
+ */
+export function dshSessionEvents(
+  session: Pick<DshSession, "snapshotEvents" | "events">
+): readonly DshSessionEvent[] {
+  return session.snapshotEvents?.() ?? session.events ?? [];
+}
+
 /** Where a session is working. dsh records it on the session header; a session without one is rare. */
 function workspaceRoot(agent: DshAgent): string {
   return agent.session.header.cwd || process.cwd();
@@ -156,7 +173,8 @@ function workspaceFor(root: string): Workspace | undefined {
   // memory, so unlike opencode there is nothing to refetch over HTTP.
   core.setTranscriptSource(async (sessionId) => {
     const agent = liveAgents.get(sessionId);
-    return agent ? readDshEvents(agent.session.events) : [];
+    // alpha.4+ removed Session.events; snapshotEvents() is the public accessor.
+    return agent ? readDshEvents(dshSessionEvents(agent.session)) : [];
   });
   const workspace: Workspace = { core, root };
   workspaces.set(root, workspace);
@@ -167,8 +185,8 @@ function workspaceFor(root: string): Workspace | undefined {
  * Start this repo's cold-check + background seed once.
  *
  * Fire-and-forget by design: `agent/session-start` is an emit that no extension point awaits, and
- * the Web UI must not wait on a network round-trip to open a session. The first prompt tolerates an
- * empty knowledge preamble until this resolves.
+ * the Web UI must not wait on a network round-trip to open a session. Nothing the first prompt
+ * needs comes from here — it builds its own knowledge preamble from that session's page list.
  */
 function ensureSeeded(workspace: Workspace): void {
   workspace.seeded ??= workspace.core.seedIfCold(workspace.root);
@@ -188,7 +206,8 @@ function workspaceForAgent(agent: DshAgent): Workspace | undefined {
  * The human text in this step's claimed batch.
  *
  * `agent/pre-step` fires before EVERY step, including tool continuations that claimed no new input,
- * and other plugins contribute their own `kind: 'plugin'` messages to the same batch. Only a
+ * and other plugins contribute their own context messages to the same batch (V3 hosts tag them
+ * `kind: 'plugin'`, V4 hosts use a producer-owned kind such as `time-context`). Only a
  * `kind: 'user'` message is a prompt worth recalling on.
  */
 function promptOf(messages: readonly DshUserMessage[]): string {
@@ -205,16 +224,16 @@ function promptOf(messages: readonly DshUserMessage[]): string {
  * Build the injected memory message.
  *
  * `form: 'recall'` is dsh's own vocabulary for retrieved context, so its UI renders the block as
- * recalled material rather than as something the user typed, and `plugin: 'hindsight'` names us in
- * the durable log. Neither is what keeps the block out of a write-back — transcript-dsh.ts drops
- * every plugin-sourced message, ours included.
+ * recalled material rather than as something the user typed. Session format V4 requires injected
+ * messages to use a producer-owned source kind; `plugin:hindsight` is the canonical fallback name
+ * for an unregistered plugin. The non-user source also keeps the block out of a write-back.
  */
 function injectionMessage(text: string): DshUserMessage {
   return {
     id: randomUUID(),
     role: "user",
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: HINDSIGHT_PLUGIN, form: "recall" },
+    source: { kind: `plugin:${HINDSIGHT_PLUGIN}`, form: "recall" },
   };
 }
 

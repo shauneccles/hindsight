@@ -28,7 +28,7 @@ func main() {
 		RetainRequest(hindsight.RetainRequest{
 			Items: []hindsight.MemoryItem{
 				{
-					Content:    "Alice presented the Q4 roadmap...",
+					Content:    hindsight.TextContent("Alice presented the Q4 roadmap..."),
 					DocumentId: *hindsight.NewNullableString(&docID),
 				},
 			},
@@ -42,7 +42,7 @@ func main() {
 		RetainRequest(hindsight.RetainRequest{
 			Items: []hindsight.MemoryItem{
 				{
-					Content:    "Project deadline: March 31",
+					Content:    hindsight.TextContent("Project deadline: March 31"),
 					DocumentId: *hindsight.NewNullableString(&planDoc),
 				},
 			},
@@ -53,7 +53,7 @@ func main() {
 		RetainRequest(hindsight.RetainRequest{
 			Items: []hindsight.MemoryItem{
 				{
-					Content:    "Project deadline: April 15 (extended)",
+					Content:    hindsight.TextContent("Project deadline: April 15 (extended)"),
 					DocumentId: *hindsight.NewNullableString(&planDoc),
 				},
 			},
@@ -69,6 +69,28 @@ func main() {
 	fmt.Printf("Memory units: %d\n", doc.GetMemoryUnitCount())
 	// [/docs:document-get]
 
+	// [docs:document-update-tags]
+	// Replace the document's tags (the full set it should end up with)
+	updateResult, _, err := client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+		UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{"team-a", "team-b"}}).
+		Execute()
+	if err != nil {
+		log.Fatalf("Failed to update document: %v", err)
+	}
+	fmt.Printf("Updated: %v\n", updateResult.GetSuccess())
+
+	// Remove all tags (make document visible everywhere). Pass an empty slice, not nil:
+	// a nil slice is left out of the request, and the server rejects an update with no tags.
+	client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+		UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{}}).
+		Execute()
+	// [/docs:document-update-tags]
+
+	cleared, _, err := client.DocumentsAPI.GetDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
+	if err != nil || len(cleared.GetTags()) != 0 {
+		log.Fatalf("Expected no tags after clearing, got %v (err %v)", cleared.GetTags(), err)
+	}
+
 	// [docs:document-delete]
 	client.DocumentsAPI.DeleteDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
 	// [/docs:document-delete]
@@ -80,9 +102,7 @@ func main() {
 		log.Fatalf("Failed to list documents: %v", err)
 	}
 	for _, d := range docs.Items {
-		id, _ := d["id"].(string)
-		memCount, _ := d["memory_unit_count"].(float64)
-		fmt.Printf("%s: %d memories\n", id, int(memCount))
+		fmt.Printf("%s: %d memories\n", d.Id, d.GetMemoryUnitCount())
 	}
 	// [/docs:document-list]
 

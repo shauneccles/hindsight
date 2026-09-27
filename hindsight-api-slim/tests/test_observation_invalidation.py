@@ -43,7 +43,7 @@ async def _insert_memory(
     store = get_memories()
     fact = SimpleNamespace(
         fact_text=text,
-        embedding=memory.embeddings.encode([text])[0],
+        embedding=(await memory.embeddings.encode([text]))[0],
         fact_type=fact_type,
         tags=[],
         context=None,
@@ -56,6 +56,7 @@ async def _insert_memory(
         occurred_start=None,
         occurred_end=None,
         mentioned_at=None,
+        attachment_ids=[],
     )
     unit_ids = await store.insert_facts(
         conn=conn, ops=memory._backend.ops, bank_id=bank_id, facts=[fact], document_id=document_id
@@ -78,7 +79,7 @@ async def _insert_observation(
     """
     store = get_memories()
     obs_id = uuid.uuid4()
-    if store.writes_memory_rows_in_sql:
+    if not store.store_owned:
         await conn.execute(
             """
             INSERT INTO memory_units (
@@ -99,7 +100,7 @@ async def _insert_observation(
             record=FactRecord(
                 unit_id=str(obs_id),
                 text=text,
-                embedding=memory.embeddings.encode([text])[0],
+                embedding=(await memory.embeddings.encode([text]))[0],
                 fact_type="observation",
                 proof_count=len(source_memory_ids),
                 source_memory_ids=[str(s) for s in source_memory_ids],
@@ -113,7 +114,7 @@ async def _insert_observation(
 async def _get_observation_ids(conn, bank_id: str) -> list[str]:
     """Ids of the bank's observations, read from whichever store holds them."""
     store = get_memories()
-    if store.writes_memory_rows_in_sql:
+    if not store.store_owned:
         rows = await conn.fetch(
             "SELECT id FROM memory_units WHERE bank_id = $1 AND fact_type = 'observation'",
             bank_id,
@@ -128,7 +129,7 @@ async def _get_observation_ids(conn, bank_id: str) -> list[str]:
 async def _get_consolidated_at(conn, memory_id: uuid.UUID, bank_id: str | None = None):
     """A memory's consolidated marker. ``bank_id`` is required for a bank-partitioned store."""
     store = get_memories()
-    if store.writes_memory_rows_in_sql:
+    if not store.store_owned:
         return await conn.fetchval(
             "SELECT consolidated_at FROM memory_units WHERE id = $1",
             memory_id,
@@ -158,7 +159,7 @@ async def _count_surviving(conn, bank_id: str, memory_ids: list) -> int:
 
 
 async def _ensure_bank(memory: MemoryEngine, bank_id: str, request_context: RequestContext):
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1008,240 @@ class TestUpdateDocumentTagsObservationCleanup:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    async def test_repatching_identical_tags_invalidates_nothing(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """A PATCH re-sending the tags the document already has must not run the cascade.
+
+        This is what an idempotent tag-normalisation sweep does on its second run. The
+        retag cascade reaches past the document — it requeues every co-source of every
+        observation it deletes — so paying it for a no-op re-consolidates a large slice
+        of the bank for a write that changes nothing.
+        """
+        bank_id = f"test-tag-update-noop-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
+            other_mem = await _insert_memory(memory, conn, bank_id, "Alice also rock-climbs.")
+
+        # First PATCH is a real change and is expected to invalidate.
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(
+                doc_id, bank_id, tags=["kind:handoff", "pickup"], request_context=request_context
+            )
+
+        # Rebuild the observation the way consolidation would have, then re-send the
+        # SAME tags.
+        async with pool.acquire() as conn:
+            obs_id = await _insert_observation(
+                memory, conn, bank_id, "Alice loves outdoor activities.", doc_mem_ids + [other_mem]
+            )
+            assert await _get_consolidated_at(conn, other_mem, bank_id) is not None
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
+            result = await memory.update_document(
+                doc_id, bank_id, tags=["kind:handoff", "pickup"], request_context=request_context
+            )
+            assert result is True, "A no-op retag still updates the document and reports success"
+            mock_consolidate.assert_not_awaited()
+
+        async with pool.acquire() as conn:
+            assert str(obs_id) in await _get_observation_ids(conn, bank_id), (
+                "Observation must survive a PATCH that does not change the tag set"
+            )
+            assert await _get_consolidated_at(conn, other_mem, bank_id) is not None, (
+                "Co-source memory must not be requeued by a no-op retag"
+            )
+            for mem_id in doc_mem_ids:
+                assert await _get_consolidated_at(conn, mem_id, bank_id) is not None, (
+                    "Document's own memories must not be requeued by a no-op retag"
+                )
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_reordered_tags_are_not_a_change(self, memory: MemoryEngine, request_context: RequestContext):
+        """Tags are compared as a set: a reordered array changes nothing consolidation can see."""
+        bank_id = f"test-tag-update-reorder-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a", "b", "c"], request_context=request_context)
+
+        async with pool.acquire() as conn:
+            obs_id = await _insert_observation(memory, conn, bank_id, "Alice is outdoorsy.", doc_mem_ids)
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
+            await memory.update_document(doc_id, bank_id, tags=["c", "a", "b"], request_context=request_context)
+            mock_consolidate.assert_not_awaited()
+
+        async with pool.acquire() as conn:
+            assert str(obs_id) in await _get_observation_ids(conn, bank_id)
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_partial_tag_overlap_still_invalidates(self, memory: MemoryEngine, request_context: RequestContext):
+        """The no-op guard is exact: a tag set that differs at all still runs the cascade."""
+        bank_id = f"test-tag-update-changed-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a", "b"], request_context=request_context)
+
+        async with pool.acquire() as conn:
+            obs_id = await _insert_observation(memory, conn, bank_id, "Alice is outdoorsy.", doc_mem_ids)
+
+        # Adding one tag to the existing set is a real change.
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
+            await memory.update_document(doc_id, bank_id, tags=["a", "b", "c"], request_context=request_context)
+            mock_consolidate.assert_awaited()
+
+        async with pool.acquire() as conn:
+            assert str(obs_id) not in await _get_observation_ids(conn, bank_id)
+            for mem_id in doc_mem_ids:
+                assert await _get_consolidated_at(conn, mem_id, bank_id) is None
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_empty_tags_clears_them(self, memory: MemoryEngine, request_context: RequestContext):
+        """``tags=[]`` is a real update: it clears the document's tags and its units'.
+
+        The array is a REPLACEMENT, never a merge, so an empty one is how a caller drops
+        every tag. Every guard on the path is written ``is not None`` rather than a
+        truthiness check precisely so the empty list survives it — this test is what stops
+        one of them regressing to ``if tags:`` and turning a clear into a silent no-op.
+        """
+        bank_id = f"test-tag-update-clear-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a", "b"], request_context=request_context)
+
+        async with pool.acquire() as conn:
+            obs_id = await _insert_observation(memory, conn, bank_id, "Alice is outdoorsy.", doc_mem_ids)
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
+            assert await memory.update_document(doc_id, bank_id, tags=[], request_context=request_context)
+            mock_consolidate.assert_awaited()
+
+        document = await memory.get_document(doc_id, bank_id, request_context=request_context)
+        assert list(document["tags"] or []) == [], document["tags"]
+
+        async with pool.acquire() as conn:
+            for mem_id in doc_mem_ids:
+                stored_mem = await _get_memory(conn, bank_id, mem_id)
+                assert list(stored_mem.tags or []) == [], f"Memory unit {mem_id} should have no tags left"
+            # Clearing is a tag CHANGE like any other, so it runs the same cascade.
+            assert str(obs_id) not in await _get_observation_ids(conn, bank_id)
+            for mem_id in doc_mem_ids:
+                assert await _get_consolidated_at(conn, mem_id, bank_id) is None
+
+        # And clearing tags on a document that already has none is the no-op the set
+        # comparison promises — not a second round of re-consolidation.
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()) as mock_consolidate:
+            assert await memory.update_document(doc_id, bank_id, tags=[], request_context=request_context)
+            mock_consolidate.assert_not_awaited()
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_patch_endpoint_accepts_empty_tags(
+        self, memory: MemoryEngine, api_client, request_context: RequestContext
+    ):
+        """PATCH ``{"tags": []}`` clears the tags; only a MISSING ``tags`` is a 422.
+
+        The route rejects "no field provided" with ``body.tags is None``. An empty list is
+        a provided value, and the documented way to drop every tag, so it must reach the
+        engine rather than trip the guard.
+        """
+        bank_id = f"test-tag-patch-empty-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            await _insert_document_with_memories(memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")])
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a", "b"], request_context=request_context)
+
+            resp = await api_client.patch(f"/v1/default/banks/{bank_id}/documents/{doc_id}", json={"tags": []})
+        assert resp.status_code == 200, resp.text
+
+        document = await memory.get_document(doc_id, bank_id, request_context=request_context)
+        assert list(document["tags"] or []) == [], document["tags"]
+
+        # An omitted `tags` is still the "nothing to update" 422.
+        resp = await api_client.patch(f"/v1/default/banks/{bank_id}/documents/{doc_id}", json={})
+        assert resp.status_code == 422, resp.text
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_tag_change_stamps_memory_units_updated_at(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """A real retag stamps the units' ``updated_at``; a no-op retag leaves it alone."""
+        store = get_memories()
+        if store.store_owned:
+            pytest.skip("updated_at is a SQL memory_units column")
+
+        bank_id = f"test-tag-update-stamp-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+            doc_mem_ids = await _insert_document_with_memories(
+                memory, conn, bank_id, doc_id, [("Alice loves hiking.", "experience")]
+            )
+
+        async def _updated_at():
+            async with pool.acquire() as conn:
+                return await conn.fetchval("SELECT updated_at FROM memory_units WHERE id = $1", doc_mem_ids[0])
+
+        before = await _updated_at()
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a"], request_context=request_context)
+        after_change = await _updated_at()
+        assert after_change > before, "A tag change must stamp the memory unit's updated_at"
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_document(doc_id, bank_id, tags=["a"], request_context=request_context)
+        assert await _updated_at() == after_change, "A no-op retag must not restamp updated_at"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
     async def test_update_tags_does_not_affect_unrelated_observations(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
@@ -1049,7 +1284,7 @@ class TestConsolidationSourceMemoryFiltering:
     async def test_create_observation_filters_deleted_source_memories(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
-        from hindsight_api.engine.consolidation.consolidator import _create_observation_directly
+        from tests.consolidation_actions import create_observation as _create_observation_directly
 
         bank_id = f"test-race-create-filter-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -1082,7 +1317,7 @@ class TestConsolidationSourceMemoryFiltering:
     async def test_create_observation_skipped_when_all_sources_deleted(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
-        from hindsight_api.engine.consolidation.consolidator import _create_observation_directly
+        from tests.consolidation_actions import create_observation as _create_observation_directly
 
         bank_id = f"test-race-create-skip-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -1109,7 +1344,7 @@ class TestConsolidationSourceMemoryFiltering:
     async def test_update_observation_skipped_when_all_new_sources_deleted(
         self, memory: MemoryEngine, request_context: RequestContext
     ):
-        from hindsight_api.engine.consolidation.consolidator import _execute_update_action
+        from tests.consolidation_actions import execute_update_action as _execute_update_action
         from hindsight_api.engine.response_models import MemoryFact
 
         bank_id = f"test-race-update-skip-{uuid.uuid4().hex[:8]}"
@@ -1158,7 +1393,7 @@ class TestConsolidationSourceMemoryFiltering:
         # The preflight sees the source live, but it is deleted while the embedder runs
         # off-connection. The authoritative in-txn FOR SHARE liveness guard (not the preflight) must
         # then skip the update, so a dead source is never written back into the observation.
-        from hindsight_api.engine.consolidation.consolidator import _execute_update_action
+        from tests.consolidation_actions import execute_update_action as _execute_update_action
         from hindsight_api.engine.response_models import MemoryFact
 
         bank_id = f"test-race-update-inflight-{uuid.uuid4().hex[:8]}"

@@ -9,14 +9,14 @@ retain had been using.
 Chunk boundaries are load-bearing: they are content-hashed for delta retain, and a
 chunk's index becomes its ``chunk_id``. A re-implementation that shifted them would make
 every stored chunk of every existing document look changed, silently. So the tests here
-are mostly differential — they pin the new splitter against the langchain one it
-replaced, on inputs chosen to reach every branch of it.
+are mostly differential — they pin the new splitter against the one it replaced, on
+inputs chosen to reach every branch of it. That reference is ``tests.chunking_reference``:
+langchain's ``RecursiveCharacterTextSplitter``, transcribed so the oracle survives without
+the dependency (which pulled in langchain-core -> langsmith -> orjson).
 """
 
 import json
 import tracemalloc
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from hindsight_api.engine.retain.fact_extraction import (
     _RECURSIVE_TEXT_SEPARATORS,
@@ -24,22 +24,12 @@ from hindsight_api.engine.retain.fact_extraction import (
     chunk_text,
     iter_chunks,
 )
+from tests.chunking_reference import recursive_split
 
 
-def _langchain_split(text: str, max_chars: int) -> list[str]:
-    """The exact splitter call the plain-text chunking path made before #3756.
-
-    Kept as the reference implementation the streaming splitter is diffed against, which is
-    the only remaining use of langchain-text-splitters in this repo.
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=max_chars,
-        chunk_overlap=0,
-        length_function=len,
-        is_separator_regex=False,
-        separators=_RECURSIVE_TEXT_SEPARATORS,
-    )
-    return splitter.split_text(text)
+def _reference_split(text: str, max_chars: int) -> list[str]:
+    """The exact splitter call the plain-text chunking path made before #3756."""
+    return recursive_split(text, max_chars, _RECURSIVE_TEXT_SEPARATORS)
 
 
 # Inputs chosen to reach each separator in _RECURSIVE_TEXT_SEPARATORS in turn, plus the
@@ -64,15 +54,15 @@ _PLAIN_TEXT_CASES = {
 }
 
 
-def test_streaming_splitter_matches_langchain_across_separator_tiers():
-    """Every separator tier and degenerate case splits exactly as langchain did."""
+def test_streaming_splitter_matches_the_reference_across_separator_tiers():
+    """Every separator tier and degenerate case splits exactly as the old splitter did."""
     for name, text in _PLAIN_TEXT_CASES.items():
         for max_chars in (10, 17, 40, 100, 1000):
             streamed = list(_iter_recursive_splits(text, max_chars, _RECURSIVE_TEXT_SEPARATORS))
-            assert streamed == _langchain_split(text, max_chars), f"{name} at max_chars={max_chars}"
+            assert streamed == _reference_split(text, max_chars), f"{name} at max_chars={max_chars}"
 
 
-def test_streaming_splitter_matches_langchain_on_generated_prose():
+def test_streaming_splitter_matches_the_reference_on_generated_prose():
     """A larger, more varied body — the shape a real document arrives in."""
     paragraphs = []
     for index in range(60):
@@ -84,7 +74,7 @@ def test_streaming_splitter_matches_langchain_on_generated_prose():
     text = "\n\n".join(paragraphs)
 
     for max_chars in (50, 137, 500, 1500):
-        assert list(_iter_recursive_splits(text, max_chars, _RECURSIVE_TEXT_SEPARATORS)) == _langchain_split(
+        assert list(_iter_recursive_splits(text, max_chars, _RECURSIVE_TEXT_SEPARATORS)) == _reference_split(
             text, max_chars
         )
 
@@ -176,3 +166,45 @@ def test_chunk_text_idempotent_on_streamed_chunks():
     text = "\n\n".join(f"Para {i}. Sentence two here; clause three, word four!" for i in range(40))
     for chunk in iter_chunks(text, 120):
         assert chunk_text(chunk, 120) == [chunk]
+
+
+def test_conversation_chunks_drop_lone_surrogate_escapes():
+    """A lone ``\\ud83d`` escape (half an emoji) must not become an unencodable chunk.
+
+    json.loads turns the escape into a real surrogate; before the fix the chunk then
+    crashed ``compute_chunk_hash`` with ``UnicodeEncodeError: surrogates not allowed``.
+    """
+    turns = [{"role": "user", "content": "x" * 50 + " hi \\ud83d"} for _ in range(4)]
+    text = json.dumps(turns).replace("\\\\ud83d", "\\ud83d")
+    assert "\\ud83d" in text  # the ASCII escape, as the client sent it
+    chunks = chunk_text(text, max_chars=150)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        chunk.encode()  # raises on a lone surrogate
+        assert all(t["content"].endswith(" hi ") for t in json.loads(chunk))
+
+
+def test_conversation_chunks_keep_paired_surrogate_emoji():
+    turns = [{"role": "user", "content": "x" * 50 + " hi \U0001f600"} for _ in range(4)]
+    chunks = chunk_text(json.dumps(turns), max_chars=150)
+    assert len(chunks) > 1
+    assert all("\U0001f600" in chunk for chunk in chunks)
+
+
+def test_oversized_conversation_turn_fragments_drop_lone_surrogates():
+    """A turn too large to keep whole is fragmented — the fragments must encode too.
+
+    Distinct path from the packing case above: an oversized turn is serialized on its
+    own and split as text, so it reaches the reader through a different serialization
+    than a turn that shares a chunk.
+    """
+    turn = {"role": "user", "content": "y" * 400 + " hi \\ud83d"}
+    text = json.dumps([turn]).replace("\\\\ud83d", "\\ud83d")
+    assert "\\ud83d" in text  # the ASCII escape, as the client sent it
+
+    chunks = chunk_text(text, max_chars=150)
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        chunk.encode()  # raises on a lone surrogate
+    assert "\ud83d" not in "".join(chunks)

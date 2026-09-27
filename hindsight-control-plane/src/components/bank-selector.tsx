@@ -6,8 +6,18 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { bankRoute } from "@/lib/bank-url";
+import { hoistCurrentBank } from "@/lib/bank-order";
 import { withBasePath } from "@/lib/base-path";
 import { client } from "@/lib/api";
+import type { RetainContentBlock as ContentBlock } from "@/lib/api";
+import {
+  ContentComposer,
+  hasComposedContent,
+  toRetainContent,
+  type ComposeMode,
+  type ComposerBlock,
+} from "@/components/content-composer";
+
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
 import {
@@ -127,6 +137,8 @@ function BankSelectorInner() {
   const [docDialogOpen, setDocDialogOpen] = React.useState(false);
   const [docTab, setDocTab] = React.useState<"text" | "upload">("text");
   const [docContent, setDocContent] = React.useState("");
+  const [docComposeMode, setDocComposeMode] = React.useState<ComposeMode>("text");
+  const [docBlocks, setDocBlocks] = React.useState<ComposerBlock[]>([]);
   const [docContext, setDocContext] = React.useState("");
   const [docEventDate, setDocEventDate] = React.useState("");
   const [docDocumentId, setDocDocumentId] = React.useState("");
@@ -201,12 +213,26 @@ function BankSelectorInner() {
     return () => window.removeEventListener("hindsight:logo-spin", spin);
   }, []);
 
-  // Banks arrive already ordered by last write descending, one page at a time, so the
-  // list is rendered in server order — re-sorting here would only shuffle a later page
-  // above an earlier one.
+  // The banks overview page has its own "create bank" button; the dialog (with its
+  // template import) lives here, so that button asks for it rather than duplicating it.
+  React.useEffect(() => {
+    const openCreate = () => setCreateDialogOpen(true);
+    window.addEventListener("hindsight:create-bank", openCreate);
+    return () => window.removeEventListener("hindsight:create-bank", openCreate);
+  }, []);
+
   const maxFactCount = React.useMemo(
     () => Math.max(1, ...bankInfos.map((b) => b.fact_count)),
     [bankInfos]
+  );
+
+  // Banks arrive already ordered by last write descending, one page at a time, so the
+  // list stays in server order — re-sorting it here would only shuffle a later page
+  // above an earlier one. The single exception is hoisting the current bank; see
+  // hoistCurrentBank for why that one is worth the reorder.
+  const orderedBanks = React.useMemo(
+    () => hoistCurrentBank(bankInfos, currentBank),
+    [bankInfos, currentBank]
   );
 
   // Search runs server-side (the bank list is paginated), so the input holds a draft
@@ -446,7 +472,7 @@ function BankSelectorInner() {
   };
 
   const handleCreateDocument = async () => {
-    if (!currentBank || !docContent.trim()) return;
+    if (!currentBank || !hasComposedContent(docComposeMode, docContent, docBlocks)) return;
 
     setIsCreatingDoc(true);
 
@@ -457,7 +483,7 @@ function BankSelectorInner() {
         .filter(Boolean);
 
       const item: {
-        content: string;
+        content: string | ContentBlock[];
         context?: string;
         timestamp?: string;
         document_id?: string;
@@ -466,7 +492,7 @@ function BankSelectorInner() {
         metadata?: Record<string, string>;
         entities?: Array<{ text: string }>;
         strategy?: string;
-      } = { content: docContent };
+      } = { content: toRetainContent(docComposeMode, docContent, docBlocks) };
       if (docContext) item.context = docContext;
       if (docEventDate) item.timestamp = toIsoTimestamp(docEventDate);
       if (docDocumentId) item.document_id = docDocumentId;
@@ -506,6 +532,8 @@ function BankSelectorInner() {
       // Reset form and close dialog
       setDocDialogOpen(false);
       setDocContent("");
+      setDocBlocks([]);
+      setDocComposeMode("text");
       setDocContext("");
       setDocEventDate("");
       setDocDocumentId("");
@@ -535,7 +563,14 @@ function BankSelectorInner() {
             freely); the wordmark is the right slice of the full lockup (logo.png)
             shown via a cropped background. Their widths sum to the full logo, so
             the two pieces butt together seamlessly at h-10. */}
-        <div className="flex items-center h-10 select-none" aria-label="Hindsight">
+        {/* The logo is the way back to the banks overview, as it is in most apps. */}
+        <button
+          type="button"
+          className="flex items-center h-10 select-none cursor-pointer"
+          aria-label={tNavBank("allBanks")}
+          title={tNavBank("allBanks")}
+          onClick={() => router.push("/dashboard")}
+        >
           <img
             src={withBasePath("/favicon.png")}
             alt=""
@@ -551,7 +586,7 @@ function BankSelectorInner() {
               backgroundRepeat: "no-repeat",
             }}
           />
-        </div>
+        </button>
 
         {/* Separator */}
         <div className="h-8 w-px bg-border" />
@@ -617,7 +652,7 @@ function BankSelectorInner() {
                     banksLoading && bankInfos.length > 0 && "opacity-40"
                   )}
                 >
-                  {bankInfos.map((bank, index) => {
+                  {orderedBanks.map((bank, index) => {
                     const barPct = (bank.fact_count / maxFactCount) * 100;
                     const isSelected = currentBank === bank.bank_id;
                     // Last write, not last ingestion: appends to an existing document
@@ -641,7 +676,13 @@ function BankSelectorInner() {
                         // already on screen, so appending page 2 flows in without
                         // replaying page 1. The stagger restarts per page and is capped
                         // so the tail of a 50-row page doesn't crawl in.
-                        className="relative overflow-hidden py-2.5 mb-0.5 group animate-list-row-enter"
+                        className={cn(
+                          "relative overflow-hidden py-2.5 mb-0.5 group animate-list-row-enter",
+                          // Not bg-accent: cmdk paints the keyboard-active row with
+                          // data-[selected=true]:bg-accent, so reusing it here would
+                          // make two rows look active at once while arrowing down.
+                          isSelected && "ring-1 ring-inset ring-primary/50"
+                        )}
                         style={{
                           animationDelay: `${Math.min(index % BANKS_PAGE_SIZE, 10) * 18}ms`,
                         }}
@@ -655,15 +696,44 @@ function BankSelectorInner() {
                           <Check
                             className={cn(
                               "h-4 w-4 shrink-0",
-                              isSelected ? "opacity-100" : "opacity-0"
+                              isSelected ? "opacity-100 text-primary" : "opacity-0"
                             )}
                           />
                           <span
-                            className="truncate flex-1 font-medium"
-                            title={bank.name || bank.bank_id}
+                            className={cn(
+                              "truncate flex-1",
+                              isSelected ? "font-semibold" : "font-medium"
+                            )}
+                            title={bank.display_alias || bank.name || bank.bank_id}
                           >
-                            {bank.name || bank.bank_id}
+                            {/* display_alias outranks name: `name` is a deprecated
+                                free-text label, while a promoted alias is a real id
+                                the operator chose to present the bank under. */}
+                            {bank.display_alias || bank.name || bank.bank_id}
                           </span>
+                          {/* The real id stays visible whenever it is not what is
+                              shown — the display is a convenience, never a disguise. */}
+                          {bank.display_alias && (
+                            <span
+                              className="shrink-0 truncate max-w-[35%] font-mono text-[11px] text-muted-foreground/60"
+                              title={bank.bank_id}
+                            >
+                              {bank.bank_id}
+                            </span>
+                          )}
+                          {/* Only set when the search matched an alias rather than this
+                              bank's own id or name, which is exactly when the row would
+                              otherwise look like it does not match what was typed. */}
+                          {bank.matched_aliases.length > 0 && (
+                            <span
+                              className="shrink-0 truncate max-w-[40%] font-mono text-[11px] text-muted-foreground/70"
+                              title={tNavBank("viaAlias", {
+                                aliases: bank.matched_aliases.join(", "),
+                              })}
+                            >
+                              {tNavBank("viaAlias", { aliases: bank.matched_aliases.join(", ") })}
+                            </span>
+                          )}
                           <button
                             type="button"
                             aria-label={tNavBank("copyName")}
@@ -917,14 +987,18 @@ function BankSelectorInner() {
                 </TabsList>
 
                 <TabsContent value="text" className="mt-3">
-                  <label className="font-bold block mb-1 text-sm text-foreground">
-                    {tAddDocument("contentLabel")}
-                  </label>
-                  <Textarea
-                    value={docContent}
-                    onChange={(e) => setDocContent(e.target.value)}
-                    placeholder={tAddDocument("contentPlaceholder")}
-                    className="min-h-[150px] resize-y"
+                  <ContentComposer
+                    label={
+                      <label className="font-bold text-sm text-foreground">
+                        {tAddDocument("contentLabel")}
+                      </label>
+                    }
+                    mode={docComposeMode}
+                    onModeChange={setDocComposeMode}
+                    text={docContent}
+                    onTextChange={setDocContent}
+                    blocks={docBlocks}
+                    onBlocksChange={setDocBlocks}
                     autoFocus
                   />
                 </TabsContent>
@@ -1452,6 +1526,8 @@ function BankSelectorInner() {
                 onClick={() => {
                   setDocDialogOpen(false);
                   setDocContent("");
+                  setDocBlocks([]);
+                  setDocComposeMode("text");
                   setDocContext("");
                   setDocEventDate("");
                   setDocDocumentId("");
@@ -1472,7 +1548,9 @@ function BankSelectorInner() {
               {docTab === "text" ? (
                 <Button
                   onClick={handleCreateDocument}
-                  disabled={isCreatingDoc || !docContent.trim()}
+                  disabled={
+                    isCreatingDoc || !hasComposedContent(docComposeMode, docContent, docBlocks)
+                  }
                 >
                   {isCreatingDoc
                     ? tAddDocument("addingDocument")

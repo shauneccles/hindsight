@@ -9,6 +9,7 @@ fallbacks. See https://docs.litellm.ai/docs/routing.
 """
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -56,6 +57,22 @@ def two_step_config() -> dict[str, Any]:
     }
 
 
+def _usage(prompt_tokens: int, completion_tokens: int) -> SimpleNamespace:
+    """A real OpenAI-shaped usage block, not a MagicMock.
+
+    ``visible_token_usage`` derives visible output from ``total_tokens`` and
+    ``completion_tokens_details.reasoning_tokens``; on a MagicMock those come
+    back as auto-created mocks and the arithmetic raises.
+    """
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        prompt_tokens_details=None,
+        completion_tokens_details=None,
+    )
+
+
 @pytest.fixture
 def mock_router_response() -> MagicMock:
     response = MagicMock()
@@ -64,8 +81,7 @@ def mock_router_response() -> MagicMock:
     choice.message.tool_calls = None
     choice.finish_reason = "stop"
     response.choices = [choice]
-    response.usage.prompt_tokens = 12
-    response.usage.completion_tokens = 3
+    response.usage = _usage(12, 3)
     response._hidden_params = {"model": "openai/gpt-4o-mini"}
     return response
 
@@ -210,11 +226,13 @@ class TestRouterCall:
         mock_router.acompletion = AsyncMock(return_value=mock_router_response)
         provider = _make_router_provider(two_step_config, mock_router)
 
-        result = await provider.call(
-            messages=[{"role": "user", "content": "hi"}],
-            max_completion_tokens=50,
-            max_retries=0,
-        )
+        result = (
+            await provider.call(
+                messages=[{"role": "user", "content": "hi"}],
+                max_completion_tokens=50,
+                max_retries=0,
+            )
+        ).content
         assert result == "ok"
         # Hindsight always issues against model_name="default"; Router handles fallback,
         # load-balancing, and routing strategy from there.
@@ -232,19 +250,20 @@ class TestRouterCall:
         choice.message.tool_calls = None
         choice.finish_reason = "stop"
         response.choices = [choice]
-        response.usage.prompt_tokens = 5
-        response.usage.completion_tokens = 5
+        response.usage = _usage(5, 5)
         response._hidden_params = {"model": "openai/gpt-4o-mini"}
 
         mock_router = MagicMock()
         mock_router.acompletion = AsyncMock(return_value=response)
         provider = _make_router_provider(two_step_config, mock_router)
 
-        result = await provider.call(
-            messages=[{"role": "user", "content": "q"}],
-            response_format=MySchema,
-            max_retries=0,
-        )
+        result = (
+            await provider.call(
+                messages=[{"role": "user", "content": "q"}],
+                response_format=MySchema,
+                max_retries=0,
+            )
+        ).content
         assert isinstance(result, MySchema)
         assert result.answer == "42"
 
@@ -255,12 +274,14 @@ class TestRouterCall:
         mock_router.acompletion = AsyncMock(side_effect=[Exception("503 Service Unavailable"), mock_router_response])
         provider = _make_router_provider(two_step_config, mock_router)
 
-        result = await provider.call(
-            messages=[{"role": "user", "content": "hi"}],
-            max_retries=2,
-            initial_backoff=0.0,
-            max_backoff=0.0,
-        )
+        result = (
+            await provider.call(
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=2,
+                initial_backoff=0.0,
+                max_backoff=0.0,
+            )
+        ).content
         assert result == "ok"
         assert mock_router.acompletion.await_count == 2
 
@@ -328,8 +349,7 @@ class TestRouterCall:
         choice.message.tool_calls = [tool_call]
         choice.finish_reason = "tool_calls"
         response.choices = [choice]
-        response.usage.prompt_tokens = 5
-        response.usage.completion_tokens = 2
+        response.usage = _usage(5, 2)
         response._hidden_params = {"model": "openai/gpt-4o-mini"}
 
         mock_router = MagicMock()

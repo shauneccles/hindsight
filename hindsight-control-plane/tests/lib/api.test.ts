@@ -85,6 +85,62 @@ describe("ControlPlaneClient error handling", () => {
   });
 });
 
+describe("ControlPlaneClient.cloneBank", () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  let client: ControlPlaneClient;
+
+  beforeEach(() => {
+    client = new ControlPlaneClient();
+    fetchSpy = vi.spyOn(globalThis, "fetch");
+    fetchSpy.mockResolvedValue(
+      new Response(JSON.stringify({ operation_id: "op-1", status: "pending" }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  it("posts the target bank id to the clone route", async () => {
+    const result = await client.cloneBank("source-bank", "source-bank-copy");
+
+    expect(result.operation_id).toBe("op-1");
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("/api/banks/source-bank/clone");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ target_bank_id: "source-bank-copy" });
+  });
+
+  it("forwards all three scope flags, matching the endpoint's own three", async () => {
+    await client.cloneBank("source-bank", "copy", {
+      includeData: true,
+      includeBankConfig: false,
+      includeHistory: true,
+    });
+
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      target_bank_id: "copy",
+      include_data: true,
+      include_bank_config: false,
+      include_history: true,
+    });
+  });
+
+  it("omits scope flags that were not set, so the server's defaults decide", async () => {
+    await client.cloneBank("source-bank", "copy", { includeBankConfig: false });
+
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.include_bank_config).toBe(false);
+    expect(body).not.toHaveProperty("include_data");
+    expect(body).not.toHaveProperty("include_history");
+  });
+});
+
 describe("ControlPlaneClient.deleteOperation", () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
   let client: ControlPlaneClient;
@@ -216,5 +272,64 @@ describe("ControlPlaneClient direct fetch error formatting", () => {
     expect(fetchSpy).toHaveBeenCalledWith(
       expect.stringContaining("/api/documents/transfer?bank_id=bank-a&include_knowledge_base=true")
     );
+  });
+
+  // The bank profile endpoint was retired server-side; getBankProfile now composes
+  // the bank config (traits + mission) with the filtered bank list (display name).
+  it("composes a bank profile from the config and the bank list", async () => {
+    fetchSpy.mockImplementation(((url: string) =>
+      Promise.resolve(
+        url.includes("/config")
+          ? new Response(
+              JSON.stringify({
+                bank_id: "bank-a",
+                config: {
+                  disposition_skepticism: 5,
+                  disposition_literalism: 2,
+                  disposition_empathy: 4,
+                  reflect_mission: "Be useful",
+                },
+                overrides: {},
+              }),
+              { status: 200 }
+            )
+          : new Response(
+              JSON.stringify({
+                banks: [
+                  { bank_id: "bank-a-other", name: "Wrong bank" },
+                  { bank_id: "bank-a", name: "Bank A" },
+                ],
+                total: 2,
+                limit: 100,
+                offset: 0,
+              }),
+              { status: 200 }
+            )
+      )) as unknown as typeof fetch);
+
+    await expect(client.getBankProfile("bank-a")).resolves.toEqual({
+      bank_id: "bank-a",
+      name: "Bank A",
+      disposition: { skepticism: 5, literalism: 2, empathy: 4 },
+      mission: "Be useful",
+    });
+  });
+
+  it("falls back to the bank id when the listing cannot supply a name", async () => {
+    fetchSpy.mockImplementation(((url: string) =>
+      url.includes("/config")
+        ? Promise.resolve(
+            new Response(JSON.stringify({ bank_id: "bank-a", config: {}, overrides: {} }), {
+              status: 200,
+            })
+          )
+        : Promise.reject(new Error("list unavailable"))) as unknown as typeof fetch);
+
+    await expect(client.getBankProfile("bank-a")).resolves.toEqual({
+      bank_id: "bank-a",
+      name: "bank-a",
+      disposition: { skepticism: 3, literalism: 3, empathy: 3 },
+      mission: "",
+    });
   });
 });

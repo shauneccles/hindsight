@@ -1,13 +1,116 @@
 """Tests for EmbedManager interface."""
 
+import io
+import signal
+import subprocess
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hindsight_embed import get_embed_manager
-from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+from hindsight_embed._http_probe import ProbeResponse
+from hindsight_embed.daemon_embed_manager import (
+    DaemonEmbedManager,
+    _detach_popen_kwargs,
+    _terminate_startup_process,
+)
 
 
 def _mock_sentence_transformers_present(monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: object())
+
+
+# Process groups and SIGKILL do not exist on Windows.
+_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+
+
+def _startup_manager(is_running: MagicMock) -> DaemonEmbedManager:
+    manager = DaemonEmbedManager()
+    manager._profile_manager = MagicMock()
+    manager._profile_manager.load_profile_config.return_value = {}
+    manager._clear_port = MagicMock(return_value=True)
+    manager.is_running = is_running
+    manager._component_version = MagicMock(return_value="0.0.0")
+    manager._find_api_command = MagicMock(return_value=["hindsight-api"])
+    return manager
+
+
+def _running_process() -> MagicMock:
+    process = MagicMock(pid=4321)
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    return process
+
+
+@_posix_only
+def test_start_timeout_terminates_spawned_daemon_group(tmp_path, monkeypatch):
+    manager = _startup_manager(MagicMock(return_value=False))
+    process = _running_process()
+    paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.DAEMON_STARTUP_TIMEOUT", 0)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    killpg = MagicMock()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
+
+    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process) as popen:
+        assert manager._start_daemon_locked({}, "test", paths) is False
+
+    assert popen.call_args.args[0] == ["hindsight-api", "--idle-timeout", "0", "--port", "9177"]
+    # The whole group, so a uvx launcher's hindsight-api grandchild goes too.
+    killpg.assert_called_once_with(4321, signal.SIGTERM)
+    process.wait.assert_called_once_with(timeout=10)
+
+
+def test_startup_keeps_polling_after_transient_stability_failure(tmp_path, monkeypatch):
+    manager = _startup_manager(MagicMock(side_effect=[False, True, False, True, True]))
+    process = _running_process()
+    paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.time", lambda: 0)
+
+    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process):
+        assert manager._start_daemon_locked({}, "test", paths) is True
+
+    process.wait.assert_not_called()
+    assert manager.is_running.call_count == 5
+
+
+def test_startup_fails_fast_when_daemon_exits(tmp_path, monkeypatch):
+    manager = _startup_manager(MagicMock(return_value=False))
+    process = _running_process()
+    process.poll.return_value = 1
+    paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.sleep", MagicMock(side_effect=AssertionError))
+
+    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process):
+        assert manager._start_daemon_locked({}, "test", paths) is False
+
+    manager.is_running.assert_called_once()  # the pre-spawn check only
+
+
+@_posix_only
+def test_start_timeout_kills_daemon_group_that_ignores_terminate(monkeypatch):
+    process = _running_process()
+    process.wait.side_effect = [subprocess.TimeoutExpired("hindsight-api", 10), 0]
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    killpg = MagicMock()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
+
+    _terminate_startup_process(process)
+
+    assert killpg.call_args_list == [((4321, signal.SIGTERM),), ((4321, signal.SIGKILL),)]
+    assert process.wait.call_count == 2
+
+
+def test_start_timeout_kills_daemon_on_windows(monkeypatch):
+    process = _running_process()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
+
+    _terminate_startup_process(process)
+
+    process.kill.assert_called_once_with()
 
 
 def test_sanitize_profile_name_via_db_url():
@@ -62,20 +165,47 @@ def test_manager_singleton():
 
 def test_register_profile_skips_when_no_api_keys():
     """
-    When config contains only short keys (no HINDSIGHT_API_* prefix),
-    _register_profile should not call create_profile, preserving any
-    existing profile .env file.
+    When config carries no HINDSIGHT_API_* keys there is nothing to persist, so
+    _register_profile must not call create_profile — which would rewrite the
+    profile .env from an empty config.
 
     Regression test for https://github.com/vectorize-io/hindsight/issues/894
     """
     manager = DaemonEmbedManager()
     manager._profile_manager = MagicMock()
 
-    # Config with short keys (as passed from cli.py's get_config())
-    config = {"llm_api_key": "sk-123", "llm_provider": "openai", "llm_model": "gpt-4o"}
-    manager._register_profile("myprofile", 8100, config)
+    manager._register_profile("myprofile", 8100, {"HINDSIGHT_EMBED_API_URL": "http://elsewhere"})
 
     manager._profile_manager.create_profile.assert_not_called()
+
+
+def test_register_profile_does_not_overwrite_configured_values(tmp_path, monkeypatch):
+    """A daemon start seeds missing keys but never rewrites configured ones.
+
+    `config` reaching _register_profile is the profile merged with this
+    invocation's ambient HINDSIGHT_* environment. Letting it win would make a
+    one-off `HINDSIGHT_API_LLM_MODEL=... hindsight-embed recall` permanently
+    rewrite the user's profile; the file is owned by `configure` and the
+    control center.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    manager = DaemonEmbedManager()
+    manager._profile_manager.create_profile(
+        "p", {"HINDSIGHT_API_LLM_PROVIDER": "anthropic", "HINDSIGHT_API_LLM_MODEL": "claude-sonnet-4-20250514"}
+    )
+
+    manager._register_profile(
+        "p",
+        9100,
+        {"HINDSIGHT_API_LLM_MODEL": "gpt-4o", "HINDSIGHT_API_LLM_BASE_URL": "https://example.com/v1"},
+    )
+
+    env = (tmp_path / ".hindsight" / "profiles" / "p.env").read_text(encoding="utf-8")
+    assert "HINDSIGHT_API_LLM_MODEL=claude-sonnet-4-20250514" in env  # configured value kept
+    assert "HINDSIGHT_API_LLM_MODEL=gpt-4o" not in env
+    assert "HINDSIGHT_API_LLM_BASE_URL=https://example.com/v1" in env  # missing key seeded
 
 
 def test_register_profile_calls_create_when_api_keys_present():
@@ -472,23 +602,15 @@ def test_is_ui_running_detects_ipv6_only_ui(tmp_path, monkeypatch):
 
     requested = []
 
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
+    # A ::1 listener is not guaranteed on CI hosts, so the probe is stood in for
+    # here; the probe's own transport is covered by test_http_probe.py.
+    def fake_probe(url, **kwargs):
+        requested.append(url)
+        if url.startswith("http://[::1]:"):
+            return ProbeResponse(status_code=200, text="")
+        return None  # connection refused
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def get(self, url):
-            requested.append(url)
-            if url.startswith("http://[::1]:"):
-                return MagicMock(status_code=200)
-            raise OSError("Connection refused")
-
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.httpx.Client", FakeClient)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", fake_probe)
 
     assert manager.is_ui_running("hermes", 19177) is True
     assert requested == [
@@ -503,22 +625,19 @@ def test_is_ui_running_false_when_no_loopback_answers(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     manager = DaemonEmbedManager()
 
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
+    requested = []
 
-        def __enter__(self):
-            return self
+    def refused(url, **kwargs):
+        requested.append(url)
+        return None
 
-        def __exit__(self, *args):
-            return False
-
-        def get(self, url):
-            raise OSError("Connection refused")
-
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.httpx.Client", FakeClient)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", refused)
 
     assert manager.is_ui_running("hermes", 19177) is False
+    assert requested == [
+        "http://127.0.0.1:19177/api/health",
+        "http://[::1]:19177/api/health",
+    ]
 
 
 def test_is_port_in_use_checks_both_loopback_families(monkeypatch):
@@ -550,22 +669,17 @@ def test_is_port_in_use_checks_both_loopback_families(monkeypatch):
     assert attempted == ["127.0.0.1", "::1"]
 
 
-class _RecordingClient:
-    """httpx.Client stand-in that records the timeout each probe was given."""
+class _RecordingProbe:
+    """probe_get stand-in that answers 200 and records each probe's timeouts."""
 
-    timeouts: list = []
+    def __init__(self):
+        self.reads: list[float] = []
+        self.connects: list[float | None] = []
 
-    def __init__(self, *args, **kwargs):
-        _RecordingClient.timeouts.append(kwargs.get("timeout"))
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def get(self, url):
-        return MagicMock(status_code=200)
+    def __call__(self, url, *, read_timeout, connect_timeout=None):
+        self.reads.append(read_timeout)
+        self.connects.append(connect_timeout)
+        return ProbeResponse(status_code=200, text="")
 
 
 def test_reclaim_probe_waits_long_enough_for_a_busy_daemon(monkeypatch):
@@ -578,12 +692,12 @@ def test_reclaim_probe_waits_long_enough_for_a_busy_daemon(monkeypatch):
 
     assert daemon_embed_manager.HEALTH_PROBE_TIMEOUT >= 10.0
 
-    _RecordingClient.timeouts = []
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.httpx.Client", _RecordingClient)
+    probe = _RecordingProbe()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", probe)
     monkeypatch.setattr(daemon_embed_manager, "HEALTH_PROBE_TIMEOUT", 25.0)
 
     DaemonEmbedManager._port_health_ok(9177)
-    assert [t.read for t in _RecordingClient.timeouts] == [25.0]
+    assert probe.reads == [25.0]
 
 
 def test_liveness_probes_stay_short(tmp_path, monkeypatch):
@@ -599,14 +713,14 @@ def test_liveness_probes_stay_short(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     manager = DaemonEmbedManager()
 
-    _RecordingClient.timeouts = []
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.httpx.Client", _RecordingClient)
+    probe = _RecordingProbe()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", probe)
 
     assert manager.is_running("hermes") is True
     assert manager.is_ui_running("hermes", 19177) is True
 
-    assert [t.read for t in _RecordingClient.timeouts] == [2.0, 2.0]
-    assert all(t.connect == daemon_embed_manager.PROBE_CONNECT_TIMEOUT for t in _RecordingClient.timeouts)
+    assert probe.reads == [2.0, 2.0]
+    assert all(c == daemon_embed_manager.PROBE_CONNECT_TIMEOUT for c in probe.connects)
 
     # An address that swallows the SYN hangs in connect, not in read, so the
     # connect cap is what bounds the delete handler's three serial probes
@@ -614,3 +728,73 @@ def test_liveness_probes_stay_short(tmp_path, monkeypatch):
     # default client timeout — and below the 4s the two uncapped 2s probes
     # could reach before this change.
     assert daemon_embed_manager.PROBE_CONNECT_TIMEOUT * 3 < 5.0
+
+
+# ── #4344: the probe's decode is pinned, not left to the locale ──────────────
+# `netstat`/`powershell`/`wmic` emit localized text in the console code page. With
+# `text=True` alone the decode uses `locale.getpreferredencoding(False)`, which is
+# `utf-8` in a UTF-8-mode process, and the mismatch raises inside `subprocess`'s own
+# reader thread: the thread dies, `run()` returns with `stdout=None` and returncode 0,
+# and `_windows_listening_pids()` reports no listeners on a host that has plenty.
+
+# A localized zh-CN `netstat -ano -p TCP` answer: cp936 header, ASCII data lines.
+_CP936_NETSTAT = (
+    "\r\n活动连接\r\n\r\n"
+    "  协议  本地地址          外部地址        状态           PID\r\n"
+    "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       4242\r\n"
+    "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4\r\n"
+).encode("cp936")
+
+
+def _emit(payload: bytes) -> list[str]:
+    """A command that writes `payload` to stdout as raw bytes."""
+    import sys as _sys
+
+    return [
+        _sys.executable,
+        "-c",
+        "import sys; sys.stdout.buffer.write(%r); sys.stdout.buffer.flush()" % payload,
+    ]
+
+
+def test_run_probe_reads_output_that_is_not_utf8():
+    """The probe returns the output instead of losing it in a dead reader thread."""
+    output = DaemonEmbedManager._run_probe(_emit(_CP936_NETSTAT))
+
+    assert output is not None
+    # The localized header is replaced rather than raising; the data lines are intact.
+    assert "LISTENING" in output
+    assert "127.0.0.1:8642" in output
+    assert "4242" in output
+
+
+def test_windows_listening_pids_parses_a_localized_netstat(monkeypatch):
+    """The existing parser needs no change: only the header carries non-ASCII."""
+    decoded = _CP936_NETSTAT.decode("utf-8", errors="replace")
+    monkeypatch.setattr(
+        "hindsight_embed.daemon_embed_manager.DaemonEmbedManager._run_probe",
+        staticmethod(lambda cmd, timeout=None: decoded),
+    )
+
+    assert DaemonEmbedManager._windows_listening_pids(8642) == [4242]
+    assert DaemonEmbedManager._windows_listening_pids(445) == [4]
+    assert DaemonEmbedManager._windows_listening_pids(9999) == []
+
+
+def test_run_probe_still_reports_a_failed_command_as_none():
+    """A non-zero exit is still None, so the encoding change did not widen success."""
+    import sys as _sys
+
+    assert DaemonEmbedManager._run_probe([_sys.executable, "-c", "raise SystemExit(3)"]) is None
+
+
+def test_detach_popen_kwargs_pins_stdin():
+    """The daemon child must never inherit the caller's fd 0.
+
+    A caller can hold an fd 0 that is a socket opened with FD_CLOEXEC (e.g. a
+    TUI/gateway parent that wires its IPC channel onto fds 0-2). An inherited
+    fd 0 is closed by the kernel at exec, so the child would start with
+    ``sys.stdin = None`` and crash in ``_redirect_stdio_to_log()``.
+    """
+    kwargs = _detach_popen_kwargs(io.BytesIO())
+    assert kwargs["stdin"] == subprocess.DEVNULL

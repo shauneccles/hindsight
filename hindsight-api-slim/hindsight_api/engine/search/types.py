@@ -28,6 +28,21 @@ class GraphRetrievalTimings:
     hop_details: list[dict] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class GraphRetrieval:
+    """What one graph-retrieval strategy returned, plus how long it took getting there.
+
+    ``timings`` is diagnostics only — every caller but the perf path discards it,
+    and it is ``None`` when instrumentation is off. Pairing it with the results in
+    a bare tuple meant the interesting half was always the one you had to remember
+    came first; a strategy that returned them the other way round would type-check
+    identically against ``tuple[list, X | None]`` at every implementation.
+    """
+
+    results: list["RetrievalResult"]
+    timings: "GraphRetrievalTimings | None" = None
+
+
 @dataclass
 class RetrievalResult:
     """
@@ -65,6 +80,24 @@ class RetrievalResult:
     # stored record's entity ids are already the complete set — satisfies this; one that
     # only stores direct postings must leave this ``None`` for observations.
     entity_ids: list[str] | None = None
+
+    # The memories an OBSERVATION was consolidated from, if the backend carried them.
+    # ``None`` means "not carried" (the default store, and every non-observation result);
+    # a list — possibly empty — means the backend resolved it inline.
+    #
+    # Recall needs this twice for an observation it is about to return: ``prefer_observations``
+    # drops the raw facts an observation supersedes, and ``include_chunks`` walks the sources for
+    # their chunk ids. Both used to re-fetch the observation to read one field off a record the
+    # hydration had already fetched and thrown away. A store that leaves this ``None`` keeps the
+    # re-fetch, so the two paths stay interchangeable rather than one being an approximation.
+    source_memory_ids: list[str] | None = None
+
+    # Short ids of the attachments this fact was drawn from, if the backend carried them.
+    # ``None`` means "not carried" (the default store, which reads them back from
+    # ``memory_units.attachment_ids`` when the response is rendered); a list — possibly
+    # empty — means the backend returned them on the row, so the read surface resolves
+    # them without asking the store again.
+    attachment_ids: list[str] | None = None
 
     # Retrieval-specific scores (only one will be set depending on retrieval method)
     similarity: float | None = None  # Semantic retrieval
@@ -190,6 +223,7 @@ class ScoredResult:
             "chunk_id": self.retrieval.chunk_id,
             "tags": self.retrieval.tags,
             "metadata": self.retrieval.metadata,
+            "attachment_ids": self.retrieval.attachment_ids,
             "semantic_similarity": self.retrieval.similarity,
             "bm25_score": self.retrieval.bm25_score,
         }

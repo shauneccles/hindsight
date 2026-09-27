@@ -2,9 +2,9 @@
 
 Opt-in, fire-and-forget recording of every LLM call Hindsight makes (both
 successes and failures) into the ``llm_requests`` table, per bank. Each row
-captures the input messages, the model output, token usage (input / output /
-cached / total), finish reason, and caller metadata. Disabled by default —
-controlled by ``HINDSIGHT_API_LLM_TRACE_ENABLED``.
+captures the input messages, the model output, token usage (input / visible
+output / cached / thoughts / visible total), finish reason, and caller metadata.
+Disabled by default — controlled by ``HINDSIGHT_API_LLM_TRACE_ENABLED``.
 
 This plugs into the OpenTelemetry **GenAI** recording pattern: providers already
 call ``tracing.get_span_recorder().record_llm_call(...)`` on success, so the DB
@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -105,6 +106,7 @@ class LLMResponseUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
+    thoughts_tokens: int = 0
 
 
 # Per-call provider usage, set by providers right after a response is received.
@@ -134,6 +136,46 @@ def reset_response_usage(token: Token) -> None:
 def current_response_usage() -> LLMResponseUsage | None:
     """Return the active call's provider-reported usage, or None."""
     return _response_usage_ctx.get()
+
+
+@dataclass
+class LLMQueueWait:
+    """Accumulator for time a call spent waiting on LLM concurrency permits."""
+
+    seconds: float = 0.0
+
+
+# Optional per-call sink for permit wait time, bound by a caller that wants to
+# report it. Unset by default, which makes record_queue_wait a no-op.
+_queue_wait_ctx: ContextVar[LLMQueueWait | None] = ContextVar("hindsight_llm_queue_wait_ctx", default=None)
+
+
+def set_queue_wait_sink(sink: LLMQueueWait | None) -> Token:
+    """Collect permit wait time for calls made under this context. Returns a reset token.
+
+    Without a sink, ``duration`` for an LLM call conflates two very different things:
+    time queued behind a concurrency permit and time the request was actually in
+    flight. That ambiguity sent issue #3881 chasing the provider. The worker path has
+    the ``.queued`` stage breadcrumb for this, but ``set_stage`` is a no-op outside a
+    worker task, so a synchronous HTTP request had no signal at all.
+    """
+    return _queue_wait_ctx.set(sink)
+
+
+def reset_queue_wait_sink(token: Token) -> None:
+    """Unwind a binding made by :func:`set_queue_wait_sink`."""
+    _queue_wait_ctx.reset(token)
+
+
+def record_queue_wait(seconds: float) -> None:
+    """Add permit wait time to the active sink. No-op when no caller bound one.
+
+    Accumulates rather than overwrites: a provider that owns its retry loop
+    re-acquires permits per attempt, and the caller wants the total.
+    """
+    sink = _queue_wait_ctx.get()
+    if sink is not None:
+        sink.seconds += seconds
 
 
 def set_trace_context(ctx: LLMTraceContext | None) -> Token:
@@ -281,6 +323,7 @@ class LLMRequestRecord:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None
+    thoughts_tokens: int | None = None
     total_tokens: int | None = None
     llm_info: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -312,6 +355,7 @@ class LLMRequestEntry(BaseModel):
     input_tokens: int | None
     output_tokens: int | None
     cached_tokens: int | None
+    thoughts_tokens: int | None
     total_tokens: int | None
     # Arbitrary JSON (message list, string, or object) — open `Any` so the
     # OpenAPI schema stays a plain open type the Go SDK generator can model.
@@ -338,6 +382,10 @@ class LLMRequestTokenSums(BaseModel):
     input: int
     output: int
     cached: int
+    # Optional so a current generated client can still parse a stats response
+    # from a server predating reasoning usage, which omits the field entirely.
+    # This server always sends it (the SUM is COALESCEd to 0).
+    thoughts: int | None = None
     total: int
 
 
@@ -390,6 +438,14 @@ class LLMTraceRecorder:
         # post-operation UPDATE (otherwise the UPDATE could race ahead of the
         # INSERTs it patches — but it must not block on unrelated operations).
         self._pending: dict[str | None, set[asyncio.Task]] = {}
+        # Trace ids that have actually produced a row. `_pending` cannot answer this: it is
+        # emptied as writes complete, so an absent entry means "nothing in flight", not "nothing
+        # was ever written". Without the distinction, `attach_memory_ids` issues an UPDATE for
+        # every operation that created memories -- including a retain in an extraction mode that
+        # makes no LLM call at all, where it matches zero rows and its only effect is to take a
+        # pooled connection per sub-batch. Bounded, and only ever holds ids: a trace id is ~36
+        # bytes and this is capped, so it cannot grow with traffic.
+        self._rows_written: OrderedDict[str, None] = OrderedDict()
 
     def _writable(self) -> Any | None:
         """Return the pool to write through, or None if writing isn't possible.
@@ -437,6 +493,7 @@ class LLMTraceRecorder:
         error: BaseException | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         cached_tokens: int = 0,
+        thoughts_tokens: int | None = None,
         **_extra: Any,
     ) -> None:
         """Build a trace record from a GenAI call and schedule a DB write."""
@@ -477,12 +534,22 @@ class LLMTraceRecorder:
             trace_id=ctx.trace_id if ctx else None,
             span_id=str(uuid.uuid4()),
             parent_span_id=ctx.operation_span_id if ctx else None,
-            input=messages,
+            # A copy: the row is serialized later, in a background write, and the
+            # reflect loop keeps appending to this same list — its own tool call,
+            # the tool result — so a reference would record messages sent AFTER
+            # this call as if they had been part of its prompt.
+            input=list(messages) if isinstance(messages, list) else messages,
             output=None if error is not None else response_content,
             error=f"{type(error).__name__}: {error}" if error is not None else None,
             input_tokens=input_tokens or None,
             output_tokens=output_tokens or None,
             cached_tokens=cached_tokens or None,
+            # ``or None`` like its siblings: a provider that reports no reasoning
+            # is indistinguishable from one that reports nothing at all (a
+            # transport failure stashes no usage and arrives here as 0), so a
+            # stored 0 would claim a count nobody made. NULL reads uniformly as
+            # "no reasoning usage reported" across old and new rows alike.
+            thoughts_tokens=thoughts_tokens or None,
             total_tokens=(input_tokens + output_tokens) or None,
             llm_info=llm_info,
             metadata=metadata,
@@ -500,6 +567,18 @@ class LLMTraceRecorder:
         key = record.trace_id
         self._pending.setdefault(key, set()).add(task)
         task.add_done_callback(lambda t, k=key: self._discard_pending(k, t))
+        if key:
+            self._mark_rows_written(key)
+
+    _ROWS_WRITTEN_MAX = 4096
+
+    def _mark_rows_written(self, trace_id: str) -> None:
+        self._rows_written[trace_id] = None
+        self._rows_written.move_to_end(trace_id)
+        while len(self._rows_written) > self._ROWS_WRITTEN_MAX:
+            # Evicting the oldest can only cause a MISSED patch on a very long-lived trace, never
+            # a wrong one -- and the patch is best-effort metadata either way.
+            self._rows_written.popitem(last=False)
 
     def _discard_pending(self, key: str | None, task: asyncio.Task) -> None:
         bucket = self._pending.get(key)
@@ -524,12 +603,12 @@ class LLMTraceRecorder:
                         (id, bank_id, operation, scope, trace_id, span_id, parent_span_id,
                          provider, model, status,
                          started_at, ended_at, duration_ms,
-                         input_tokens, output_tokens, cached_tokens, total_tokens,
+                         input_tokens, output_tokens, cached_tokens, thoughts_tokens, total_tokens,
                          input, output, error, llm_info, metadata)
                     VALUES
                         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                         $11, $12, $13, $14, $15, $16, $17,
-                         $18::jsonb, $19::jsonb, $20, $21::jsonb, $22::jsonb)
+                         $11, $12, $13, $14, $15, $16, $17, $18,
+                         $19::jsonb, $20::jsonb, $21, $22::jsonb, $23::jsonb)
                     """,
                     uuid.uuid4(),
                     record.bank_id,
@@ -547,6 +626,7 @@ class LLMTraceRecorder:
                     record.input_tokens,
                     record.output_tokens,
                     record.cached_tokens,
+                    record.thoughts_tokens,
                     record.total_tokens,
                     _safe_json(record.input, self._max_chars),
                     _safe_json(record.output, self._max_chars),
@@ -593,6 +673,11 @@ class LLMTraceRecorder:
         if source_ids:
             patch["source_memory_ids"] = source_ids
         if not patch:
+            return
+        # Nothing was traced, so there is no row to patch. This is the ordinary case for an
+        # extraction mode that calls no LLM: memories are created, so `patch` is non-empty, but
+        # the UPDATE would match zero rows.
+        if trace_ctx.trace_id not in self._rows_written:
             return
         try:
             asyncio.create_task(self._attach_memory_ids(trace_ctx.bank_id, trace_ctx.trace_id, patch))

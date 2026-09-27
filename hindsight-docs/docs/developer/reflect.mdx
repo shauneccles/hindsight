@@ -2,6 +2,8 @@
 sidebar_position: 4
 ---
 
+import {Flow} from '@vectorize-io/interfig';
+import reflectLoop from '@vectorize-io/interfig/figures/reflect';
 import CodeSnippet from '@site/src/components/CodeSnippet';
 import memoryBanksPy from '!!raw-loader!@site/examples/api/memory-banks.py';
 
@@ -9,23 +11,7 @@ import memoryBanksPy from '!!raw-loader!@site/examples/api/memory-banks.py';
 
 When you call `reflect()`, Hindsight runs an **agentic loop** that autonomously gathers evidence and reasons through the lens of the bank's disposition to generate contextual responses.
 
-```mermaid
-graph TB
-    subgraph agent["Reflect Agent Loop"]
-        A[Query] --> B{Need more info?}
-        B -->|Yes| C[Call Tools]
-        C --> D[search_mental_models]
-        C --> E[search_observations]
-        C --> F[recall]
-        C --> G[expand]
-        D --> B
-        E --> B
-        F --> B
-        G --> B
-        B -->|No| H[Generate Response]
-    end
-    H --> I[Response + Citations]
-```
+<Flow {...reflectLoop.props} />
 
 ---
 
@@ -45,7 +31,8 @@ The reflect agent runs in a loop with access to these tools:
 
 | Tool | Purpose | Priority |
 |------|---------|----------|
-| `search_mental_models` | User-curated summaries | Highest (check first) |
+| `search_mental_models` | User-curated summaries — best match in full, a snippet of the others | Highest (check first) |
+| `read_mental_models` | Full text of the pages returned as snippets | When a snippet looks relevant |
 | `search_observations` | Consolidated knowledge | High |
 | `recall` | Raw facts (ground truth) | Fallback |
 | `expand` | Get more context for a memory | As needed |
@@ -268,6 +255,11 @@ The response then carries **both** the prose and the structured view:
 extracts that answer into JSON matching your schema. `structured_output` is therefore always a
 faithful projection of `text` — you get the readable answer **and** a typed object to program
 against, never one instead of the other.
+
+**When extraction fails.** The reflect still returns `200` with the prose answer, no
+`structured_output`, and a `structured_output_error` field saying why (a provider error, a timeout,
+unparseable output). A missing `structured_output` *without* that field means the answer simply held
+nothing matching your schema — so you can retry the broken case without retrying the ordinary one.
 
 **Schema rules.** The schema must be an object with at least one property. Each property's `type`
 is one of `string`, `number`, `integer`, `boolean`, `array`, or `object`, and `required` lists

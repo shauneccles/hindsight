@@ -20,11 +20,19 @@
  *        {user}        $HINDSIGHT_USER_ID or "anonymous"
  *      e.g. "hindsight-{gitProject}" or "{harness}-{gitProject}" to split per agent. The default
  *      is harness-neutral "coding-agent::{gitProject}" so every coding agent shares ONE memory per repo.
+ *
+ * The repository probe (core/git-layout.ts) reads the repository layout off disk and answers one
+ * of three things: this repo, no repo, or "could not tell". Only "no repo" reaches the basename
+ * fallback — a probe that FAILED makes resolution throw `BankResolutionError`, and the lifecycle
+ * hooks skip the session (`deriveBankIdOrSkip`). Guessing there is how a linked worktree ended up
+ * with a permanent bank of its own (#3950): a skipped session is recoverable, a scattered one is not.
  */
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, normalize, sep } from "node:path";
+import { diag } from "./diag";
+import { probeGitLayout } from "./git-layout";
+import { log } from "./log";
 import { applyTemplate } from "./template";
 
 export interface BankConfig {
@@ -44,52 +52,45 @@ const DEFAULT_BANK_NAME = "coding";
 // split memory per agent, defeating cross-agent sharing).
 const DEFAULT_TEMPLATE = "coding-agent::{gitProject}";
 
-/** Main-worktree root for a directory inside a git repo (worktree- and bare-repo-aware), else null. */
-export function getProjectRootFromGit(directory: string): string | null {
-  if (!directory) return null;
-  try {
-    const commonDir = execFileSync(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      {
-        cwd: directory,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 1000,
-        windowsHide: true,
-      }
-    ).trim();
-    if (!commonDir) return null;
-    // Clones + `git worktree add`: common-dir is `<main root>/.git`.
-    if (basename(commonDir) === ".git") return dirname(commonDir);
+/**
+ * The repository a directory belongs to — or WHY there is no answer.
+ *
+ * "This is not a repository" and "the probe did not complete" are different answers and only the
+ * first may reach a fallback: mapping both to `null` is what forked linked worktrees into their
+ * own banks (#3950).
+ */
+export type ProjectRoot =
+  | { status: "resolved"; root: string }
+  | { status: "absent" }
+  | { status: "failed"; reason: string };
 
-    // A bare-hub keeps its bare repository in a hidden plumbing directory (usually `.bare`),
-    // while a standalone bare clone uses its directory name as the project identity. Check the
-    // common dir itself because a linked worktree reports `false` for --is-bare-repository.
-    if (basename(commonDir).startsWith(".") && isBareRepository(commonDir)) {
-      return dirname(commonDir);
-    }
-
-    // Preserve the historical name for standalone bare repositories such as `myrepo.git`.
-    return commonDir;
-  } catch {
-    return null;
+/** Thrown when a repository could not be identified because the PROBE failed. Callers on the
+ *  retain path skip the session rather than invent a bank: a skipped session is recoverable, a
+ *  session scattered into a bank nobody reads is not. */
+export class BankResolutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BankResolutionError";
   }
 }
 
-function isBareRepository(commonDir: string): boolean {
-  try {
-    return (
-      execFileSync("git", ["-C", commonDir, "rev-parse", "--is-bare-repository"], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 1000,
-        env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined },
-      }).trim() === "true"
-    );
-  } catch {
-    return false;
+/** Main-worktree root for a directory inside a git repo (worktree- and bare-repo-aware). */
+export function resolveProjectRoot(directory: string): ProjectRoot {
+  if (!directory) return { status: "absent" };
+  const layout = probeGitLayout(directory);
+  if (layout.status !== "resolved") return layout;
+  const commonDir = layout.commonDir;
+  // Clones + `git worktree add`: common-dir is `<main root>/.git`.
+  if (basename(commonDir) === ".git") return { status: "resolved", root: dirname(commonDir) };
+
+  // A bare-hub keeps its bare repository in a hidden plumbing directory (usually `.bare`), while a
+  // standalone bare clone uses its directory name as the project identity.
+  if (basename(commonDir).startsWith(".") && layout.bare) {
+    return { status: "resolved", root: dirname(commonDir) };
   }
+
+  // Preserve the historical name for standalone bare repositories such as `myrepo.git`.
+  return { status: "resolved", root: commonDir };
 }
 
 /** Worktree-aware repo name for DOCUMENT IDS (gitlog:<name>, commit context): all worktrees of a
@@ -153,23 +154,37 @@ function dirName(directory: string): string {
  * exported roots are a last rescue, not a new source of truth — and both name the CURRENT
  * session's own project, so neither can reach a repo this session was not already working in.
  */
-function mainWorktreeRoot(directory: string, sessionRoot = ""): string | null {
+function mainWorktreeRoot(directory: string, sessionRoot = ""): ProjectRoot {
   const candidates = [
     nearestExistingDir(directory),
     sessionRoot,
     ...PROJECT_ROOT_ENV.map((v) => process.env[v] || ""),
   ];
+  // A failure anywhere in the cascade is remembered but not returned early: a later candidate may
+  // still answer, and only when NONE does does the difference between "no repository here" and
+  // "could not tell" matter.
+  let failure: ProjectRoot | null = null;
   for (const candidate of candidates) {
-    const root = candidate ? getProjectRootFromGit(candidate) : null;
-    if (root) return root;
+    if (!candidate) continue;
+    const projectRoot = resolveProjectRoot(candidate);
+    if (projectRoot.status === "resolved") return projectRoot;
+    if (projectRoot.status === "failed") failure = projectRoot;
   }
-  return null;
+  return failure ?? { status: "absent" };
 }
 
 function gitProjectName(directory: string, resolveWorktrees: boolean, sessionRoot = ""): string {
   if (resolveWorktrees) {
-    const root = mainWorktreeRoot(directory, sessionRoot);
-    if (root) return basename(root);
+    const projectRoot = mainWorktreeRoot(directory, sessionRoot);
+    if (projectRoot.status === "resolved") return basename(projectRoot.root);
+    // The fallback below is right for a directory outside any repository and WRONG for a failed
+    // probe inside one — for a linked worktree it names the worktree instead of the repo, forking
+    // it into a bank of its own, forever and silently (#3950). Refuse to guess instead.
+    if (projectRoot.status === "failed") {
+      throw new BankResolutionError(
+        `git probe failed for ${directory} (${projectRoot.reason}) — refusing to guess a bank id`
+      );
+    }
   }
   // Nothing git can name. `directory` is the agent's LIVE working directory and it moves during
   // normal work; inside a repo that was harmless because every subdirectory resolved back to the
@@ -212,8 +227,10 @@ function mapLookup(map: Record<string, string>, directory: string): string | und
 function lookupDirectories(config: BankConfig, directory: string, sessionRoot = ""): string[] {
   const directories = [normalize(directory)];
   if (config.resolveWorktrees ?? true) {
-    const root = mainWorktreeRoot(directory, sessionRoot);
-    const normalizedRoot = root ? normalize(root) : "";
+    // Deliberately failure-tolerant, unlike bank naming: approval and mapping fall back to the
+    // literal directory, which can only ever be narrower than the repo-wide answer.
+    const projectRoot = mainWorktreeRoot(directory, sessionRoot);
+    const normalizedRoot = projectRoot.status === "resolved" ? normalize(projectRoot.root) : "";
     if (normalizedRoot && normalizedRoot !== directories[0]) directories.push(normalizedRoot);
   }
   return directories;
@@ -251,6 +268,20 @@ export function isOptedIn(config: BankConfig, directory: string): boolean {
   return Boolean(pathMap && directories.some((candidate) => mapLookup(pathMap, candidate)));
 }
 
+/** The `mapPathToBank` destination for a directory, if any — resolution step 1, shared by
+ *  `deriveBankId` and `bankProjectName` so the two cannot disagree about which step applied. */
+function mappedBank(
+  config: BankConfig,
+  directory: string,
+  sessionRoot?: string
+): string | undefined {
+  const pathMap = config.mapPathToBank;
+  if (!directory || !pathMap) return undefined;
+  return lookupDirectories(config, directory, sessionRoot)
+    .map((candidate) => mapLookup(pathMap, candidate))
+    .find((bank) => bank !== undefined);
+}
+
 /** Derive the bank id for a working directory (see module doc for the resolution order). */
 export function deriveBankId(
   config: BankConfig,
@@ -262,13 +293,7 @@ export function deriveBankId(
    *  entry this directory inherits (lookupDirectories). */
   sessionRoot?: string
 ): string {
-  const pathMap = config.mapPathToBank;
-  const mapped =
-    directory && pathMap
-      ? lookupDirectories(config, directory, sessionRoot)
-          .map((candidate) => mapLookup(pathMap, candidate))
-          .find((bank) => bank !== undefined)
-      : undefined;
+  const mapped = mappedBank(config, directory, sessionRoot);
   if (mapped) return mapped;
 
   // dynamic by default — but an explicit bankId (without dynamicBankId: true) means "static".
@@ -283,4 +308,73 @@ export function deriveBankId(
     user: () => process.env.HINDSIGHT_USER_ID || "anonymous",
   };
   return applyTemplate(config.bankIdTemplate || DEFAULT_TEMPLATE, resolvers, "bankIdTemplate");
+}
+
+/**
+ * The repository a BANK is about, or undefined when no single repository is.
+ *
+ * Distinct from `deriveBankId`'s `{gitProject}` in what it is a property OF. Both read the session's
+ * working directory, but a bank id derived from `{gitProject}` moves with the directory in lockstep
+ * with this name, so the two can never disagree; a bank id that does NOT come from the directory —
+ * a static `bankId`, a `mapPathToBank` destination, a template keyed on `{channel}` — can collect
+ * several repositories, and naming one of them after whichever session happened to run last is how
+ * the seeded knowledge pages ended up flipping their scope sentence between repos on every session
+ * start (#4146). Callers write this into per-BANK state, so it may only be answered when the bank
+ * and the repository are the same unit; `undefined` means "this bank is not one repo's" and leaves
+ * the caller to name it some other way.
+ *
+ * Deliberately failure-tolerant where `deriveBankId` refuses to guess: a probe that cannot name the
+ * repository yields `undefined` rather than throwing, because the strict rule protects bank
+ * IDENTITY (#3950) and nothing here decides which bank is written to.
+ */
+export function bankProjectName(
+  config: BankConfig,
+  directory: string,
+  sessionRoot?: string
+): string | undefined {
+  if (mappedBank(config, directory, sessionRoot)) return undefined;
+
+  const dynamic = config.dynamicBankId ?? !config.bankId;
+  if (!dynamic) return undefined;
+
+  // Only `{gitProject}` ties the id to the repository. `{project}` is the live directory basename
+  // and names a subdirectory as readily as a repo, so it does not qualify.
+  const template = config.bankIdTemplate || DEFAULT_TEMPLATE;
+  if (!template.includes("{gitProject}")) return undefined;
+
+  try {
+    // The IDENTICAL call `deriveBankId` makes for the placeholder, `resolveWorktrees` and
+    // `sessionRoot` included — a second, subtly different derivation is the bug being fixed.
+    return gitProjectName(directory, config.resolveWorktrees ?? true, sessionRoot);
+  } catch (error) {
+    if (error instanceof BankResolutionError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * `deriveBankId`, or null when the repository could not be identified — with a `warn` and a diag
+ * event so the miss is diagnosable in minutes rather than by cross-referencing bank creation
+ * timestamps against a log file.
+ *
+ * The lifecycle hooks (SessionStart, prompt, retain) use this: skipping a session loses one
+ * session's memory and heals on the next hook, while guessing a bank id scatters it permanently.
+ */
+export function deriveBankIdOrSkip(
+  config: BankConfig,
+  directory: string,
+  harness = "coding",
+  sessionRoot?: string
+): string | null {
+  try {
+    return deriveBankId(config, directory, harness, sessionRoot);
+  } catch (error) {
+    if (!(error instanceof BankResolutionError)) throw error;
+    log.warn(harness, "bank unresolved: skipping (repository could not be identified)", {
+      directory,
+      error: error.message,
+    });
+    diag(harness, "bank_unresolved", { directory, error: error.message });
+    return null;
+  }
 }

@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.9.2
+  version: 0.10.1
 servers:
 - url: /
 paths:
@@ -70,6 +70,102 @@ paths:
                 $ref: '#/components/schemas/VersionResponse'
           description: Successful Response
       summary: Get API version and feature flags
+      tags:
+      - Monitoring
+  /v1/default/llm-concurrency:
+    delete:
+      description: Restore the process-wide LLM concurrency cap to HINDSIGHT_API_LLM_MAX_CONCURRENT.
+      operationId: reset_llm_concurrency
+      parameters:
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMConcurrencyResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Reset LLM concurrency
+      tags:
+      - Monitoring
+    get:
+      description: "The process-wide cap on concurrent LLM calls, its configured default,\
+        \ and live usage. Always available: HINDSIGHT_API_ENABLE_LLM_CONCURRENCY_API\
+        \ gates only the write operations on this resource."
+      operationId: get_llm_concurrency
+      parameters:
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMConcurrencyResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get LLM concurrency
+      tags:
+      - Monitoring
+    patch:
+      description: "Resize the process-wide cap on concurrent LLM calls without a\
+        \ restart. In-flight calls are never interrupted: lowering the cap stops new\
+        \ calls from starting until usage is under it, and raising it starts waiting\
+        \ calls immediately. Not persisted: a restart restores HINDSIGHT_API_LLM_MAX_CONCURRENT."
+      operationId: update_llm_concurrency
+      parameters:
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LLMConcurrencyUpdate'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMConcurrencyResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Update LLM concurrency
       tags:
       - Monitoring
   /metrics:
@@ -176,6 +272,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/GraphDataResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -188,8 +286,9 @@ paths:
   /v1/default/banks/{bank_id}/memories/list:
     get:
       description: "List memory units with pagination and optional full-text search.\
-        \ Supports filtering by type, source document, and linked entity ID. Results\
-        \ are sorted by most recent first (mentioned_at DESC, then created_at DESC)."
+        \ Supports filtering by type, source document, linked entity ID, and a time\
+        \ window. Results are sorted by most recent first (mentioned_at DESC, then\
+        \ created_at DESC) unless a time window selects another axis."
       operationId: list_memories
       parameters:
       - explode: false
@@ -273,6 +372,44 @@ paths:
           title: Tags Match
           type: string
         style: form
+      - description: "Time axis to filter and order by. `created_at` / `updated_at`\
+          \ = ingest and last-write time; `mentioned_at` / `occurred_start` / `occurred_end`\
+          \ = event time. Defaults to `created_at` when only `start_date`/`end_date`\
+          \ are given. Filtering and ordering both follow `time_field`, and rows with\
+          \ no value on that column are excluded — so `total` counts only rows carrying\
+          \ that timestamp, and can be 0 on a bank that is not empty."
+        explode: true
+        in: query
+        name: time_field
+        required: false
+        schema:
+          enum:
+          - created_at
+          - updated_at
+          - mentioned_at
+          - occurred_start
+          - occurred_end
+          nullable: true
+          type: string
+        style: form
+      - description: Filter from this ISO datetime (inclusive)
+        explode: true
+        in: query
+        name: start_date
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: Filter until this ISO datetime (exclusive)
+        explode: true
+        in: query
+        name: end_date
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
       - explode: true
         in: query
         name: limit
@@ -308,6 +445,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ListMemoryUnitsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -365,6 +504,55 @@ paths:
       summary: "Dry-run fact extraction (preview, no persistence)"
       tags:
       - Memory
+  /v1/default/banks/{bank_id}/prompts/preview:
+    post:
+      description: "Render the exact system and user messages retain, consolidation\
+        \ or reflect would send for this bank, without calling an LLM, reading memories,\
+        \ or changing anything. Everything that shapes the prompt comes from the bank;\
+        \ the runtime data an operation would be given is a fixed placeholder. Both\
+        \ messages are returned: retain and consolidation keep their system prompt\
+        \ bank-agnostic (one provider-side cache serves every bank) and carry the\
+        \ mission in the user message instead."
+      operationId: preview_prompt
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromptPreviewRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromptPreviewResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Preview an operation's prompts (no LLM call)
+      tags:
+      - Banks
   /v1/default/banks/{bank_id}/memories/{memory_id}:
     get:
       description: "Get a single memory unit by ID with all its metadata including\
@@ -715,6 +903,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/BankStatsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -821,6 +1011,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/MemoriesTimeseriesResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -883,6 +1075,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/EntityListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -944,6 +1138,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/EntityGraphResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1085,16 +1281,18 @@ paths:
           title: Tags Match
           type: string
         style: form
-      - description: "Detail level: 'metadata' (names/tags only), 'content' (adds\
-          \ content/config), 'full' (includes reflect_response)"
+      - description: "Detail level: 'metadata' (names/tags/staleness — the default),\
+          \ 'content' (adds content/config), 'full' (includes reflect_response). Content\
+          \ is opt-in: it is returned only when explicitly requested."
         explode: true
         in: query
         name: detail
         required: false
         schema:
-          default: full
-          description: "Detail level: 'metadata' (names/tags only), 'content' (adds\
-            \ content/config), 'full' (includes reflect_response)"
+          default: metadata
+          description: "Detail level: 'metadata' (names/tags/staleness — the default),\
+            \ 'content' (adds content/config), 'full' (includes reflect_response).\
+            \ Content is opt-in: it is returned only when explicitly requested."
           enum:
           - metadata
           - content
@@ -1138,6 +1336,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/MentalModelListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1564,6 +1764,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/KnowledgeTreeResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1689,6 +1891,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/KnowledgePageBundleResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1752,6 +1956,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/KnowledgePageSearchResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1997,6 +2203,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/DirectiveListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2188,9 +2396,10 @@ paths:
       - Directives
   /v1/default/banks/{bank_id}/documents:
     get:
-      description: "List documents with pagination and optional search, most recently\
-        \ written first (`updated_at` descending). Documents are the source content\
-        \ from which memory units are extracted."
+      description: "List documents with pagination, optional search, and an optional\
+        \ time window. Most recently written first (`updated_at` descending) unless\
+        \ `time_field` selects another axis. Documents are the source content from\
+        \ which memory units are extracted."
       operationId: list_documents
       parameters:
       - explode: false
@@ -2233,6 +2442,40 @@ paths:
           title: Tags Match
           type: string
         style: form
+      - description: "Time axis to filter and order by: `created_at` (when the document\
+          \ first arrived) or `updated_at` (its last write, the default ordering).\
+          \ Filtering and ordering both follow `time_field`, and rows with no value\
+          \ on that column are excluded — so `total` counts only rows carrying that\
+          \ timestamp, and can be 0 on a bank that is not empty."
+        explode: true
+        in: query
+        name: time_field
+        required: false
+        schema:
+          enum:
+          - created_at
+          - updated_at
+          nullable: true
+          type: string
+        style: form
+      - description: Filter from this ISO datetime (inclusive)
+        explode: true
+        in: query
+        name: start_date
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: Filter until this ISO datetime (exclusive)
+        explode: true
+        in: query
+        name: end_date
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
       - explode: true
         in: query
         name: limit
@@ -2268,6 +2511,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ListDocumentsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2496,7 +2741,9 @@ paths:
       description: |-
         Update mutable fields on a document without re-processing its content.
 
-        **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+        **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
+
+        The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
 
         At least one field must be provided.
       operationId: update_document
@@ -2628,6 +2875,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ListTagsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2760,6 +3009,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/OperationsListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2771,7 +3022,12 @@ paths:
       - Operations
   /v1/default/banks/{bank_id}/operations/{operation_id}:
     delete:
-      description: Cancel a pending async operation by removing it from the queue
+      description: "Cancel a queued or running async operation. A 'pending' operation\
+        \ is never started. A 'processing' one is cancelled cooperatively: the row\
+        \ is marked 'cancelled' immediately and the worker running it stops at its\
+        \ next checkpoint, so work already in flight may finish the batch it is on.\
+        \ This also clears operations stranded in 'processing' by a crashed worker.\
+        \ Returns 409 for operations that already reached a terminal state."
       operationId: cancel_operation
       parameters:
       - explode: false
@@ -2811,7 +3067,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
-      summary: Cancel a pending async operation
+      summary: Cancel a pending or in-flight async operation
       tags:
       - Operations
     get:
@@ -2968,8 +3224,12 @@ paths:
   /v1/default/banks/{bank_id}/profile:
     get:
       deprecated: true
-      description: Get disposition traits and mission for a memory bank. Returns 404
-        if the bank does not exist.
+      description: "**Removed.** The bank profile endpoints have been removed. Disposition\
+        \ traits and the reflect mission are bank configuration: read them from GET\
+        \ /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`,\
+        \ `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config.\
+        \ The `name` field this endpoint also returned was a display-only label; read\
+        \ it from GET /v1/default/banks."
       operationId: get_bank_profile
       parameters:
       - explode: false
@@ -3001,12 +3261,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
-      summary: Get memory bank profile
+      summary: Get memory bank profile (removed — use GET .../config)
       tags:
       - Banks
     put:
       deprecated: true
-      description: "Update bank's disposition traits (skepticism, literalism, empathy)"
+      description: "**Removed.** The bank profile endpoints have been removed. Disposition\
+        \ traits and the reflect mission are bank configuration: read them from GET\
+        \ /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`,\
+        \ `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config.\
+        \ The `name` field this endpoint also returned was a display-only label; read\
+        \ it from GET /v1/default/banks."
       operationId: update_bank_disposition
       parameters:
       - explode: false
@@ -3044,14 +3309,17 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
-      summary: Update memory bank disposition
+      summary: Update memory bank disposition (removed — use PATCH .../config)
       tags:
       - Banks
   /v1/default/banks/{bank_id}/background:
     post:
       deprecated: true
-      description: "Deprecated: Use PUT /mission instead. This endpoint now updates\
-        \ the mission field."
+      description: "**Removed.** The bank background was folded into the reflect mission.\
+        \ Write it with PATCH /v1/default/banks/{bank_id}/config as `reflect_mission`.\
+        \ That call replaces the value rather than merging into it, so read the current\
+        \ mission from GET .../config first if you relied on this endpoint's append\
+        \ behaviour."
       operationId: add_bank_background
       parameters:
       - explode: false
@@ -3089,7 +3357,191 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
-      summary: Add/merge memory bank background (deprecated)
+      summary: Add/merge memory bank background (removed — use PATCH .../config)
+      tags:
+      - Banks
+  /v1/default/banks/{bank_id}/aliases:
+    get:
+      description: "Extra bank ids that reach this bank. Every endpoint accepts an\
+        \ alias wherever it accepts a bank id, so callers can be moved onto a new\
+        \ id in phases while the old one keeps working."
+      operationId: list_bank_aliases
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankAliasesResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List the bank's aliases
+      tags:
+      - Banks
+    post:
+      description: |-
+        Give the bank another id to answer to. Nothing is copied or moved: the bank keeps its own id and all of its data, and the alias is only a second way to reach it — which is what makes it a zero-downtime alternative to renaming.
+
+        Returns 409 if the name is already a bank or another alias.
+      operationId: create_bank_alias
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBankAliasRequest'
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankAliasesResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Add an alias to the bank
+      tags:
+      - Banks
+  /v1/default/banks/{bank_id}/aliases/{alias}:
+    delete:
+      description: "Stop an id reaching this bank. The bank and its memories are untouched;\
+        \ only the extra name goes away, and callers still using it get the same 404\
+        \ (or new empty bank) they would have got before it existed."
+      operationId: delete_bank_alias
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: alias
+        required: true
+        schema:
+          title: Alias
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankAliasesResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Remove an alias from the bank
+      tags:
+      - Banks
+    patch:
+      description: |-
+        Present the bank under one of its aliases. Purely cosmetic: the bank keeps its own `bank_id`, which every other part of the system — authorisation, metering, exports, audit logs — continues to use.
+
+        Promoting an alias demotes whichever one was shown before, so a bank is presented under at most one alias. Send `primary: false` to go back to showing its own id.
+      operationId: set_bank_alias_primary
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: alias
+        required: true
+        schema:
+          title: Alias
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetBankAliasPrimaryRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankAliasesResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Show this alias in place of the bank id
       tags:
       - Banks
   /v1/default/banks/{bank_id}:
@@ -3253,6 +3705,12 @@ paths:
           nullable: true
           type: string
         style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BankTemplateManifest'
+        required: true
       responses:
         "200":
           content:
@@ -3299,6 +3757,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/BankTemplateManifest'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -3351,6 +3811,7 @@ paths:
       tags:
       - Document Transfer
     post:
+      deprecated: true
       description: "Submit a transfer archive (produced by the export endpoint) for\
         \ import into a bank. Runs as a background operation: facts are re-embedded\
         \ with the target bank's embedding model and entities are re-resolved — no\
@@ -3410,6 +3871,7 @@ paths:
       - Document Transfer
   /v1/default/banks/{bank_id}/document-transfer/export:
     post:
+      deprecated: true
       description: "Submit an async export of a bank's documents (extracted facts,\
         \ entity names, causal links, chunks) as a transfer ZIP archive. Embeddings\
         \ and database ids are not included — importing re-embeds with the target\
@@ -3493,6 +3955,350 @@ paths:
       summary: Export documents (async)
       tags:
       - Document Transfer
+  /v1/default/banks/{bank_id}/transfer/export:
+    post:
+      description: "Submit an async export of a bank as a transfer ZIP archive. Three\
+        \ flags choose what the archive carries: include_data (documents, facts, observations,\
+        \ attachments and their bytes, the curation archive, the operations log and\
+        \ the maintenance queues), include_bank_config (bank config, mental models\
+        \ and their history, knowledge pages), include_bank_config (the bank's config\
+        \ overrides, directives and webhooks) and include_history (audit_log, llm_requests).\
+        \ Embeddings and database ids are never carried — importing re-embeds with\
+        \ the target bank's model and re-resolves entities, so an archive moves between\
+        \ instances configured with different embedding models. Returns an operation_id;\
+        \ poll GET /v1/default/banks/{bank_id}/operations/{operation_id}, then fetch\
+        \ the archive from the download_url in its result_metadata. Pass document_id\
+        \ to export specific documents instead of the whole bank (a document subset\
+        \ carries no bank-level sections)."
+      operationId: export_bank_transfer
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: Carry the memories and everything backing them
+        explode: true
+        in: query
+        name: include_data
+        required: false
+        schema:
+          default: true
+          description: Carry the memories and everything backing them
+          title: Include Data
+          type: boolean
+        style: form
+      - description: "Carry the bank's config overrides, directives and webhooks"
+        explode: true
+        in: query
+        name: include_bank_config
+        required: false
+        schema:
+          default: true
+          description: "Carry the bank's config overrides, directives and webhooks"
+          title: Include Bank Config
+          type: boolean
+        style: form
+      - description: Carry audit_log and llm_requests
+        explode: true
+        in: query
+        name: include_history
+        required: false
+        schema:
+          default: false
+          description: Carry audit_log and llm_requests
+          title: Include History
+          type: boolean
+        style: form
+      - description: Document id(s); omit for the whole bank
+        explode: true
+        in: query
+        name: document_id
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankTransferSubmitResponse'
+          description: Successful Response
+        "404":
+          description: The bank does not exist.
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Export a bank (async)
+      tags:
+      - Bank Transfer
+  /v1/default/banks/{bank_id}/transfer/import:
+    post:
+      description: |-
+        Submit a transfer archive (produced by the export endpoint) for import. Runs as a background operation: facts are re-embedded with the target bank's embedding model and entities are re-resolved — no LLM extraction, so the import costs no tokens and invents no new facts.
+
+        Two modes. `restore` (default) writes a whole bank into target_bank_id, which must NOT already exist — it restores a bank rather than merging into one, and is how a bank is moved between instances or copied under a new id. `merge` folds an archive's documents into this bank, with document_conflict deciding what happens to ids that already exist (skip, replace, new-id).
+
+        The include flags narrow what is restored to a subset of what the archive holds; they cannot add what the producer did not export. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and per-component counts. The operation is recorded against {bank_id} even in restore mode, because the target bank does not exist yet.
+      operationId: import_bank_transfer
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: restore (into a fresh bank) | merge (into this bank)
+        explode: true
+        in: query
+        name: mode
+        required: false
+        schema:
+          default: restore
+          description: restore (into a fresh bank) | merge (into this bank)
+          title: Mode
+          type: string
+        style: form
+      - description: "restore mode: the bank to create; defaults to the archive's\
+          \ source bank"
+        explode: true
+        in: query
+        name: target_bank_id
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - description: "merge mode: skip | replace | new-id"
+        explode: true
+        in: query
+        name: document_conflict
+        required: false
+        schema:
+          default: skip
+          description: "merge mode: skip | replace | new-id"
+          title: Document Conflict
+          type: string
+        style: form
+      - description: "restore mode: carry the memories and everything backing them\
+          \ (default true)"
+        explode: true
+        in: query
+        name: include_data
+        required: false
+        schema:
+          nullable: true
+          type: boolean
+        style: form
+      - description: "restore mode: restore the bank's config overrides, directives\
+          \ and webhooks (default true)"
+        explode: true
+        in: query
+        name: include_bank_config
+        required: false
+        schema:
+          nullable: true
+          type: boolean
+        style: form
+      - description: "restore mode: carry audit_log and llm_requests (default false)"
+        explode: true
+        in: query
+        name: include_history
+        required: false
+        schema:
+          nullable: true
+          type: boolean
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_import_bank_transfer'
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankTransferSubmitResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Import a bank (async)
+      tags:
+      - Bank Transfer
+  /v1/default/banks/{bank_id}/clone:
+    post:
+      description: |-
+        Copy this bank into a new one, in a single call. The clone starts with the source's memories as they are at clone time and evolves independently from then on: later retains, consolidation and edits on either bank leave the other alone.
+
+        This is the export and import above run back to back on this instance, so nothing is re-extracted and no LLM is called — facts are re-embedded and entities re-resolved, exactly as a restore does. The same three flags choose what the clone inherits: include_data (documents, facts, observations, attachments, the curation archive, the operations log, and the mental models and knowledge pages synthesized from them), include_bank_config (the bank's config overrides, directives and **webhooks**) and include_history (audit_log, llm_requests).
+
+        Note the webhooks: they travel with the bank's configuration, so a clone made with the default flags will call the source's webhook endpoints. Pass include_bank_config=false, or delete them on the clone, when they point at a per-bank consumer.
+
+        target_bank_id must not already exist. Returns an operation_id, recorded against the source bank (the target does not exist yet); poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and the per-component counts.
+      operationId: clone_bank
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: Bank to create; must not already exist
+        explode: true
+        in: query
+        name: target_bank_id
+        required: true
+        schema:
+          description: Bank to create; must not already exist
+          title: Target Bank Id
+          type: string
+        style: form
+      - description: "Copy the memories, what backs them, and the mental models and\
+          \ knowledge pages synthesized from them"
+        explode: true
+        in: query
+        name: include_data
+        required: false
+        schema:
+          default: true
+          description: "Copy the memories, what backs them, and the mental models\
+            \ and knowledge pages synthesized from them"
+          title: Include Data
+          type: boolean
+        style: form
+      - description: "Copy the bank's config overrides, directives and webhooks"
+        explode: true
+        in: query
+        name: include_bank_config
+        required: false
+        schema:
+          default: true
+          description: "Copy the bank's config overrides, directives and webhooks"
+          title: Include Bank Config
+          type: boolean
+        style: form
+      - description: Copy audit_log and llm_requests
+        explode: true
+        in: query
+        name: include_history
+        required: false
+        schema:
+          default: false
+          description: Copy audit_log and llm_requests
+          title: Include History
+          type: boolean
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankTransferSubmitResponse'
+          description: Successful Response
+        "404":
+          description: The bank does not exist.
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Clone a bank (async)
+      tags:
+      - Bank Transfer
+  /v1/default/banks/{bank_id}/attachments/{attachment_id}:
+    get:
+      description: |-
+        Serve the bytes of an attachment retained as inline content. The id is the one inside a placeholder token, and is returned on `attachments[].url` by recall and by the document/chunk/memory reads — so an agent can show or reason over the original behind an attachment-derived fact.
+
+        Bytes are served with the Content-Type the caller declared at retain. Access is authorized against the bank; a missing attachment and an invisible bank both return 404, so the endpoint cannot be used to probe what a bank holds.
+      operationId: get_bank_attachment
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - explode: false
+        in: path
+        name: attachment_id
+        required: true
+        schema:
+          title: Attachment Id
+          type: string
+        style: simple
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/octet-stream:
+              schema:
+                format: binary
+                type: string
+          description: Attachment bytes
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Fetch an attachment retained inline with a document
+      tags:
+      - Memory
   /v1/default/files/download/{key}:
     get:
       description: Stream a file previously written to file storage — currently the
@@ -3520,9 +4326,10 @@ paths:
       responses:
         "200":
           content:
-            application/json:
-              schema: {}
-            application/zip: {}
+            application/zip:
+              schema:
+                format: binary
+                type: string
           description: Stored file
         "422":
           content:
@@ -3592,8 +4399,78 @@ paths:
         \ with. Returns every distinct scope (tag order normalized) with the number\
         \ of observations in it; the empty tag list is the global/untagged scope.\
         \ Use a returned scope with the graph endpoint (tags=<scope> & tags_match=exact)\
-        \ to filter observations to exactly that scope."
+        \ to filter observations to exactly that scope. Paged: `total` reports every\
+        \ distinct scope in the bank."
       operationId: list_observation_scopes
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: Maximum number of scopes to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Maximum number of scopes to return
+          maximum: 1000
+          minimum: 0
+          title: Limit
+          type: integer
+        style: form
+      - description: Offset for pagination
+        explode: true
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Offset for pagination
+          minimum: 0
+          title: Offset
+          type: integer
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationScopesResponse'
+          description: Successful Response
+        "404":
+          description: The bank does not exist.
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: List observation scopes
+      tags:
+      - Memory
+  /v1/default/banks/{bank_id}/consolidation-strategies/preview:
+    post:
+      description: "Report which of the bank's existing observation scopes each consolidation\
+        \ strategy would apply to, for a draft `consolidation_strategies` value (nothing\
+        \ is saved). Uses the same matching and first-strategy-wins rule as consolidation.\
+        \ Scans up to 10,000 distinct scopes; `complete` is false beyond that and\
+        \ the counts are lower bounds. Scopes with no observations yet do not exist\
+        \ and are not counted."
+      operationId: preview_consolidation_strategies
       parameters:
       - explode: false
         in: path
@@ -3611,20 +4488,28 @@ paths:
           nullable: true
           type: string
         style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConsolidationStrategiesPreviewRequest'
+        required: true
       responses:
         "200":
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ObservationScopesResponse'
+                $ref: '#/components/schemas/ConsolidationStrategiesPreview'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
-      summary: List observation scopes
+      summary: Preview consolidation strategies
       tags:
       - Memory
   /v1/default/banks/{bank_id}/consolidation/recover:
@@ -3754,9 +4639,11 @@ paths:
       tags:
       - Banks
     get:
-      description: Get fully resolved configuration for a bank including all hierarchical
-        overrides (global → tenant → bank). The 'config' field contains all resolved
-        config values. The 'overrides' field shows only bank-specific overrides.
+      description: "Get fully resolved configuration for a bank including all hierarchical\
+        \ overrides (global → tenant → bank). The 'config' field contains all resolved\
+        \ config values. The 'overrides' field shows only bank-specific overrides.\
+        \ Always available: HINDSIGHT_API_ENABLE_BANK_CONFIG_API gates only the write\
+        \ operations on this resource."
       operationId: get_bank_config
       parameters:
       - explode: false
@@ -3782,6 +4669,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/BankConfigResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -3881,7 +4770,8 @@ paths:
       - Banks
   /v1/default/banks/{bank_id}/webhooks:
     get:
-      description: List all webhooks registered for a bank.
+      description: "List the webhooks registered for a bank, oldest first. Paged:\
+        \ `total` reports every webhook on the bank."
       operationId: list_webhooks
       parameters:
       - explode: false
@@ -3892,6 +4782,31 @@ paths:
           title: Bank Id
           type: string
         style: simple
+      - description: Maximum number of webhooks to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 100
+          description: Maximum number of webhooks to return
+          maximum: 1000
+          minimum: 0
+          title: Limit
+          type: integer
+        style: form
+      - description: Offset for pagination
+        explode: true
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Offset for pagination
+          minimum: 0
+          title: Offset
+          type: integer
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -3907,6 +4822,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/WebhookListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4397,6 +5314,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/AuditLogListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4454,6 +5373,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/AuditLogStatsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4612,6 +5533,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/LLMRequestListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4669,6 +5592,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/LLMRequestStatsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4911,6 +5836,47 @@ components:
       required:
       - mission
       title: BackgroundResponse
+    BankAliasEntry:
+      description: One id a bank answers to.
+      properties:
+        alias:
+          title: Alias
+          type: string
+        primary:
+          default: false
+          description: "Whether this alias is shown in place of the bank's own id.\
+            \ Display only — the bank keeps its id, and everything that names a bank\
+            \ still uses it. At most one alias per bank can be primary, and none has\
+            \ to be."
+          title: Primary
+          type: boolean
+      required:
+      - alias
+      title: BankAliasEntry
+    BankAliasesResponse:
+      description: Response model for a bank's aliases.
+      example:
+        aliases:
+        - alias: user-123
+          primary: true
+        - alias: legacy-user123
+          primary: false
+        bank_id: user123
+      properties:
+        bank_id:
+          description: "The bank's own id, which an alias never replaces"
+          title: Bank Id
+          type: string
+        aliases:
+          description: "Extra ids that also reach this bank, the primary one first\
+            \ then oldest first"
+          items:
+            $ref: '#/components/schemas/BankAliasEntry'
+          type: array
+      required:
+      - aliases
+      - bank_id
+      title: BankAliasesResponse
     BankConfigResponse:
       description: Response model for bank configuration.
       example:
@@ -4985,6 +5951,17 @@ components:
         last_write_at:
           nullable: true
           type: string
+        display_alias:
+          nullable: true
+          type: string
+        matched_aliases:
+          description: "Aliases of this bank that matched the search `q`. Empty when\
+            \ no search was made, or when the bank matched on its own id or name —\
+            \ so a non-empty value explains a result whose `bank_id` does not contain\
+            \ the search text."
+          items:
+            type: string
+          type: array
       required:
       - bank_id
       - disposition
@@ -5282,6 +6259,9 @@ components:
         retain_chunk_batch_size:
           nullable: true
           type: integer
+        retain_max_attachments_per_chunk:
+          nullable: true
+          type: integer
         mcp_enabled_tools:
           items:
             type: string
@@ -5304,9 +6284,20 @@ components:
             additionalProperties: {}
           nullable: true
           type: array
+        consolidation_strategies:
+          items:
+            $ref: '#/components/schemas/ConsolidationStrategySpec'
+          nullable: true
+          type: array
         reflect_source_facts_max_tokens:
           nullable: true
           type: integer
+        knowledge_page_default_trigger:
+          additionalProperties: {}
+          nullable: true
+        reflect_default_options:
+          additionalProperties: {}
+          nullable: true
         mental_model_min_refresh_interval_seconds:
           minimum: 0.0
           nullable: true
@@ -5554,6 +6545,57 @@ components:
       - name
       - source_query
       title: BankTemplateMentalModel
+    BankTransferSubmitResponse:
+      description: |-
+        Response for the unified bank-transfer endpoints (202).
+
+        The transfer runs in the background; poll
+        GET /v1/default/banks/{bank_id}/operations/{operation_id}. An export's
+        ``result_metadata`` carries ``download_url`` / ``storage_key`` /
+        ``byte_size`` / ``filename``; an import's carries the per-component counts.
+      example:
+        operation_id: operation_id
+        status: pending
+      properties:
+        operation_id:
+          title: Operation Id
+          type: string
+        status:
+          default: pending
+          title: Status
+          type: string
+      required:
+      - operation_id
+      title: BankTransferSubmitResponse
+    Base64AttachmentSource:
+      description: |-
+        Inline attachment bytes, base64-encoded.
+
+        The only source type in this version. ``url`` (server-side fetch) and
+        ``blob_id`` (pre-uploaded handle) are the natural next ones, which is why this
+        is modelled as a discriminated union on ``type`` rather than as bare fields.
+      properties:
+        type:
+          default: base64
+          enum:
+          - base64
+          title: Type
+          type: string
+        media_type:
+          description: "MIME type of the attachment, e.g. 'image/png' or 'application/pdf'.\
+            \ Any well-formed type is accepted; whether the model can read it is the\
+            \ model's answer to give, and a provider that rejects it fails the retain\
+            \ with its own error."
+          title: Media Type
+          type: string
+        data:
+          description: "Base64-encoded bytes (no data: URI prefix)."
+          title: Data
+          type: string
+      required:
+      - data
+      - media_type
+      title: Base64AttachmentSource
     Body_file_retain:
       properties:
         files:
@@ -5570,6 +6612,16 @@ components:
       - files
       - request
       title: Body_file_retain
+    Body_import_bank_transfer:
+      properties:
+        file:
+          description: Transfer ZIP archive
+          format: binary
+          title: File
+          type: string
+      required:
+      - file
+      title: Body_import_bank_transfer
     Body_import_documents:
       properties:
         file:
@@ -5631,6 +6683,47 @@ components:
       - operation_id
       - status
       title: ChildOperationStatus
+    ChunkAttachment:
+      description: "An attachment referenced by retained text, and where to fetch\
+        \ it."
+      properties:
+        id:
+          description: The id inside the text's placeholder; a prefix of the bytes'
+            sha256.
+          title: Id
+          type: string
+        hash:
+          description: Full sha256 of the attachment bytes.
+          title: Hash
+          type: string
+        kind:
+          description: "'image' or 'file', as the caller sent it."
+          title: Kind
+          type: string
+        media_type:
+          description: MIME type of the attachment.
+          title: Media Type
+          type: string
+        byte_size:
+          description: Size of the attachment in bytes.
+          title: Byte Size
+          type: integer
+        filename:
+          nullable: true
+          type: string
+        url:
+          description: Bank-scoped API path serving the bytes. Requires the same authorization
+            as the bank.
+          title: Url
+          type: string
+      required:
+      - byte_size
+      - hash
+      - id
+      - kind
+      - media_type
+      - url
+      title: ChunkAttachment
     ChunkData:
       description: Chunk data for a single chunk.
       properties:
@@ -5648,6 +6741,11 @@ components:
           description: Whether the chunk text was truncated due to token limits
           title: Truncated
           type: boolean
+        attachments:
+          items:
+            $ref: '#/components/schemas/ChunkAttachment'
+          nullable: true
+          type: array
       required:
       - chunk_index
       - id
@@ -5690,6 +6788,11 @@ components:
         created_at:
           title: Created At
           type: string
+        attachments:
+          items:
+            $ref: '#/components/schemas/ChunkAttachment'
+          nullable: true
+          type: array
       required:
       - bank_id
       - chunk_id
@@ -5744,6 +6847,256 @@ components:
       required:
       - operation_id
       title: ConsolidationResponse
+    ConsolidationScopePattern:
+      description: |-
+        One rule of a consolidation strategy: tags, and how they must match.
+
+        ``tags`` may be empty — that is a rule still being filled in, which the editor
+        saves as typed and consolidation ignores. The type pins the *shape*, not
+        completeness: a string where the tag list belongs is rejected at the door
+        instead of being stored and silently ignored for the life of the bank.
+
+        Unknown keys are rejected too, but by :class:`StrictConsolidationStrategySpec`
+        on the write path rather than by ``extra="forbid"`` here: that would put
+        ``additionalProperties: false`` in the schema, which openapi-generator cannot
+        process ("Codegen Property not yet supported in getPydanticType").
+      example:
+        tags_match: tags_match
+        tags:
+        - tags
+        - tags
+      properties:
+        tags:
+          description: "fnmatch tag patterns, e.g. company:*"
+          items:
+            type: string
+          type: array
+        tags_match:
+          nullable: true
+          type: string
+      title: ConsolidationScopePattern
+    ConsolidationStrategiesPreview:
+      description: Which existing observation scopes each consolidation strategy would
+        apply to.
+      example:
+        scopes_scanned: 3
+        default:
+          observation_count: 9
+          match_count: 7
+          samples:
+          - handled_by: 2
+            count: 5
+            tags:
+            - tags
+            - tags
+          - handled_by: 2
+            count: 5
+            tags:
+            - tags
+            - tags
+        strategies:
+        - active: true
+          claimed_count: 0
+          rules:
+          - taken_count: 1
+            observation_count: 5
+            match_count: 6
+            samples:
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+          - taken_count: 1
+            observation_count: 5
+            match_count: 6
+            samples:
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+        - active: true
+          claimed_count: 0
+          rules:
+          - taken_count: 1
+            observation_count: 5
+            match_count: 6
+            samples:
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+          - taken_count: 1
+            observation_count: 5
+            match_count: 6
+            samples:
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+            - handled_by: 2
+              count: 5
+              tags:
+              - tags
+              - tags
+        complete: true
+      properties:
+        strategies:
+          items:
+            $ref: '#/components/schemas/StrategyPreview'
+          type: array
+        default:
+          $ref: '#/components/schemas/DefaultScopesPreview'
+        scopes_scanned:
+          description: Distinct scopes the preview was computed over
+          title: Scopes Scanned
+          type: integer
+        complete:
+          description: False when the bank has more distinct scopes than the preview
+            scans; counts are then lower bounds
+          title: Complete
+          type: boolean
+      required:
+      - complete
+      - default
+      - scopes_scanned
+      - strategies
+      title: ConsolidationStrategiesPreview
+    ConsolidationStrategiesPreviewRequest:
+      description: A draft consolidation_strategies value to preview against existing
+        scopes.
+      example:
+        strategies:
+        - observations_mission: observations_mission
+          scopes:
+          - tags_match: tags_match
+            tags:
+            - tags
+            - tags
+          - tags_match: tags_match
+            tags:
+            - tags
+            - tags
+          max_observations_per_scope: 0
+          consolidation_source_facts_max_tokens: 6
+          consolidation_source_facts_max_tokens_per_observation: 1
+        - observations_mission: observations_mission
+          scopes:
+          - tags_match: tags_match
+            tags:
+            - tags
+            - tags
+          - tags_match: tags_match
+            tags:
+            - tags
+            - tags
+          max_observations_per_scope: 0
+          consolidation_source_facts_max_tokens: 6
+          consolidation_source_facts_max_tokens_per_observation: 1
+        sample_limit: 29
+      properties:
+        strategies:
+          description: Draft consolidation_strategies value
+          items:
+            $ref: '#/components/schemas/ConsolidationStrategySpec'
+          type: array
+        sample_limit:
+          default: 5
+          description: Example scopes returned per rule
+          maximum: 50.0
+          minimum: 0.0
+          title: Sample Limit
+          type: integer
+      required:
+      - strategies
+      title: ConsolidationStrategiesPreviewRequest
+    ConsolidationStrategySpec:
+      description: |-
+        One `consolidation_strategies` entry: the rules it claims scopes with, and
+        the observation settings those scopes use. Every setting is optional; unset
+        ones come from the bank-wide values.
+      example:
+        observations_mission: observations_mission
+        scopes:
+        - tags_match: tags_match
+          tags:
+          - tags
+          - tags
+        - tags_match: tags_match
+          tags:
+          - tags
+          - tags
+        max_observations_per_scope: 0
+        consolidation_source_facts_max_tokens: 6
+        consolidation_source_facts_max_tokens_per_observation: 1
+      properties:
+        scopes:
+          description: "Alternatives: the strategy claims a scope when any rule matches\
+            \ it"
+          items:
+            $ref: '#/components/schemas/ConsolidationScopePattern'
+          type: array
+        observations_mission:
+          nullable: true
+          type: string
+        max_observations_per_scope:
+          nullable: true
+          type: integer
+        consolidation_source_facts_max_tokens:
+          nullable: true
+          type: integer
+        consolidation_source_facts_max_tokens_per_observation:
+          nullable: true
+          type: integer
+      title: ConsolidationStrategySpec
+    Content:
+      anyOf:
+      - nullable: true
+        type: string
+      - items:
+          $ref: '#/components/schemas/Content_anyOf_inner'
+        type: array
+      description: The raw content to retain or extract from. Either a plain string
+        or an ordered list of content blocks.
+      title: Content
+    CreateBankAliasRequest:
+      description: Request model for adding an alias to a bank.
+      example:
+        alias: user-123
+      properties:
+        alias:
+          description: "The extra bank id. Same rules as a bank id (non-empty, at\
+            \ most 192 bytes of UTF-8, no control characters), and it must not already\
+            \ name a bank or another alias."
+          title: Alias
+          type: string
+        primary:
+          default: false
+          description: "Also show the bank under this alias, replacing whichever alias\
+            \ is shown today."
+          title: Primary
+          type: boolean
+      required:
+      - alias
+      title: CreateBankAliasRequest
     CreateBankRequest:
       description: Request model for creating/updating a bank.
       example:
@@ -5794,6 +7147,9 @@ components:
           nullable: true
           type: integer
         retain_structured_chunk_size:
+          nullable: true
+          type: integer
+        retain_max_attachments_per_chunk:
           nullable: true
           type: integer
         enable_observations:
@@ -5961,14 +7317,17 @@ components:
           recall_chunks_max_tokens: 5
           refresh_cron: refresh_cron
           tag_groups:
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
+          reflect_search_observations_include_entities: true
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
@@ -5981,10 +7340,11 @@ components:
           - exclude_mental_model_ids
           - exclude_mental_model_ids
           include_chunks: true
+          reflect_search_observations_max_tokens: 1
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 1
+          recall_max_tokens: 5
         tags:
         - tags
         - tags
@@ -6054,6 +7414,39 @@ components:
       required:
       - url
       title: CreateWebhookRequest
+    DefaultScopesPreview:
+      description: The scopes no strategy claims — they consolidate under the bank-wide
+        settings.
+      example:
+        observation_count: 9
+        match_count: 7
+        samples:
+        - handled_by: 2
+          count: 5
+          tags:
+          - tags
+          - tags
+        - handled_by: 2
+          count: 5
+          tags:
+          - tags
+          - tags
+      properties:
+        match_count:
+          title: Match Count
+          type: integer
+        observation_count:
+          title: Observation Count
+          type: integer
+        samples:
+          items:
+            $ref: '#/components/schemas/StrategyScopePreview'
+          type: array
+      required:
+      - match_count
+      - observation_count
+      - samples
+      title: DefaultScopesPreview
     DeleteDocumentResponse:
       description: Response model for delete document endpoint.
       example:
@@ -6298,6 +7691,60 @@ components:
       required:
       - operation_id
       title: DocumentImportSubmitResponse
+    DocumentListItem:
+      description: |-
+        One row of the document listing — a document's metadata without its text.
+
+        Extra keys are allowed and passed through: the rows used to be an open object, and
+        typing them must not drop a field an older or newer server also returns.
+      properties:
+        id:
+          description: Document ID
+          title: Id
+          type: string
+        bank_id:
+          default: ""
+          description: Bank the document belongs to
+          title: Bank Id
+          type: string
+        content_hash:
+          nullable: true
+          type: string
+        created_at:
+          default: ""
+          description: When the document was first retained (ISO 8601)
+          title: Created At
+          type: string
+        updated_at:
+          default: ""
+          description: When the document was last written (ISO 8601)
+          title: Updated At
+          type: string
+        text_length:
+          default: 0
+          description: Length of the stored document text in characters
+          title: Text Length
+          type: integer
+        memory_unit_count:
+          default: 0
+          description: Number of memory units extracted from this document
+          title: Memory Unit Count
+          type: integer
+        retain_params:
+          additionalProperties: {}
+          nullable: true
+        document_metadata:
+          additionalProperties: {}
+          nullable: true
+        tags:
+          default: []
+          description: Tags associated with this document
+          items:
+            type: string
+          type: array
+      required:
+      - id
+      title: DocumentListItem
     DocumentResponse:
       description: Response model for get document endpoint.
       example:
@@ -6357,6 +7804,11 @@ components:
           nullable: true
         observation_scopes:
           $ref: '#/components/schemas/Observation_Scopes'
+        attachments:
+          items:
+            $ref: '#/components/schemas/ChunkAttachment'
+          nullable: true
+          type: array
       required:
       - bank_id
       - content_hash
@@ -6378,8 +7830,6 @@ components:
         retain_mission: retain_mission
         agent_name: agent_name
         retain_chunk_size: 0
-        context: ""
-        llm_output_language: llm_output_language
         retain_extract_causal_links: true
         entity_labels:
         - values:
@@ -6424,15 +7874,16 @@ components:
               fields:
                 key: null
           key: key
-        retain_custom_instructions: retain_custom_instructions
-        content: content
+        content: Content
         entities_allow_free_form: true
+        context: ""
+        llm_output_language: llm_output_language
+        strategy: strategy
+        retain_custom_instructions: retain_custom_instructions
         timestamp: 2000-01-23T04:56:07.000+00:00
       properties:
         content:
-          description: Text to extract facts from (e.g. a document or a single chunk).
-          title: Content
-          type: string
+          $ref: '#/components/schemas/Content'
         context:
           default: ""
           description: Optional context about the content.
@@ -6443,6 +7894,9 @@ components:
           nullable: true
           type: string
         agent_name:
+          nullable: true
+          type: string
+        strategy:
           nullable: true
           type: string
         retain_mission:
@@ -6475,15 +7929,29 @@ components:
       - content
       title: DryRunExtractRequest
     DryRunExtractionResult:
-      description: "Result of dry-run fact extraction: candidate facts plus aggregated\
-        \ LLM token usage."
+      description: |-
+        Result of dry-run fact extraction: candidate facts, the chunks they came from,
+        and aggregated LLM token usage.
       example:
+        chunks:
+        - fact_count: 1
+          text: text
+        - fact_count: 1
+          text: text
         usage:
           input_tokens: 1500
           output_tokens: 500
           total_tokens: 2000
         facts:
         - occurred_start: occurred_start
+          chunk_index: 0
+          attachments:
+          - media_type: media_type
+            block_index: 6
+            type: image
+          - media_type: media_type
+            block_index: 6
+            type: image
           entities:
           - entities
           - entities
@@ -6491,6 +7959,14 @@ components:
           text: text
           fact_type: fact_type
         - occurred_start: occurred_start
+          chunk_index: 0
+          attachments:
+          - media_type: media_type
+            block_index: 6
+            type: image
+          - media_type: media_type
+            block_index: 6
+            type: image
           entities:
           - entities
           - entities
@@ -6502,6 +7978,13 @@ components:
           description: Candidate facts the retain step would extract.
           items:
             $ref: '#/components/schemas/ExtractedFact'
+          type: array
+        chunks:
+          description: The chunks the input was cut into before extraction. Already
+            computed on every path; returned because `retain_chunk_size` is otherwise
+            a number with no visible effect.
+          items:
+            $ref: '#/components/schemas/ExtractionChunk'
           type: array
         usage:
           $ref: '#/components/schemas/TokenUsage'
@@ -6546,6 +8029,90 @@ components:
       - mention_count
       - observations
       title: EntityDetailResponse
+    EntityGraphEdge:
+      description: "A co-occurrence edge, in the Cytoscape ``{\"data\": {...}}`` envelope\
+        \ the graph uses."
+      properties:
+        data:
+          $ref: '#/components/schemas/EntityGraphEdgeData'
+      required:
+      - data
+      title: EntityGraphEdge
+    EntityGraphEdgeData:
+      description: The payload of one co-occurrence edge.
+      properties:
+        id:
+          description: Edge ID (``<source>-<target>``)
+          title: Id
+          type: string
+        source:
+          description: Source entity ID
+          title: Source
+          type: string
+        target:
+          description: Target entity ID
+          title: Target
+          type: string
+        linkType:
+          default: cooccurrence
+          description: Kind of relationship this edge represents
+          title: Linktype
+          type: string
+        weight:
+          default: 0
+          description: Number of co-occurrences between the two entities
+          title: Weight
+          type: integer
+        color:
+          nullable: true
+          type: string
+        lineStyle:
+          nullable: true
+          type: string
+        lastCooccurred:
+          nullable: true
+          type: string
+      required:
+      - id
+      - source
+      - target
+      title: EntityGraphEdgeData
+    EntityGraphNode:
+      description: "An entity node, in the Cytoscape ``{\"data\": {...}}`` envelope\
+        \ the graph uses."
+      properties:
+        data:
+          $ref: '#/components/schemas/EntityGraphNodeData'
+      required:
+      - data
+      title: EntityGraphNode
+    EntityGraphNodeData:
+      description: |-
+        The payload of one entity node in the co-occurrence graph.
+
+        Extra keys are allowed and passed through: the graph payload has always been an open
+        object, and typing it must not drop a field an older or newer server also returns.
+      properties:
+        id:
+          description: Entity ID
+          title: Id
+          type: string
+        label:
+          default: ""
+          description: Entity canonical name
+          title: Label
+          type: string
+        mentionCount:
+          default: 0
+          description: How many times this entity was mentioned
+          title: Mentioncount
+          type: integer
+        color:
+          nullable: true
+          type: string
+      required:
+      - id
+      title: EntityGraphNodeData
     EntityGraphResponse:
       description: Response model for entity co-occurrence graph endpoint.
       example:
@@ -6576,11 +8143,11 @@ components:
       properties:
         nodes:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/EntityGraphNode'
           type: array
         edges:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/EntityGraphEdge'
           type: array
         total_entities:
           title: Total Entities
@@ -6723,6 +8290,14 @@ components:
         are omitted because nothing is stored. Entities are raw, unresolved names.
       example:
         occurred_start: occurred_start
+        chunk_index: 0
+        attachments:
+        - media_type: media_type
+          block_index: 6
+          type: image
+        - media_type: media_type
+          block_index: 6
+          type: image
         entities:
         - entities
         - entities
@@ -6749,10 +8324,65 @@ components:
           items:
             type: string
           type: array
+        chunk_index:
+          nullable: true
+          type: integer
+        attachments:
+          description: Attachments from user input that this fact is attributed to
+            / associated with.
+          items:
+            $ref: '#/components/schemas/ExtractedFactAttachment'
+          type: array
       required:
       - fact_type
       - text
       title: ExtractedFact
+    ExtractedFactAttachment:
+      description: An attachment from multimodal input associated with an extracted
+        fact.
+      example:
+        media_type: media_type
+        block_index: 6
+        type: image
+      properties:
+        block_index:
+          description: Index of the content block in user's input (0-based)
+          title: Block Index
+          type: integer
+        type:
+          description: Content block type ('image' or 'file')
+          enum:
+          - image
+          - file
+          title: AttachmentType
+          type: string
+        media_type:
+          description: "MIME media type of the attachment, e.g. 'image/png'"
+          title: Media Type
+          type: string
+      required:
+      - block_index
+      - media_type
+      - type
+      title: ExtractedFactAttachment
+    ExtractionChunk:
+      description: "One chunk the extractor was handed, and how much it yielded."
+      example:
+        fact_count: 1
+        text: text
+      properties:
+        text:
+          description: The chunk as the extractor saw it.
+          title: Text
+          type: string
+        fact_count:
+          description: How many facts came out of this chunk.
+          title: Fact Count
+          type: integer
+      required:
+      - fact_count
+      - text
+      title: ExtractionChunk
     FactsIncludeOptions:
       description: Options for including facts (based_on) in reflect results.
       properties: {}
@@ -6807,6 +8437,10 @@ components:
             \ source text is not stored."
           title: Store Document Text
           type: boolean
+        llm_concurrency_api:
+          description: Whether the runtime LLM concurrency API accepts changes
+          title: Llm Concurrency Api
+          type: boolean
       required:
       - audit_log
       - bank_config_api
@@ -6814,12 +8448,34 @@ components:
       - document_export_api
       - document_import_api
       - file_upload_api
+      - llm_concurrency_api
       - llm_trace
       - mcp
       - observations
       - store_document_text
       - worker
       title: FeaturesInfo
+    FileContentBlock:
+      description: |-
+        A non-image attachment — a PDF, a spreadsheet — in its input position.
+
+        This stays distinct from ``image`` because providers use different request
+        parts for images and documents; retaining the caller's kind avoids guessing.
+      properties:
+        type:
+          enum:
+          - file
+          title: Type
+          type: string
+        source:
+          $ref: '#/components/schemas/Base64AttachmentSource'
+        filename:
+          nullable: true
+          type: string
+      required:
+      - source
+      - type
+      title: FileContentBlock
     FileRetainResponse:
       description: Response model for file upload endpoint.
       example:
@@ -6841,18 +8497,22 @@ components:
       description: Response model for graph data endpoint.
       example:
         edges:
-        - from: "1"
-          to: "2"
-          type: semantic
-          weight: 0.8
+        - data:
+            id: 1-2-semantic
+            linkType: semantic
+            source: "1"
+            target: "2"
+            weight: 0.8
         limit: 1000
         nodes:
-        - id: "1"
-          label: Alice works at Google
-          type: world
-        - id: "2"
-          label: Bob went hiking
-          type: world
+        - data:
+            id: "1"
+            label: Alice works at Google
+            text: Alice works at Google
+        - data:
+            id: "2"
+            label: Bob went hiking
+            text: Bob went hiking
         table_rows:
         - context: Work info
           date: 2024-01-15 10:30
@@ -6863,15 +8523,15 @@ components:
       properties:
         nodes:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/MemoryGraphNode'
           type: array
         edges:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/MemoryGraphEdge'
           type: array
         table_rows:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/MemoryGraphTableRow'
           type: array
         total_units:
           title: Total Units
@@ -6909,6 +8569,21 @@ components:
             $ref: '#/components/schemas/ValidationError'
           type: array
       title: HTTPValidationError
+    ImageContentBlock:
+      description: "An image within a multimodal item, in the position the caller\
+        \ wrote it."
+      properties:
+        type:
+          enum:
+          - image
+          title: Type
+          type: string
+        source:
+          $ref: '#/components/schemas/Base64AttachmentSource'
+      required:
+      - source
+      - type
+      title: ImageContentBlock
     IncludeOptions:
       description: Options for including additional data in recall results.
       properties:
@@ -6927,28 +8602,25 @@ components:
         knowledge base is client-managed (CRUD); ``managed`` lets a client tag a node
         as system-owned vs. hand-authored.
       example:
-        children:
-        - null
-        - null
         kind: folder
-        parent_id: parent_id
-        managed: false
-        name: name
         description: description
-        id: id
+        last_refresh_failed_at: last_refresh_failed_at
         is_stale: true
         trigger:
           recall_chunks_max_tokens: 5
           refresh_cron: refresh_cron
           tag_groups:
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
+          reflect_search_observations_include_entities: true
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
@@ -6961,14 +8633,22 @@ components:
           - exclude_mental_model_ids
           - exclude_mental_model_ids
           include_chunks: true
+          reflect_search_observations_max_tokens: 1
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 1
-        mental_model_id: mental_model_id
+          recall_max_tokens: 5
         tags:
         - tags
         - tags
+        children:
+        - null
+        - null
+        parent_id: parent_id
+        managed: false
+        name: name
+        id: id
+        mental_model_id: mental_model_id
         timestamp: timestamp
       properties:
         id:
@@ -7008,6 +8688,9 @@ components:
         is_stale:
           nullable: true
           type: boolean
+        last_refresh_failed_at:
+          nullable: true
+          type: string
         trigger:
           $ref: '#/components/schemas/MentalModelTrigger-Output'
         children:
@@ -7092,7 +8775,11 @@ components:
           nullable: true
           type: string
         markdown:
-          description: "The full markdown document: YAML frontmatter + markdown body."
+          description: "The full markdown document: YAML frontmatter + markdown body.\
+            \ A page with no body yet renders 'No content yet.' as its body rather\
+            \ than frontmatter alone, which reads as a page that failed to render.\
+            \ The notice is added here on the way out; the stored body in `body` stays\
+            \ empty, and the export bundle keeps the bare document."
           title: Markdown
           type: string
       required:
@@ -7108,12 +8795,14 @@ components:
         results:
         - snippet: snippet
           score: 0.8008281904610115
+          source_query: source_query
           updated_at: updated_at
           name: name
           id: id
           mental_model_id: mental_model_id
         - snippet: snippet
           score: 0.8008281904610115
+          source_query: source_query
           updated_at: updated_at
           name: name
           id: id
@@ -7136,6 +8825,7 @@ components:
       example:
         snippet: snippet
         score: 0.8008281904610115
+        source_query: source_query
         updated_at: updated_at
         name: name
         id: id
@@ -7150,10 +8840,22 @@ components:
         mental_model_id:
           nullable: true
           type: string
+        source_query:
+          nullable: true
+          type: string
         snippet:
+          description: "The page's opening text. A page whose body is still empty\
+            \ says so in words — 'No content yet.' — rather than coming back blank,\
+            \ so a caller can tell an unwritten page from a page whose snippet simply\
+            \ did not render. The marker is produced on the way out; the stored body\
+            \ stays empty and out of the search index."
           title: Snippet
           type: string
         score:
+          description: "Rank-fusion score in 0..1, where 1.0 means every search arm\
+            \ placed this page first. It reflects where the page ranked for this query,\
+            \ not how well its text matched, so it is only comparable within one result\
+            \ set."
           title: Score
           type: number
         updated_at:
@@ -7169,28 +8871,25 @@ components:
       description: The knowledge base as a nested folder/page tree.
       example:
         roots:
-        - children:
-          - null
-          - null
-          kind: folder
-          parent_id: parent_id
-          managed: false
-          name: name
+        - kind: folder
           description: description
-          id: id
+          last_refresh_failed_at: last_refresh_failed_at
           is_stale: true
           trigger:
             recall_chunks_max_tokens: 5
             refresh_cron: refresh_cron
             tag_groups:
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
+            reflect_search_observations_include_entities: true
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
@@ -7203,37 +8902,42 @@ components:
             - exclude_mental_model_ids
             - exclude_mental_model_ids
             include_chunks: true
+            reflect_search_observations_max_tokens: 1
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 1
-          mental_model_id: mental_model_id
+            recall_max_tokens: 5
           tags:
           - tags
           - tags
+          children:
+          - null
+          - null
+          parent_id: parent_id
+          managed: false
+          name: name
+          id: id
+          mental_model_id: mental_model_id
           timestamp: timestamp
-        - children:
-          - null
-          - null
-          kind: folder
-          parent_id: parent_id
-          managed: false
-          name: name
+        - kind: folder
           description: description
-          id: id
+          last_refresh_failed_at: last_refresh_failed_at
           is_stale: true
           trigger:
             recall_chunks_max_tokens: 5
             refresh_cron: refresh_cron
             tag_groups:
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
+            reflect_search_observations_include_entities: true
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
@@ -7246,14 +8950,22 @@ components:
             - exclude_mental_model_ids
             - exclude_mental_model_ids
             include_chunks: true
+            reflect_search_observations_max_tokens: 1
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 1
-          mental_model_id: mental_model_id
+            recall_max_tokens: 5
           tags:
           - tags
           - tags
+          children:
+          - null
+          - null
+          parent_id: parent_id
+          managed: false
+          name: name
+          id: id
+          mental_model_id: mental_model_id
           timestamp: timestamp
       properties:
         roots:
@@ -7278,6 +8990,52 @@ components:
       - duration_ms
       - scope
       title: LLMCallTrace
+    LLMConcurrencyResponse:
+      description: The process-wide LLM concurrency cap and its live usage.
+      example:
+        waiting: 5
+        configured_max_concurrent: 6
+        max_concurrent: 0
+        in_flight: 1
+      properties:
+        max_concurrent:
+          description: Current cap on concurrent LLM calls in this process
+          title: Max Concurrent
+          type: integer
+        configured_max_concurrent:
+          description: "The cap from HINDSIGHT_API_LLM_MAX_CONCURRENT, restored by\
+            \ DELETE and on restart"
+          title: Configured Max Concurrent
+          type: integer
+        in_flight:
+          description: LLM calls currently holding a permit
+          title: In Flight
+          type: integer
+        waiting:
+          description: LLM calls queued for a permit
+          title: Waiting
+          type: integer
+      required:
+      - configured_max_concurrent
+      - in_flight
+      - max_concurrent
+      - waiting
+      title: LLMConcurrencyResponse
+    LLMConcurrencyUpdate:
+      description: Request model for changing the process-wide LLM concurrency cap.
+      example:
+        max_concurrent: 1
+      properties:
+        max_concurrent:
+          description: New cap on concurrent LLM calls in this process. Lowering it
+            lets in-flight calls finish and starts no new call until usage is under
+            the cap; raising it starts waiting calls immediately.
+          minimum: 1.0
+          title: Max Concurrent
+          type: integer
+      required:
+      - max_concurrent
+      title: LLMConcurrencyUpdate
     LLMRequestEntry:
       description: "A single LLM request trace row, as returned by the read API."
       example:
@@ -7286,6 +9044,7 @@ components:
         metadata:
           key: ""
         span_id: span_id
+        thoughts_tokens: 9
         error: error
         llm_info:
           key: ""
@@ -7296,7 +9055,7 @@ components:
         provider: provider
         bank_id: bank_id
         scope: scope
-        total_tokens: 9
+        total_tokens: 3
         started_at: started_at
         model: model
         output_tokens: 2
@@ -7354,6 +9113,9 @@ components:
         cached_tokens:
           nullable: true
           type: integer
+        thoughts_tokens:
+          nullable: true
+          type: integer
         total_tokens:
           nullable: true
           type: integer
@@ -7387,6 +9149,7 @@ components:
       - span_id
       - started_at
       - status
+      - thoughts_tokens
       - total_tokens
       - trace_id
       title: LLMRequestEntry
@@ -7403,6 +9166,7 @@ components:
           metadata:
             key: ""
           span_id: span_id
+          thoughts_tokens: 9
           error: error
           llm_info:
             key: ""
@@ -7413,7 +9177,7 @@ components:
           provider: provider
           bank_id: bank_id
           scope: scope
-          total_tokens: 9
+          total_tokens: 3
           started_at: started_at
           model: model
           output_tokens: 2
@@ -7427,6 +9191,7 @@ components:
           metadata:
             key: ""
           span_id: span_id
+          thoughts_tokens: 9
           error: error
           llm_info:
             key: ""
@@ -7437,7 +9202,7 @@ components:
           provider: provider
           bank_id: bank_id
           scope: scope
-          total_tokens: 9
+          total_tokens: 3
           started_at: started_at
           model: model
           output_tokens: 2
@@ -7479,7 +9244,8 @@ components:
         tokens:
           output: 5
           input: 1
-          total: 2
+          thoughts: 2
+          total: 7
           cached: 5
         time: time
       properties:
@@ -7514,7 +9280,8 @@ components:
           tokens:
             output: 5
             input: 1
-            total: 2
+            thoughts: 2
+            total: 7
             cached: 5
           time: time
         - total: 6
@@ -7523,7 +9290,8 @@ components:
           tokens:
             output: 5
             input: 1
-            total: 2
+            thoughts: 2
+            total: 7
             cached: 5
           time: time
         start: start
@@ -7556,7 +9324,8 @@ components:
       example:
         output: 5
         input: 1
-        total: 2
+        thoughts: 2
+        total: 7
         cached: 5
       properties:
         input:
@@ -7567,6 +9336,9 @@ components:
           type: integer
         cached:
           title: Cached
+          type: integer
+        thoughts:
+          nullable: true
           type: integer
         total:
           title: Total
@@ -7615,6 +9387,7 @@ components:
           - value
           - multi-values
           - text
+          - multi-text
           - map
           title: Type
           type: string
@@ -7655,6 +9428,7 @@ components:
           - value
           - multi-values
           - text
+          - multi-text
           - map
           title: Type
           type: string
@@ -7754,7 +9528,7 @@ components:
       properties:
         items:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/DocumentListItem'
           type: array
         total:
           title: Total
@@ -7777,20 +9551,23 @@ components:
         items:
         - context: Work conversation
           date: 2024-01-15T10:30:00Z
-          entities: "Alice (PERSON), Google (ORGANIZATION)"
+          entities: "Alice, Google"
+          fact_type: world
           id: 550e8400-e29b-41d4-a716-446655440000
           metadata:
             channel: engineering
             source: slack
+          state: valid
+          tags:
+          - user:alice
           text: Alice works at Google on the AI team
-          type: world
         limit: 100
         offset: 0
         total: 150
       properties:
         items:
           items:
-            additionalProperties: {}
+            $ref: '#/components/schemas/MemoryUnitListItem'
           type: array
         total:
           title: Total
@@ -7921,6 +9698,7 @@ components:
           default: text
           enum:
           - text
+          - multi-text
           - value
           - multi-values
           - map
@@ -7949,6 +9727,7 @@ components:
           default: text
           enum:
           - text
+          - multi-text
           - value
           - multi-values
           - map
@@ -8015,6 +9794,165 @@ components:
       - period
       - trunc
       title: MemoriesTimeseriesResponse
+    MemoryGraphEdge:
+      description: "An edge between two memory units, in the Cytoscape ``{\"data\"\
+        : {...}}`` envelope."
+      properties:
+        data:
+          $ref: '#/components/schemas/MemoryGraphEdgeData'
+      required:
+      - data
+      title: MemoryGraphEdge
+    MemoryGraphEdgeData:
+      description: The payload of one edge between two memory units.
+      properties:
+        id:
+          description: Edge ID (``<source>-<target>-<linkType>``)
+          title: Id
+          type: string
+        source:
+          description: Source memory unit ID
+          title: Source
+          type: string
+        target:
+          description: Target memory unit ID
+          title: Target
+          type: string
+        linkType:
+          default: ""
+          description: "Link kind: 'entity', 'semantic', 'temporal', ..."
+          title: Linktype
+          type: string
+        weight:
+          default: 0.0
+          description: Link strength
+          title: Weight
+          type: number
+        entityName:
+          default: ""
+          description: "Shared entity for an 'entity' link, empty otherwise"
+          title: Entityname
+          type: string
+        color:
+          nullable: true
+          type: string
+        lineStyle:
+          nullable: true
+          type: string
+      required:
+      - id
+      - source
+      - target
+      title: MemoryGraphEdgeData
+    MemoryGraphNode:
+      description: "A memory-unit node, in the Cytoscape ``{\"data\": {...}}`` envelope\
+        \ the graph uses."
+      properties:
+        data:
+          $ref: '#/components/schemas/MemoryGraphNodeData'
+      required:
+      - data
+      title: MemoryGraphNode
+    MemoryGraphNodeData:
+      description: |-
+        The payload of one memory-unit node in the memory graph.
+
+        Extra keys are allowed and passed through, so typing this never drops a field the
+        server also returns.
+      properties:
+        id:
+          description: Memory unit ID
+          title: Id
+          type: string
+        label:
+          default: ""
+          description: "Short display label (the text, truncated)"
+          title: Label
+          type: string
+        text:
+          default: ""
+          description: Full memory unit text
+          title: Text
+          type: string
+        date:
+          default: ""
+          description: "Event date (ISO 8601), empty when unknown"
+          title: Date
+          type: string
+        context:
+          default: ""
+          description: Context the memory was captured in
+          title: Context
+          type: string
+        entities:
+          default: ""
+          description: "Comma-separated entity names, 'None' when there are none"
+          title: Entities
+          type: string
+        color:
+          nullable: true
+          type: string
+      required:
+      - id
+      title: MemoryGraphNodeData
+    MemoryGraphTableRow:
+      description: One row of the flat table view that accompanies the memory graph.
+      properties:
+        id:
+          description: Memory unit ID
+          title: Id
+          type: string
+        text:
+          default: ""
+          description: Memory unit text
+          title: Text
+          type: string
+        context:
+          default: ""
+          description: Context the memory was captured in ('N/A' when absent)
+          title: Context
+          type: string
+        occurred_start:
+          nullable: true
+          type: string
+        occurred_end:
+          nullable: true
+          type: string
+        mentioned_at:
+          nullable: true
+          type: string
+        date:
+          nullable: true
+          type: string
+        entities:
+          default: ""
+          description: "Comma-separated entity names, 'None' when there are none"
+          title: Entities
+          type: string
+        document_id:
+          nullable: true
+          type: string
+        chunk_id:
+          nullable: true
+          type: string
+        fact_type:
+          nullable: true
+          type: string
+        tags:
+          default: []
+          description: Tags on this memory unit
+          items:
+            type: string
+          type: array
+        created_at:
+          nullable: true
+          type: string
+        proof_count:
+          nullable: true
+          type: integer
+      required:
+      - id
+      title: MemoryGraphTableRow
     MemoryItem:
       description: Single memory item for retain.
       example:
@@ -8034,8 +9972,7 @@ components:
         timestamp: 2024-01-15T10:30:00Z
       properties:
         content:
-          title: Content
-          type: string
+          $ref: '#/components/schemas/Content'
         timestamp:
           $ref: '#/components/schemas/Timestamp'
         context:
@@ -8116,6 +10053,103 @@ components:
       required:
       - time
       title: MemoryTimeseriesBucket
+    MemoryUnitListItem:
+      description: |-
+        One row of the memory-unit listing.
+
+        Extra keys are allowed and passed through: the rows used to be an open object, and
+        typing them must not drop a field an older or newer server also returns.
+      properties:
+        id:
+          description: Memory unit ID
+          title: Id
+          type: string
+        text:
+          default: ""
+          description: The fact text
+          title: Text
+          type: string
+        context:
+          default: ""
+          description: Context the memory was captured in
+          title: Context
+          type: string
+        date:
+          default: ""
+          description: "Event date (ISO 8601), empty when unknown"
+          title: Date
+          type: string
+        fact_type:
+          nullable: true
+          type: string
+        document_id:
+          nullable: true
+          type: string
+        mentioned_at:
+          nullable: true
+          type: string
+        occurred_start:
+          nullable: true
+          type: string
+        occurred_end:
+          nullable: true
+          type: string
+        entities:
+          default: ""
+          description: Comma-separated canonical entity names
+          title: Entities
+          type: string
+        chunk_id:
+          nullable: true
+          type: string
+        proof_count:
+          default: 1
+          description: How many times the fact was independently seen
+          title: Proof Count
+          type: integer
+        tags:
+          default: []
+          description: Tags on this memory unit
+          items:
+            type: string
+          type: array
+        metadata:
+          additionalProperties: {}
+          default: {}
+          description: Arbitrary metadata stored with the memory
+          title: Metadata
+        consolidated_at:
+          nullable: true
+          type: string
+        consolidation_failed_at:
+          nullable: true
+          type: string
+        state:
+          default: valid
+          description: "Curation state: 'valid' or 'invalidated'"
+          title: State
+          type: string
+        invalidation_reason:
+          nullable: true
+          type: string
+        invalidated_at:
+          nullable: true
+          type: string
+        edited_at:
+          nullable: true
+          type: string
+        updated_at:
+          nullable: true
+          type: string
+        source_memory_ids:
+          default: []
+          description: An observation's source facts; empty for a source fact
+          items:
+            type: string
+          type: array
+      required:
+      - id
+      title: MemoryUnitListItem
     MentalModelDeltaOperations:
       description: Structured operations a delta refresh emitted against the existing
         document.
@@ -8290,24 +10324,28 @@ components:
     MentalModelListResponse:
       description: Response model for listing mental models.
       example:
-        total: 5
-        offset: 7
-        limit: 2
+        total: 2
+        offset: 9
+        limit: 7
         items:
         - max_tokens: 0
           created_at: created_at
+          last_refresh_failed_at: last_refresh_failed_at
           trigger:
             recall_chunks_max_tokens: 5
             refresh_cron: refresh_cron
             tag_groups:
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
+            reflect_search_observations_include_entities: true
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
@@ -8320,10 +10358,11 @@ components:
             - exclude_mental_model_ids
             - exclude_mental_model_ids
             include_chunks: true
+            reflect_search_observations_max_tokens: 1
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 1
+            recall_max_tokens: 5
           last_refreshed_at: last_refreshed_at
           is_stale: true
           last_memory_seen_at: last_memory_seen_at
@@ -8339,18 +10378,22 @@ components:
           id: id
         - max_tokens: 0
           created_at: created_at
+          last_refresh_failed_at: last_refresh_failed_at
           trigger:
             recall_chunks_max_tokens: 5
             refresh_cron: refresh_cron
             tag_groups:
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
-            - match: any_strict
+            - resolve: exact
+              match: any_strict
               tags:
               - tags
               - tags
+            reflect_search_observations_include_entities: true
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
@@ -8363,10 +10406,11 @@ components:
             - exclude_mental_model_ids
             - exclude_mental_model_ids
             include_chunks: true
+            reflect_search_observations_max_tokens: 1
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 1
+            recall_max_tokens: 5
           last_refreshed_at: last_refreshed_at
           is_stale: true
           last_memory_seen_at: last_memory_seen_at
@@ -8548,18 +10592,22 @@ components:
       example:
         max_tokens: 0
         created_at: created_at
+        last_refresh_failed_at: last_refresh_failed_at
         trigger:
           recall_chunks_max_tokens: 5
           refresh_cron: refresh_cron
           tag_groups:
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
+          reflect_search_observations_include_entities: true
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
@@ -8572,10 +10620,11 @@ components:
           - exclude_mental_model_ids
           - exclude_mental_model_ids
           include_chunks: true
+          reflect_search_observations_max_tokens: 1
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 1
+          recall_max_tokens: 5
         last_refreshed_at: last_refreshed_at
         is_stale: true
         last_memory_seen_at: last_memory_seen_at
@@ -8619,6 +10668,9 @@ components:
           nullable: true
           type: string
         last_memory_seen_at:
+          nullable: true
+          type: string
+        last_refresh_failed_at:
           nullable: true
           type: string
         created_at:
@@ -8714,19 +10766,27 @@ components:
       - tool
       title: MentalModelTraceToolCall
     MentalModelTrigger-Input:
-      description: Trigger settings for a mental model.
+      description: |-
+        Trigger settings for a mental model.
+
+        Inherits the reflect options an operator can also default per bank
+        (``reflect_default_options``): set here they apply to this model's refreshes
+        only, and win over the bank default.
       example:
         recall_chunks_max_tokens: 5
         refresh_cron: refresh_cron
         tag_groups:
-        - match: any_strict
+        - resolve: exact
+          match: any_strict
           tags:
           - tags
           - tags
-        - match: any_strict
+        - resolve: exact
+          match: any_strict
           tags:
           - tags
           - tags
+        reflect_search_observations_include_entities: true
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
@@ -8739,11 +10799,19 @@ components:
         - exclude_mental_model_ids
         - exclude_mental_model_ids
         include_chunks: true
+        reflect_search_observations_max_tokens: 1
         tags_match: any
         min_refresh_interval_seconds: 0
         keep_trace: false
-        recall_max_tokens: 1
+        recall_max_tokens: 5
       properties:
+        reflect_search_observations_max_tokens:
+          minimum: 1.0
+          nullable: true
+          type: integer
+        reflect_search_observations_include_entities:
+          nullable: true
+          type: boolean
         mode:
           default: full
           description: "Refresh mode. 'full' (default) regenerates the mental model\
@@ -8831,19 +10899,27 @@ components:
           type: boolean
       title: MentalModelTrigger
     MentalModelTrigger-Output:
-      description: Trigger settings for a mental model.
+      description: |-
+        Trigger settings for a mental model.
+
+        Inherits the reflect options an operator can also default per bank
+        (``reflect_default_options``): set here they apply to this model's refreshes
+        only, and win over the bank default.
       example:
         recall_chunks_max_tokens: 5
         refresh_cron: refresh_cron
         tag_groups:
-        - match: any_strict
+        - resolve: exact
+          match: any_strict
           tags:
           - tags
           - tags
-        - match: any_strict
+        - resolve: exact
+          match: any_strict
           tags:
           - tags
           - tags
+        reflect_search_observations_include_entities: true
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
@@ -8856,11 +10932,19 @@ components:
         - exclude_mental_model_ids
         - exclude_mental_model_ids
         include_chunks: true
+        reflect_search_observations_max_tokens: 1
         tags_match: any
         min_refresh_interval_seconds: 0
         keep_trace: false
-        recall_max_tokens: 1
+        recall_max_tokens: 5
       properties:
+        reflect_search_observations_max_tokens:
+          minimum: 1.0
+          nullable: true
+          type: integer
+        reflect_search_observations_include_entities:
+          nullable: true
+          type: boolean
         mode:
           default: full
           description: "Refresh mode. 'full' (default) regenerates the mental model\
@@ -8949,14 +11033,32 @@ components:
       title: MentalModelTrigger
     MinScores:
       description: |-
-        Optional per-stage score floors for recall (all inclusive, AND-ed).
+        Optional per-stage score floors for recall. Every floor is inclusive (``>=``).
 
-        ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into the SQL
-        arms (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
-        config for this request), so they prune weak matches before fusion. ``reranker``
-        and ``final`` are **post-query** filters applied to the scored results after
-        reranking. Any field left None imposes no floor; all-None (the default) means
-        no score filtering.
+        The four floors act at two different levels, and the distinction decides what a
+        returned result is guaranteed to satisfy.
+
+        ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into their own
+        SQL arm (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
+        config for this request), so they prune weak matches before fusion. Each one
+        constrains **only the arm it names**. Recall fuses four arms — semantic, keyword,
+        graph and temporal — and a result reaches the response if *any* arm surfaced it,
+        so a returned result may legitimately carry ``null`` for a stage it was not
+        surfaced by, and results reached through the graph or temporal arm carry neither
+        ``semantic`` nor ``keyword``. A *non-null* score always clears its floor — the
+        gap is only ever a ``null``. Setting both does **not** restrict the response to
+        results that clear both: they are not a predicate over each fused result. This is
+        deliberate — an intersection would discard the strong single-arm matches that
+        hybrid retrieval exists to find (a paraphrase with no lexical overlap, an exact
+        identifier the embedding scores poorly).
+
+        ``reranker`` and ``final`` are **post-query** filters applied to every scored
+        result after fusion and reranking, so these *are* per-result predicates: a
+        returned result always clears them. Use them, not the retrieval floors, to make
+        recall abstain on low-confidence queries.
+
+        Any field left None imposes no floor; all-None (the default) means no score
+        filtering.
       properties:
         semantic:
           nullable: true
@@ -8992,6 +11094,8 @@ components:
     ObservationScopesResponse:
       description: Response model for the observation scopes enumeration endpoint.
       example:
+        limit: 100
+        offset: 0
         scopes:
         - count: 12
           tags:
@@ -9002,14 +11106,30 @@ components:
           - project:apollo
         - count: 2
           tags: []
+        total: 3
       properties:
         scopes:
           description: "Distinct observation scopes, most populous first"
           items:
             $ref: '#/components/schemas/ObservationScope'
           type: array
+        total:
+          description: Total number of distinct scopes in the bank (ignores limit/offset)
+          title: Total
+          type: integer
+        limit:
+          description: Maximum number of scopes returned in this page
+          title: Limit
+          type: integer
+        offset:
+          description: Offset this page started at
+          title: Offset
+          type: integer
       required:
+      - limit
+      - offset
       - scopes
+      - total
       title: ObservationScopesResponse
     OperationProgress:
       description: |-
@@ -9201,6 +11321,278 @@ components:
       - operations
       - total
       title: OperationsListResponse
+    PromptBlockModel:
+      description: |-
+        One block of a message: its text, and the setting that decides it.
+
+        The **active** blocks of a message concatenate back to the exact text sent, so a
+        client can render them separately without showing the reader something the model
+        never receives. An **inactive** block has no text: it marks a setting that is
+        switched off, at the point where it would land if it were on.
+
+        Everything identifying a block is a machine value, never display copy — what a
+        block is called, and what turning a switched-off one on would do, is for the
+        client to say in the language it is running in.
+      example:
+        field: ""
+        heading: ""
+        kind: text
+        editable: false
+        active: true
+        section: ""
+        text: text
+        source: config
+        choices:
+        - choices
+        - choices
+        value: value
+      properties:
+        text:
+          description: The block's text; empty when the block is inactive.
+          title: Text
+          type: string
+        source:
+          description: '`config` — produced by a setting (`field` names it); `builtin`
+            — Hindsight''s own wording.'
+          enum:
+          - config
+          - builtin
+          title: Source
+          type: string
+        field:
+          default: ""
+          description: Config field behind this block; empty when no single field
+            owns it.
+          title: Field
+          type: string
+        section:
+          default: ""
+          description: "Slug for a part the preview names itself and no field owns:\
+            \ `bank_identity`, `disposition`, `directives`. Empty otherwise."
+          title: Section
+          type: string
+        heading:
+          default: ""
+          description: "The section heading the prompt text carries at this point,\
+            \ extracted from the prompt itself. Empty when it carries none."
+          title: Heading
+          type: string
+        active:
+          default: true
+          description: Whether this block is in the prompt as configured.
+          title: Active
+          type: boolean
+        value:
+          nullable: true
+          type: string
+        kind:
+          description: "Shape of the value, so a client can offer the right control\
+            \ for editing it."
+          enum:
+          - text
+          - boolean
+          - choice
+          - complex
+          title: Kind
+          type: string
+        choices:
+          items:
+            type: string
+          nullable: true
+          type: array
+        editable:
+          default: false
+          description: "Whether this bank may override the field via the bank config\
+            \ API. Server-level fields shape the prompt but cannot be set per bank,\
+            \ and offering to edit one would only collect a 400."
+          title: Editable
+          type: boolean
+      required:
+      - kind
+      - source
+      - text
+      title: PromptBlockModel
+    PromptMessageModel:
+      description: "One message of the request, as the blocks it is built from."
+      example:
+        role: system
+        blocks:
+        - field: ""
+          heading: ""
+          kind: text
+          editable: false
+          active: true
+          section: ""
+          text: text
+          source: config
+          choices:
+          - choices
+          - choices
+          value: value
+        - field: ""
+          heading: ""
+          kind: text
+          editable: false
+          active: true
+          section: ""
+          text: text
+          source: config
+          choices:
+          - choices
+          - choices
+          value: value
+      properties:
+        role:
+          enum:
+          - system
+          - user
+          title: Role
+          type: string
+        blocks:
+          items:
+            $ref: '#/components/schemas/PromptBlockModel'
+          type: array
+      required:
+      - role
+      title: PromptMessageModel
+    PromptPreviewRequest:
+      description: |-
+        Request to render the prompts an operation would send, without calling an LLM.
+
+        The operation is the whole request: everything that shapes the prompt comes from
+        the bank — its resolved config, profile and directives — and the runtime data an
+        operation would be given is a fixed placeholder. There is deliberately nothing to
+        override. A preview answers "what does this bank send"; letting a caller pass its
+        own mission or sample text only moved that question somewhere the bank cannot
+        answer it. To try a candidate value, save it and look again — the response says
+        which settings are editable.
+      example:
+        operation: retain
+      properties:
+        operation:
+          default: retain
+          description: Which operation's prompts to render.
+          enum:
+          - retain
+          - consolidation
+          - reflect
+          title: Operation
+          type: string
+        strategy:
+          nullable: true
+          type: string
+      title: PromptPreviewRequest
+    PromptPreviewResponse:
+      description: |-
+        The messages one call of the requested operation would send.
+
+        `messages` is in send order, system first. Both are always present because a
+        mission is not necessarily in the system prompt: retain and consolidation keep
+        their system prompt bank-agnostic (so one provider-side cache serves every bank)
+        and carry the mission in the user message instead.
+
+        When `skipped_reason` is set the configuration means no prompt is sent at all —
+        `chunks` extraction mode stores each chunk verbatim and never calls an LLM — and
+        `messages` is empty.
+      example:
+        run_settings:
+        - field: field
+          kind: text
+          editable: false
+          value: value
+        - field: field
+          kind: text
+          editable: false
+          value: value
+        strategies:
+        - strategies
+        - strategies
+        response_schema:
+          key: ""
+        messages:
+        - role: system
+          blocks:
+          - field: ""
+            heading: ""
+            kind: text
+            editable: false
+            active: true
+            section: ""
+            text: text
+            source: config
+            choices:
+            - choices
+            - choices
+            value: value
+          - field: ""
+            heading: ""
+            kind: text
+            editable: false
+            active: true
+            section: ""
+            text: text
+            source: config
+            choices:
+            - choices
+            - choices
+            value: value
+        - role: system
+          blocks:
+          - field: ""
+            heading: ""
+            kind: text
+            editable: false
+            active: true
+            section: ""
+            text: text
+            source: config
+            choices:
+            - choices
+            - choices
+            value: value
+          - field: ""
+            heading: ""
+            kind: text
+            editable: false
+            active: true
+            section: ""
+            text: text
+            source: config
+            choices:
+            - choices
+            - choices
+            value: value
+        strategy: strategy
+        skipped_reason: skipped_reason
+      properties:
+        messages:
+          description: "Request messages, in send order. Each is given as the blocks\
+            \ it is built from."
+          items:
+            $ref: '#/components/schemas/PromptMessageModel'
+          type: array
+        strategy:
+          nullable: true
+          type: string
+        strategies:
+          description: "Names of the bank's retain strategies, so a client can offer\
+            \ them without a second call."
+          items:
+            type: string
+          type: array
+        run_settings:
+          description: "Settings that shape the operation without appearing in its\
+            \ prompt, such as chunk sizes."
+          items:
+            $ref: '#/components/schemas/RunSettingModel'
+          type: array
+        response_schema:
+          additionalProperties: {}
+          nullable: true
+        skipped_reason:
+          nullable: true
+          type: string
+      title: PromptPreviewResponse
     RecallRequest:
       description: Request model for recall endpoint.
       example:
@@ -9413,6 +11805,11 @@ components:
           type: array
         scores:
           $ref: '#/components/schemas/RecallScores'
+        attachments:
+          items:
+            $ref: '#/components/schemas/ChunkAttachment'
+          nullable: true
+          type: array
       required:
       - id
       - text
@@ -9528,6 +11925,29 @@ components:
         occurred_end:
           nullable: true
           type: string
+        mentioned_at:
+          nullable: true
+          type: string
+        document_id:
+          nullable: true
+          type: string
+        chunk_id:
+          nullable: true
+          type: string
+        tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+        metadata:
+          additionalProperties:
+            type: string
+          nullable: true
+        attachments:
+          items:
+            $ref: '#/components/schemas/ChunkAttachment'
+          nullable: true
+          type: array
       required:
       - text
       title: ReflectFact
@@ -9599,6 +12019,13 @@ components:
         - user_a
         tags_match: any
       properties:
+        reflect_search_observations_max_tokens:
+          minimum: 1.0
+          nullable: true
+          type: integer
+        reflect_search_observations_include_entities:
+          nullable: true
+          type: boolean
         query:
           title: Query
           type: string
@@ -9725,6 +12152,9 @@ components:
         structured_output:
           additionalProperties: {}
           nullable: true
+        structured_output_error:
+          nullable: true
+          type: string
         usage:
           $ref: '#/components/schemas/TokenUsage'
         trace:
@@ -9808,6 +12238,7 @@ components:
           - refresh_failed_empty_candidate
           - refresh_failed_delta_not_applied
           - refresh_failed_structured_output
+          - refresh_failed_error
           title: Outcome
           type: string
         failure_reason:
@@ -9818,6 +12249,9 @@ components:
           - delta_ops_all_skipped
           - delta_not_applied
           - structured_output_failed
+          - retrieval_failed
+          - no_answer
+          - unexpected_error
           nullable: true
           type: string
       required:
@@ -9939,6 +12373,58 @@ components:
       - operation_id
       - success
       title: RetryOperationResponse
+    RunSettingModel:
+      description: |-
+        A setting that shapes the operation without appearing in its prompt.
+
+        Chunk sizes decide how the input is cut before extraction runs, so they change
+        what comes back while contributing no prompt text — they cannot be blocks, which
+        partition the message, and these are in none of it.
+      example:
+        field: field
+        kind: text
+        editable: false
+        value: value
+      properties:
+        field:
+          title: Field
+          type: string
+        value:
+          nullable: true
+          type: string
+        kind:
+          description: "Shape of the value, so a client can offer the right control."
+          enum:
+          - text
+          - boolean
+          - choice
+          - complex
+          title: Kind
+          type: string
+        editable:
+          default: false
+          description: Whether this bank may override the field via the bank config
+            API.
+          title: Editable
+          type: boolean
+      required:
+      - field
+      - kind
+      title: RunSettingModel
+    SetBankAliasPrimaryRequest:
+      description: Request model for showing (or no longer showing) an alias in place
+        of the bank id.
+      example:
+        primary: true
+      properties:
+        primary:
+          description: True to present the bank under this alias; False to go back
+            to its own id.
+          title: Primary
+          type: boolean
+      required:
+      - primary
+      title: SetBankAliasPrimaryRequest
     SourceFactsIncludeOptions:
       description: Options for including source facts for observation-type results.
       properties:
@@ -9954,6 +12440,129 @@ components:
           title: Max Tokens Per Observation
           type: integer
       title: SourceFactsIncludeOptions
+    StrategyPreview:
+      description: "Preview of one strategy, aligned by position with the request."
+      example:
+        active: true
+        claimed_count: 0
+        rules:
+        - taken_count: 1
+          observation_count: 5
+          match_count: 6
+          samples:
+          - handled_by: 2
+            count: 5
+            tags:
+            - tags
+            - tags
+          - handled_by: 2
+            count: 5
+            tags:
+            - tags
+            - tags
+        - taken_count: 1
+          observation_count: 5
+          match_count: 6
+          samples:
+          - handled_by: 2
+            count: 5
+            tags:
+            - tags
+            - tags
+          - handled_by: 2
+            count: 5
+            tags:
+            - tags
+            - tags
+      properties:
+        active:
+          description: "False when the server would ignore this strategy (no usable\
+            \ rule, or no setting)"
+          title: Active
+          type: boolean
+        claimed_count:
+          description: Existing scopes this strategy actually applies to
+          title: Claimed Count
+          type: integer
+        rules:
+          description: "One entry per rule, aligned with the request"
+          items:
+            $ref: '#/components/schemas/StrategyRulePreview'
+          type: array
+      required:
+      - active
+      - claimed_count
+      - rules
+      title: StrategyPreview
+    StrategyRulePreview:
+      description: What one rule (one entry of a strategy's `scopes`) matches among
+        existing scopes.
+      example:
+        taken_count: 1
+        observation_count: 5
+        match_count: 6
+        samples:
+        - handled_by: 2
+          count: 5
+          tags:
+          - tags
+          - tags
+        - handled_by: 2
+          count: 5
+          tags:
+          - tags
+          - tags
+      properties:
+        match_count:
+          description: Existing scopes this rule matches
+          title: Match Count
+          type: integer
+        taken_count:
+          description: "Of those, how many an earlier strategy wins, so this one has\
+            \ no effect"
+          title: Taken Count
+          type: integer
+        observation_count:
+          description: Observations across the matching scopes
+          title: Observation Count
+          type: integer
+        samples:
+          description: "The most populous matching scopes, up to sample_limit"
+          items:
+            $ref: '#/components/schemas/StrategyScopePreview'
+          type: array
+      required:
+      - match_count
+      - observation_count
+      - samples
+      - taken_count
+      title: StrategyRulePreview
+    StrategyScopePreview:
+      description: One existing observation scope in a consolidation-strategy preview.
+      example:
+        handled_by: 2
+        count: 5
+        tags:
+        - tags
+        - tags
+      properties:
+        tags:
+          description: The scope's tags (sorted)
+          items:
+            type: string
+          type: array
+        count:
+          description: Observations in this scope
+          title: Count
+          type: integer
+        handled_by:
+          nullable: true
+          type: integer
+      required:
+      - count
+      - handled_by
+      - tags
+      title: StrategyScopePreview
     TagGroupAnd-Input:
       description: "Compound AND group: all child filters must match."
       properties:
@@ -9977,6 +12586,7 @@ components:
     TagGroupLeaf:
       description: "A leaf tag filter: matches memories by tag list and match mode."
       example:
+        resolve: exact
         match: any_strict
         tags:
         - tags
@@ -9995,6 +12605,13 @@ components:
           - all_strict
           - exact
           title: Match
+          type: string
+        resolve:
+          default: exact
+          enum:
+          - exact
+          - fuzzy
+          title: Resolve
           type: string
       required:
       - tags
@@ -10082,6 +12699,22 @@ components:
       - end
       - start
       title: TemporalWindow
+    TextContentBlock:
+      description: "A run of text within a multimodal item, in the position the caller\
+        \ wrote it."
+      properties:
+        type:
+          enum:
+          - text
+          title: Type
+          type: string
+        text:
+          title: Text
+          type: string
+      required:
+      - text
+      - type
+      title: TextContentBlock
     TokenUsage:
       description: |-
         Token usage metrics for LLM calls.
@@ -10293,14 +12926,17 @@ components:
           recall_chunks_max_tokens: 5
           refresh_cron: refresh_cron
           tag_groups:
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
-          - match: any_strict
+          - resolve: exact
+            match: any_strict
             tags:
             - tags
             - tags
+          reflect_search_observations_include_entities: true
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
@@ -10313,10 +12949,11 @@ components:
           - exclude_mental_model_ids
           - exclude_mental_model_ids
           include_chunks: true
+          reflect_search_observations_max_tokens: 1
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 1
+          recall_max_tokens: 5
         tags:
         - tags
         - tags
@@ -10416,6 +13053,7 @@ components:
           document_export_api: true
           document_import_api: true
           file_upload_api: true
+          llm_concurrency_api: false
           llm_trace: false
           mcp: true
           observations: false
@@ -10572,6 +13210,9 @@ components:
     WebhookListResponse:
       description: Response model for listing webhooks.
       example:
+        total: 6
+        offset: 5
+        limit: 1
         items:
         - event_types:
           - event_types
@@ -10612,8 +13253,23 @@ components:
           items:
             $ref: '#/components/schemas/WebhookResponse'
           type: array
+        total:
+          description: Total number of webhooks on the bank (ignores limit/offset)
+          title: Total
+          type: integer
+        limit:
+          description: Maximum number of webhooks returned in this page
+          title: Limit
+          type: integer
+        offset:
+          description: Offset this page started at
+          title: Offset
+          type: integer
       required:
       - items
+      - limit
+      - offset
+      - total
       title: WebhookListResponse
     WebhookResponse:
       description: Response model for a webhook.
@@ -10670,6 +13326,17 @@ components:
       - id
       - url
       title: WebhookResponse
+    Content_anyOf_inner:
+      discriminator:
+        mapping:
+          file: '#/components/schemas/FileContentBlock'
+          image: '#/components/schemas/ImageContentBlock'
+          text: '#/components/schemas/TextContentBlock'
+        propertyName: type
+      oneOf:
+      - $ref: '#/components/schemas/TextContentBlock'
+      - $ref: '#/components/schemas/ImageContentBlock'
+      - $ref: '#/components/schemas/FileContentBlock'
     Observation_Scopes:
       anyOf:
       - type: string

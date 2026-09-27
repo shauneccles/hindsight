@@ -6,6 +6,8 @@
  * every harness adapter.
  */
 
+import { createHash } from "node:crypto";
+
 // ── retain missions (git vs chat need different extraction) ─────────────────────
 export const GIT_MISSION =
   "You are ingesting a single git commit: its message and its full diff. Extract the concrete " +
@@ -68,13 +70,21 @@ export const OBSERVATIONS_MISSION =
   "than creating a sibling alongside it; note that the rule was revised and when, so the superseded " +
   "version is visible as history rather than as a competing claim.";
 
+/** Extraction modes the plugin can run its own strategies under (`custom` needs instructions the
+ *  plugin does not have, so it is not offered). */
+export const RETAIN_EXTRACTION_MODES = ["concise", "verbose", "verbatim", "chunks"] as const;
+export type RetainExtractionMode = (typeof RETAIN_EXTRACTION_MODES)[number];
+/** `concise`, not `verbose`: every Stop writes the session back, so the mode is paid per turn, and
+ *  verbose made one active Claude Code session cost ~$150/hr on Cloud (#4560). */
+export const DEFAULT_RETAIN_EXTRACTION_MODE: RetainExtractionMode = "concise";
+
 export const RETAIN_STRATEGIES = {
-  git: { retain_mission: GIT_MISSION, retain_extraction_mode: "verbose" },
+  git: { retain_mission: GIT_MISSION, retain_extraction_mode: DEFAULT_RETAIN_EXTRACTION_MODE },
   // ONE big aggregated document (last N commit messages, no diffs) -> a larger chunk size so it stays
   // in as few chunks as possible and the extractor sees the whole history arc at once.
   gitlog: {
     retain_mission: GITLOG_MISSION,
-    retain_extraction_mode: "verbose",
+    retain_extraction_mode: DEFAULT_RETAIN_EXTRACTION_MODE,
     retain_chunk_size: 12000,
   },
   // ONE strategy for ALL developer conversations — backfilled decision chats and live working
@@ -85,15 +95,15 @@ export const RETAIN_STRATEGIES = {
   // the consolidation layer.
   conversation: {
     retain_mission: CONVERSATION_MISSION,
-    retain_extraction_mode: "verbose",
+    retain_extraction_mode: DEFAULT_RETAIN_EXTRACTION_MODE,
     retain_chunk_size: 12000,
   },
   // Structural documents (e.g. the codebase survey's ingested findings) aren't dialogue — the
-  // chat strategy's "final decision vs rejected proposal" extraction doesn't apply. Verbose mode
-  // with a bigger chunk size (documents can run long) captures the concrete facts/structure instead.
+  // chat strategy's "final decision vs rejected proposal" extraction doesn't apply. A bigger chunk
+  // size (documents can run long) keeps the concrete facts/structure together instead.
   document: {
     retain_mission: DOCUMENT_MISSION,
-    retain_extraction_mode: "verbose",
+    retain_extraction_mode: DEFAULT_RETAIN_EXTRACTION_MODE,
     retain_chunk_size: 12000,
   },
   // Codebase-SURVEY lifecycle documents, ONE strategy with conditional rules: the survey's
@@ -194,7 +204,13 @@ export interface KnowledgePage {
 }
 
 /**
- * The subject-scoping clause every seeded page's query carries, naming the repository it is about.
+ * The subject-scoping clause every page this plugin creates carries, naming the subject it is
+ * about — the seeded taxonomy (through `pagesFor`) and each captured initiative alike.
+ *
+ * `project` is the repository when the bank is one repository's, and the BANK otherwise — a bank
+ * several repos share has no repo to name, and naming whichever one seeded last made the sentence
+ * flip on every session start (#4146). Either way it must be stable for the bank, because the
+ * clause is PATCHed onto pages that outlive the session.
  *
  * A bank collects everything said IN a repository, which is NOT the same as everything said ABOUT
  * it: a repo that reads its dependency's source, drafts its upstream issues, or documents how it
@@ -209,10 +225,10 @@ export interface KnowledgePage {
  * Naming the repo and stating the exclusion is what lets the synthesizer make that call while it
  * still has the fact's text in front of it. It rides on `source_query` rather than the bank's
  * `reflect_mission` because the mission is seeded ONCE and then belongs to whoever set it
- * (CODING_BANK_STRUCTURE, #2492) — a mission-only fix would never reach an existing bank, while a
+ * (`codingBankManifest`, #2492) — a mission-only fix would never reach an existing bank, while a
  * reworded query re-syncs through `seedPages()`'s drift PATCH on the next run.
  */
-function pageScopeRule(project: string): string {
+export function pageScopeRule(project: string): string {
   return (
     ` Scope this page to ${project} ITSELF: the bank also holds facts about external tools, ` +
     `libraries and services that ${project} merely uses, configures, deploys or discusses, and ` +
@@ -268,15 +284,69 @@ const PAGE_TAXONOMY: readonly KnowledgePage[] = [
   },
 ];
 
+/** The seeded pages' names, in taxonomy order — the keys `RawConfig.pages` accepts. */
+export const PAGE_NAMES: readonly string[] = PAGE_TAXONOMY.map((page) => page.name);
+
 /**
- * The seeded pages for one repository: the taxonomy above with `project` named in every query.
- *
- * A pure function of `project`, so the query text is STABLE for a given repo and `seedPages()`
- * PATCHes once (on the upgrade that introduces the clause) rather than on every deepen run.
+ * What a config says about ONE seeded page, keyed by its name in `RawConfig.pages`:
+ *   false                   — don't seed it at all
+ *   { source_query: "..." } — seed it, but ask this question instead of the taxonomy's
+ * An absent entry means the taxonomy's own query, which is what every page gets by default.
  */
-export function pagesFor(project: string): KnowledgePage[] {
+export type PageOverride = false | { source_query?: string };
+export type PagesConfig = Record<string, PageOverride>;
+
+/**
+ * A page the USER defines, keyed by its name in `RawConfig.customPages` — as opposed to `pages`,
+ * which only reworks the taxonomy above:
+ *   source_query — the question the page answers (required)
+ *   tags         — which facts feed it, e.g. ["knowledge:decision"]. OPTIONAL: the page trigger
+ *                  matches tags with `all` (see PAGE_TAGS_MATCH), so no tags is no tag constraint
+ *                  rather than an empty page — it synthesizes from everything the bank holds.
+ */
+export interface CustomPage {
+  source_query: string;
+  tags?: string[];
+}
+export type CustomPagesConfig = Record<string, CustomPage>;
+
+/**
+ * The seeded pages for one subject: the taxonomy above with `project` named in every query, minus
+ * the ones `pages` disables and with its custom queries substituted.
+ *
+ * A pure function of its arguments, so the query text is STABLE for a given subject and
+ * `seedPages()` PATCHes once (on the upgrade that introduces the clause) rather than on every
+ * deepen run — which holds only while the caller's `project` is itself stable per bank (see
+ * `bankProjectName`), and while `pages` itself is stable.
+ *
+ * `pageScopeRule` is appended to a CUSTOM query too — a page from `customPages` included. It is
+ * what stops the synthesizer presenting a dependency's decisions as this project's own (#3476), a
+ * failure mode someone rewording or adding a question is not thereby choosing to take on.
+ */
+export function pagesFor(
+  project: string,
+  pages: PagesConfig = {},
+  customPages: CustomPagesConfig = {}
+): KnowledgePage[] {
   const scope = pageScopeRule(project);
-  return PAGE_TAXONOMY.map((page) => ({ ...page, source_query: page.source_query + scope }));
+  // Matched case-insensitively on the same key `seedPages` matches live pages by, so a config
+  // entry and the page it names can't disagree about which page that is.
+  const byName = new Map(
+    Object.entries(pages).map(([name, override]) => [name.trim().toLowerCase(), override])
+  );
+  const out: KnowledgePage[] = [];
+  for (const page of PAGE_TAXONOMY) {
+    const override = byName.get(page.name.toLowerCase());
+    if (override === false) continue;
+    out.push({ ...page, source_query: (override?.source_query || page.source_query) + scope });
+  }
+  // The user's own pages, seeded at the same root and treated exactly like a taxonomy page from
+  // here on: same scoping clause, same drift re-sync, same trigger. Appended last so a taxonomy
+  // page keeps its position, which is the order the seed log and the page roster read in.
+  for (const [name, page] of Object.entries(customPages)) {
+    out.push({ name: name.trim(), source_query: page.source_query + scope, tags: page.tags ?? [] });
+  }
+  return out;
 }
 
 // Refresh policy shared by every page this plugin creates — the seeded taxonomy above and the
@@ -289,7 +359,10 @@ export interface PageTrigger {
   /** How the page's own `tags` filter the memories a refresh reads. See `PAGE_TAGS_MATCH`. */
   tags_match: "any" | "all" | "any_strict" | "all_strict" | "exact";
   refresh_after_consolidation?: boolean;
-  refresh_cron?: string;
+  /** `null` CLEARS a schedule the page already has. The server drops an unstated counterpart only
+   *  for a truthy field, so `{refresh_after_consolidation: false}` alone would leave a cron in
+   *  place and the page would keep refreshing — see `pageTriggerPatch`. */
+  refresh_cron?: string | null;
 }
 
 /**
@@ -312,22 +385,155 @@ const PAGE_TAGS_MATCH = "all" as const;
 /** A page synthesizes from all three tiers; the fact types are not a preference. */
 export const PAGE_FACT_TYPES = ["world", "experience", "observation"];
 
+/**
+ * The default schedule: once an hour, each page on its own hashed minute (see `H` below).
+ *
+ * Hourly rather than daily because a knowledge page a coding agent reads at the start of a session
+ * is worth little if it lags a day behind the repo; hourly rather than per-consolidation because a
+ * refresh costs one LLM synthesis per page, and a repo under active work consolidates far more
+ * often than once an hour. The server skips a tick that has nothing new to fold in, so an idle
+ * repo pays nothing for the schedule.
+ */
+export const DEFAULT_PAGE_TRIGGER_CRON = "H * * * *";
+
 /** The config fields that shape the trigger (a subset of Config — see core/config.ts). */
 export interface PageTriggerConfig {
   pageTriggerType?: "auto-refresh" | "cron" | "manual";
   pageTriggerCron?: string;
 }
 
+// ── hashed cron fields (`H`) ───────────────────────────────────────────────────
+/**
+ * A cron field written `H` means "pick a value in this field's range by hashing the page", so
+ * every page gets its OWN stable slot instead of the one the config literally names.
+ *
+ * One `pageTriggerCron` is shared by every page in every bank running this plugin — it ships as a
+ * single documented example and is copied verbatim. A literal `"0 3 * * *"` therefore does not
+ * schedule a refresh at 03:00; it schedules ALL of them at 03:00, on the worker pool that also
+ * serves retain, so a session ingesting at 03:0x queues behind ~5 page syntheses per bank that
+ * happened to share the one minute the docs suggested. Moving the hour moves the pile.
+ *
+ * `H` is Jenkins' syntax for exactly this problem, borrowed rather than invented because it is
+ * already recognisable, and it composes with the rest of the expression instead of replacing it:
+ *
+ *   "H H * * *"      once a day, at this page's own minute and hour
+ *   "H * * * *"      once an hour, at this page's own minute
+ *   "H 3 * * *"      daily at 03:MM — spread within the hour the operator chose
+ *   "H H(0-5) * * *" daily, spread across the night only
+ *   "0 3 * * *"      unchanged: no `H`, no hashing, exactly what it says
+ *
+ * The alternative — one enum member per period (`daily-staggered`, then `hourly-staggered`, then
+ * whatever is asked for next) — spells the schedule in the type name, so every new period is a new
+ * config value, a new branch, and a new row of docs. Spreading is a property of the SCHEDULE, so it
+ * belongs in the expression.
+ *
+ * `H` never leaves this package: `expandCronHash` resolves it to an ordinary 5-field expression
+ * before the trigger is sent, because `refresh_cron` is parsed server-side as standard cron.
+ */
+const CRON_FIELD_RANGES: readonly (readonly [number, number])[] = [
+  [0, 59], // minute
+  [0, 23], // hour
+  [1, 31], // day of month
+  [1, 12], // month
+  [0, 6], // day of week
+];
+
+const HASHED_FIELD = /^H(?:\((\d+)-(\d+)\))?$/;
+
+/**
+ * Does this expression ask for hashing at all? Plain crons take every path below unchanged.
+ *
+ * Any field STARTING with `H` counts, not just a well-formed one: no standard cron field begins
+ * with `H` (values are digits, `*`, `,`, `-`, `/`, and the JAN-DEC/SUN-SAT names), so `"Hx"` is a
+ * typo in this package's syntax rather than something the server was going to accept. Claiming it
+ * here is what gets it reported as a malformed hashed field instead of an opaque cron parse error.
+ */
+export function isHashedCron(cron: string): boolean {
+  return /(^|\s)H/.test(cron);
+}
+
+/**
+ * The five fields of `cron` when every `H` in it is well-formed, else `undefined`.
+ *
+ * Only the `H` fields are checked. The rest are the server's to validate, as they already are —
+ * this package does not own cron syntax, only the extension it adds to it.
+ */
+export function parseHashedCron(cron: string): string[] | undefined {
+  const fields = cron.trim().split(/\s+/);
+  if (fields.length !== CRON_FIELD_RANGES.length) return undefined;
+  for (const [i, field] of fields.entries()) {
+    if (!field.startsWith("H")) continue;
+    const m = HASHED_FIELD.exec(field);
+    if (!m) return undefined;
+    if (m[1] === undefined) continue;
+    const [lo, hi] = [Number(m[1]), Number(m[2])];
+    const [min, max] = CRON_FIELD_RANGES[i];
+    if (lo > hi || lo < min || hi > max) return undefined;
+  }
+  return fields;
+}
+
+/**
+ * `seed`'s own value in `[lo, hi]` — stable across machines, processes and releases.
+ *
+ * The field index is hashed alongside the seed so `H H * * *` does not derive its minute and its
+ * hour from one number: the two would move together across pages, collapsing the 1440 daily slots
+ * the expression offers back towards 60.
+ */
+function hashedValue(seed: string, field: number, lo: number, hi: number): number {
+  const digest = createHash("sha256").update(`${seed}\u0000${field}`).digest();
+  return lo + (digest.readUInt32BE(0) % (hi - lo + 1));
+}
+
+/**
+ * `cron` with each `H` replaced by `seed`'s own value for that field — an ordinary cron expression.
+ *
+ * Returns the input untouched when it holds no `H`, and when an `H` in it is malformed: a bad
+ * expression is reported by the server that parses crons, not silently rewritten into a valid one
+ * that runs at a time nobody asked for. `resolvePageTriggerType` rejects it before it gets here.
+ */
+export function expandCronHash(cron: string, seed: string): string {
+  if (!isHashedCron(cron)) return cron;
+  const fields = parseHashedCron(cron);
+  if (!fields) return cron;
+  return fields
+    .map((field, i) => {
+      const m = HASHED_FIELD.exec(field);
+      if (!m) return field;
+      const [lo, hi] =
+        m[1] === undefined ? CRON_FIELD_RANGES[i] : ([Number(m[1]), Number(m[2])] as const);
+      return String(hashedValue(seed, i, lo, hi));
+    })
+    .join(" ");
+}
+
+/**
+ * `trigger` as it should be sent for ONE page, resolving any `H` against that page's identity.
+ *
+ * Applied where a page is created rather than where the trigger is built, because that is the only
+ * place the identity exists: `buildPageTrigger` runs once per session for all of them.
+ *
+ * The seed is bank + page name — the pair that identifies a page across runs — so a page keeps its
+ * slot for as long as it keeps its name, and two banks seeded from the same config land on
+ * different ones. Hashing distributes; it does not partition, so two pages CAN still collide.
+ */
+export function pageTriggerFor(trigger: PageTrigger, bank: string, page: string): PageTrigger {
+  const cron = trigger.refresh_cron;
+  if (!cron || !isHashedCron(cron)) return trigger;
+  return { ...trigger, refresh_cron: expandCronHash(cron, `${bank}\u0000${page}`) };
+}
+
 /**
  * How this project's pages keep themselves current.
  *
- * WHEN is the only part of this that is a preference. `auto-refresh` — the default, and what every
- * page shipped with — keeps a living document, rebuilt whenever consolidation produced new
- * material: the most current setting and the most expensive, since a busy repo consolidates
- * constantly and each pass is an LLM synthesis per page (#3506). `cron` bounds that to a schedule
- * (the server skips a tick when nothing changed), `manual` refreshes only when something asks. A page is a mental model like any
- * other, so the scheduler picks it up either way (`mental_models_with_cron()` filters on nothing
- * but a non-empty `refresh_cron`).
+ * WHEN is the only part of this that is a preference. The default is `cron` on
+ * `DEFAULT_PAGE_TRIGGER_CRON` — hourly, each page on its own hashed minute: current within the
+ * hour, and bounded, since the server skips a tick when nothing changed. `auto-refresh`, which
+ * every page used to ship with, rebuilds whenever consolidation produced new material — the most
+ * current setting and by far the most expensive, since a busy repo consolidates constantly and
+ * each pass is an LLM synthesis per page (#3506). `manual` refreshes only when something asks. A
+ * page is a mental model like any other, so the scheduler picks it up either way
+ * (`mental_models_with_cron()` filters on nothing but a non-empty `refresh_cron`).
  *
  * HOW a page refreshes is deliberately NOT stated here. `create_knowledge_page` owns that
  * (`KNOWLEDGE_PAGE_DEFAULT_TRIGGER`: delta refresh, no sibling pages in the reflect loop) and
@@ -345,13 +551,54 @@ export interface PageTriggerConfig {
 export function buildPageTrigger(cfg: PageTriggerConfig = {}): PageTrigger {
   const base: PageTrigger = { fact_types: PAGE_FACT_TYPES, tags_match: PAGE_TAGS_MATCH };
   switch (cfg.pageTriggerType) {
-    case "cron":
-      return { ...base, refresh_cron: cfg.pageTriggerCron };
+    case "auto-refresh":
+      return { ...base, refresh_after_consolidation: true };
     case "manual":
       return { ...base, refresh_after_consolidation: false };
+    // "cron" and an unset type alike: the default schedule stands in for a missing expression, so
+    // a trigger built from a partial config is never a cron trigger with nothing to fire on.
     default:
-      return { ...base, refresh_after_consolidation: true };
+      return { ...base, refresh_cron: cfg.pageTriggerCron || DEFAULT_PAGE_TRIGGER_CRON };
   }
+}
+
+/** A page's refresh policy as the tree reports it — the EFFECTIVE one, defaults filled in. */
+export interface CurrentPageTrigger {
+  tags_match?: string;
+  refresh_after_consolidation?: boolean;
+  refresh_cron?: string | null;
+}
+
+/**
+ * Has an existing page's refresh policy drifted from what this config asks for?
+ *
+ * Compared against the page's OWN resolved trigger (`pageTriggerFor`), not the shared one: under a
+ * hashed cron every page has a different expression, and comparing the unresolved `H * * * *`
+ * would report drift on every page on every session.
+ *
+ * Only the fields this plugin actually states are compared. Everything else on the trigger —
+ * `mode`, sibling exclusion, `min_refresh_interval_seconds` — is the server's or the operator's,
+ * and a re-sync must not have an opinion about it (#3506).
+ */
+export function pageTriggerDrifted(current: CurrentPageTrigger, desired: PageTrigger): boolean {
+  return (
+    current.tags_match !== desired.tags_match ||
+    (current.refresh_cron ?? null) !== (desired.refresh_cron ?? null) ||
+    Boolean(current.refresh_after_consolidation) !== Boolean(desired.refresh_after_consolidation)
+  );
+}
+
+/**
+ * The trigger to PATCH onto an existing page, given the one we would create it with.
+ *
+ * The server merges a trigger patch field by field and drops the unstated counterpart of a TRUTHY
+ * refresh field, so a cron patch clears auto-refresh and vice versa. `manual` is the gap: its
+ * `refresh_after_consolidation: false` is falsy, nothing is dropped, and a page that had a cron
+ * would keep firing on it. Stating `refresh_cron: null` closes that.
+ */
+export function pageTriggerPatch(desired: PageTrigger): PageTrigger {
+  if (desired.refresh_after_consolidation === false) return { ...desired, refresh_cron: null };
+  return desired;
 }
 
 // ── the bank template ──────────────────────────────────────────────────────────
@@ -370,7 +617,7 @@ export const CODING_BANK_TEMPLATE = {
     enable_observations: true,
     observations_mission: OBSERVATIONS_MISSION,
     retain_mission: GIT_MISSION,
-    retain_extraction_mode: "verbose",
+    retain_extraction_mode: DEFAULT_RETAIN_EXTRACTION_MODE,
     retain_default_strategy: "git",
     retain_strategies: RETAIN_STRATEGIES,
     entity_labels: [KNOWLEDGE_LABELS],
@@ -378,21 +625,102 @@ export const CODING_BANK_TEMPLATE = {
   },
 } as const;
 
+/** Bank-level missions the template seeds ONCE and then leaves alone (#2492). */
+const MISSION_FIELDS = ["reflect_mission", "retain_mission", "observations_mission"] as const;
+
+/** Bank-scoped config OVERRIDES exactly as `GET /banks/{id}/config` reports them. */
+export type BankOverrides = Record<string, unknown>;
+
+/** The manifest `configureBank` POSTs to `/banks/{id}/import`. */
+export interface BankManifest {
+  version: "1";
+  bank: Record<string, unknown>;
+}
+
+/** A bank-config override the bank's owner actually made. Blank is not a choice; `false` is. */
+function isSet(v: unknown): boolean {
+  if (v === null || v === undefined) return false;
+  if (typeof v === "string") return v.trim() !== "";
+  return true;
+}
+
 /**
- * The subset re-applied to a bank that is ALREADY configured — everything above minus the missions.
+ * The template fields still missing from a bank whose overrides are `overrides` — or `undefined`
+ * when it already carries them all and there is nothing to write.
  *
- * The full template seeds a bank once. After that the missions are the user's: someone who rewrites
- * `reflect_mission` in the control plane means it, and re-importing the manifest on every seed pass
- * silently stamped the defaults back over it (#2492 — the same regression #1270 fixed for OpenClaw).
+ * **This plugin only ever ADDS what is missing; it never overwrites what the bank already says.**
  *
- * The retain strategies and entity labels stay, because they are not preferences: this plugin writes
- * documents under `git` / `gitlog` / `conversation` / `document`, and a bank missing one of those
- * would reject the write. A newer plugin adding a strategy needs it to land on existing banks too.
+ * Re-applying the whole template on every pass is how a plugin takes a bank over, and it has now
+ * been fixed three times over the same shape: #1270 for OpenClaw's missions, #2492 for this
+ * plugin's, and #3927 for everything those two left un-guarded. Each earlier fix protected only the
+ * fields that had just been noticed, so the rest kept being stamped back on every session start.
+ * Reading the current overrides and writing only where the bank is silent covers the whole surface
+ * at once, including whatever gets added to the template next.
+ *
+ * The two container fields merge PER ENTRY, because the server stores each as ONE config value and
+ * an import replaces it outright: re-sending the five strategies wholesale deleted any strategy the
+ * user had defined, reverted their edits to the plugin's own (mission, extraction mode, chunk
+ * size), and could leave `retain_default_strategy` naming a strategy that no longer existed.
+ * Merging still lets a strategy ADDED by a newer plugin release reach an existing bank — the reason
+ * the re-apply exists — without touching the entries already there.
+ *
+ * The consequence is deliberate: a release that REWORDS an existing strategy or label does not
+ * reach a bank that already has it. Clearing that override on the bank takes the current default
+ * back, since the next pass then finds the bank silent there.
+ *
+ * ONE exception, and it is a config key rather than a default: the extraction mode of the plugin's
+ * own strategies follows `mode` (RawConfig.retainExtractionMode) and is re-synced on drift, the way
+ * `seedPages()` re-syncs a page's query. It is what every session write-back costs, so it has to be
+ * changeable from the plugin's config and reach banks seeded before the change (#4560). The
+ * strategy's other fields, and any strategy the plugin did not define, are still left alone.
  */
-export const CODING_BANK_STRUCTURE = {
-  version: "1",
-  bank: {
-    retain_strategies: RETAIN_STRATEGIES,
-    entity_labels: [KNOWLEDGE_LABELS],
-  },
-} as const;
+export function codingBankManifest(
+  overrides: BankOverrides | undefined,
+  mode: RetainExtractionMode = DEFAULT_RETAIN_EXTRACTION_MODE
+): BankManifest | undefined {
+  // Unreadable overrides — the bank does not exist yet, or the deployment has the bank-config API
+  // switched off. Nothing can have been customised through an API that is not there, and this same
+  // POST is what CREATES the bank, so `{}` seeds the lot (every branch below fires, and the result
+  // is CODING_BANK_TEMPLATE — asserted in missions.test.ts).
+  const current = overrides ?? {};
+  const template = CODING_BANK_TEMPLATE.bank;
+  const bank: Record<string, unknown> = {};
+
+  // The missions are seeded as a GROUP: the plugin writes all three together, so any one of them
+  // being present means this bank has been seeded already, or its owner wrote their own (#2492).
+  if (!MISSION_FIELDS.some((f) => isSet(current[f]))) {
+    bank.reflect_mission = template.reflect_mission;
+    bank.enable_observations = template.enable_observations;
+    bank.observations_mission = template.observations_mission;
+    bank.retain_mission = template.retain_mission;
+    bank.retain_extraction_mode = mode;
+  }
+
+  if (!isSet(current.retain_default_strategy))
+    bank.retain_default_strategy = template.retain_default_strategy;
+  if (!isSet(current.entities_allow_free_form))
+    bank.entities_allow_free_form = template.entities_allow_free_form;
+
+  const strategies =
+    current.retain_strategies && typeof current.retain_strategies === "object"
+      ? (current.retain_strategies as Record<string, unknown>)
+      : {};
+  const updates: Record<string, unknown> = {};
+  for (const [name, def] of Object.entries(template.retain_strategies)) {
+    // `custom` (the survey) carries its own instructions and is not the configured mode's to change.
+    const synced = def.retain_extraction_mode === "custom" ? {} : { retain_extraction_mode: mode };
+    const have = strategies[name] as Record<string, unknown> | null | undefined;
+    if (!have || typeof have !== "object") updates[name] = { ...def, ...synced };
+    else if ("retain_extraction_mode" in synced && have.retain_extraction_mode !== mode)
+      updates[name] = { ...have, ...synced };
+  }
+  // The whole map is one config value, so the UNION has to be sent — not just the changes.
+  if (Object.keys(updates).length > 0) bank.retain_strategies = { ...strategies, ...updates };
+
+  const labels = Array.isArray(current.entity_labels) ? current.entity_labels : [];
+  const [knowledgeGroup] = template.entity_labels;
+  if (!labels.some((g) => (g as { key?: unknown } | null)?.key === knowledgeGroup.key))
+    bank.entity_labels = [...labels, knowledgeGroup];
+
+  return Object.keys(bank).length > 0 ? { version: "1", bank } : undefined;
+}

@@ -29,6 +29,12 @@ import type {
   ClearObservationsData,
   ClearObservationsErrors,
   ClearObservationsResponses,
+  CloneBankData,
+  CloneBankErrors,
+  CloneBankResponses,
+  CreateBankAliasData,
+  CreateBankAliasErrors,
+  CreateBankAliasResponses,
   CreateDirectiveData,
   CreateDirectiveErrors,
   CreateDirectiveResponses,
@@ -47,6 +53,9 @@ import type {
   CreateWebhookData,
   CreateWebhookErrors,
   CreateWebhookResponses,
+  DeleteBankAliasData,
+  DeleteBankAliasErrors,
+  DeleteBankAliasResponses,
   DeleteBankData,
   DeleteBankErrors,
   DeleteBankResponses,
@@ -80,6 +89,9 @@ import type {
   ExportBankTemplateData,
   ExportBankTemplateErrors,
   ExportBankTemplateResponses,
+  ExportBankTransferData,
+  ExportBankTransferErrors,
+  ExportBankTransferResponses,
   ExportDocumentsData,
   ExportDocumentsErrors,
   ExportDocumentsResponses,
@@ -95,6 +107,9 @@ import type {
   GetAgentStatsData,
   GetAgentStatsErrors,
   GetAgentStatsResponses,
+  GetBankAttachmentData,
+  GetBankAttachmentErrors,
+  GetBankAttachmentResponses,
   GetBankConfigData,
   GetBankConfigErrors,
   GetBankConfigResponses,
@@ -129,6 +144,9 @@ import type {
   GetKnowledgePageResponses,
   GetLivenessData,
   GetLivenessResponses,
+  GetLlmConcurrencyData,
+  GetLlmConcurrencyErrors,
+  GetLlmConcurrencyResponses,
   GetMemoriesTimeseriesData,
   GetMemoriesTimeseriesErrors,
   GetMemoriesTimeseriesResponses,
@@ -156,12 +174,18 @@ import type {
   ImportBankTemplateData,
   ImportBankTemplateErrors,
   ImportBankTemplateResponses,
+  ImportBankTransferData,
+  ImportBankTransferErrors,
+  ImportBankTransferResponses,
   ImportDocumentsData,
   ImportDocumentsErrors,
   ImportDocumentsResponses,
   ListAuditLogsData,
   ListAuditLogsErrors,
   ListAuditLogsResponses,
+  ListBankAliasesData,
+  ListBankAliasesErrors,
+  ListBankAliasesResponses,
   ListBanksData,
   ListBanksErrors,
   ListBanksResponses,
@@ -206,6 +230,12 @@ import type {
   LlmRequestStatsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
+  PreviewConsolidationStrategiesData,
+  PreviewConsolidationStrategiesErrors,
+  PreviewConsolidationStrategiesResponses,
+  PreviewPromptData,
+  PreviewPromptErrors,
+  PreviewPromptResponses,
   RecallMemoriesData,
   RecallMemoriesErrors,
   RecallMemoriesResponses,
@@ -227,6 +257,9 @@ import type {
   ResetBankConfigData,
   ResetBankConfigErrors,
   ResetBankConfigResponses,
+  ResetLlmConcurrencyData,
+  ResetLlmConcurrencyErrors,
+  ResetLlmConcurrencyResponses,
   RetainMemoriesData,
   RetainMemoriesErrors,
   RetainMemoriesResponses,
@@ -236,6 +269,9 @@ import type {
   SearchKnowledgeBaseData,
   SearchKnowledgeBaseErrors,
   SearchKnowledgeBaseResponses,
+  SetBankAliasPrimaryData,
+  SetBankAliasPrimaryErrors,
+  SetBankAliasPrimaryResponses,
   TestBankLlmData,
   TestBankLlmErrors,
   TestBankLlmResponses,
@@ -260,6 +296,9 @@ import type {
   UpdateKnowledgeNodeData,
   UpdateKnowledgeNodeErrors,
   UpdateKnowledgeNodeResponses,
+  UpdateLlmConcurrencyData,
+  UpdateLlmConcurrencyErrors,
+  UpdateLlmConcurrencyResponses,
   UpdateMemoryData,
   UpdateMemoryErrors,
   UpdateMemoryResponses,
@@ -342,6 +381,55 @@ export const getVersion = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Reset LLM concurrency
+ *
+ * Restore the process-wide LLM concurrency cap to HINDSIGHT_API_LLM_MAX_CONCURRENT.
+ */
+export const resetLlmConcurrency = <ThrowOnError extends boolean = false>(
+  options?: Options<ResetLlmConcurrencyData, ThrowOnError>
+) =>
+  (options?.client ?? client).delete<
+    ResetLlmConcurrencyResponses,
+    ResetLlmConcurrencyErrors,
+    ThrowOnError
+  >({ url: "/v1/default/llm-concurrency", ...options });
+
+/**
+ * Get LLM concurrency
+ *
+ * The process-wide cap on concurrent LLM calls, its configured default, and live usage. Always available: HINDSIGHT_API_ENABLE_LLM_CONCURRENCY_API gates only the write operations on this resource.
+ */
+export const getLlmConcurrency = <ThrowOnError extends boolean = false>(
+  options?: Options<GetLlmConcurrencyData, ThrowOnError>
+) =>
+  (options?.client ?? client).get<
+    GetLlmConcurrencyResponses,
+    GetLlmConcurrencyErrors,
+    ThrowOnError
+  >({ url: "/v1/default/llm-concurrency", ...options });
+
+/**
+ * Update LLM concurrency
+ *
+ * Resize the process-wide cap on concurrent LLM calls without a restart. In-flight calls are never interrupted: lowering the cap stops new calls from starting until usage is under it, and raising it starts waiting calls immediately. Not persisted: a restart restores HINDSIGHT_API_LLM_MAX_CONCURRENT.
+ */
+export const updateLlmConcurrency = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateLlmConcurrencyData, ThrowOnError>
+) =>
+  (options.client ?? client).patch<
+    UpdateLlmConcurrencyResponses,
+    UpdateLlmConcurrencyErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/llm-concurrency",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Prometheus metrics endpoint
  *
  * Exports metrics in Prometheus format for scraping
@@ -370,7 +458,7 @@ export const getGraph = <ThrowOnError extends boolean = false>(
 /**
  * List memory units
  *
- * List memory units with pagination and optional full-text search. Supports filtering by type, source document, and linked entity ID. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).
+ * List memory units with pagination and optional full-text search. Supports filtering by type, source document, linked entity ID, and a time window. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC) unless a time window selects another axis.
  */
 export const listMemories = <ThrowOnError extends boolean = false>(
   options: Options<ListMemoriesData, ThrowOnError>
@@ -394,6 +482,23 @@ export const dryRunExtractMemories = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/memories/dry-run-extract",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Preview an operation's prompts (no LLM call)
+ *
+ * Render the exact system and user messages retain, consolidation or reflect would send for this bank, without calling an LLM, reading memories, or changing anything. Everything that shapes the prompt comes from the bank; the runtime data an operation would be given is a fixed placeholder. Both messages are returned: retain and consolidation keep their system prompt bank-agnostic (one provider-side cache serves every bank) and carry the mission in the user message instead.
+ */
+export const previewPrompt = <ThrowOnError extends boolean = false>(
+  options: Options<PreviewPromptData, ThrowOnError>
+) =>
+  (options.client ?? client).post<PreviewPromptResponses, PreviewPromptErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/prompts/preview",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -953,7 +1058,7 @@ export const updateDirective = <ThrowOnError extends boolean = false>(
 /**
  * List documents
  *
- * List documents with pagination and optional search, most recently written first (`updated_at` descending). Documents are the source content from which memory units are extracted.
+ * List documents with pagination, optional search, and an optional time window. Most recently written first (`updated_at` descending) unless `time_field` selects another axis. Documents are the source content from which memory units are extracted.
  */
 export const listDocuments = <ThrowOnError extends boolean = false>(
   options: Options<ListDocumentsData, ThrowOnError>
@@ -1029,7 +1134,9 @@ export const getDocument = <ThrowOnError extends boolean = false>(
  *
  * Update mutable fields on a document without re-processing its content.
  *
- * **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+ * **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
+ *
+ * The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
  *
  * At least one field must be provided.
  */
@@ -1085,9 +1192,9 @@ export const listOperations = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Cancel a pending async operation
+ * Cancel a pending or in-flight async operation
  *
- * Cancel a pending async operation by removing it from the queue
+ * Cancel a queued or running async operation. A 'pending' operation is never started. A 'processing' one is cancelled cooperatively: the row is marked 'cancelled' immediately and the worker running it stops at its next checkpoint, so work already in flight may finish the batch it is on. This also clears operations stranded in 'processing' by a crashed worker. Returns 409 for operations that already reached a terminal state.
  */
 export const cancelOperation = <ThrowOnError extends boolean = false>(
   options: Options<CancelOperationData, ThrowOnError>
@@ -1138,9 +1245,9 @@ export const deleteOperation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Get memory bank profile
+ * Get memory bank profile (removed — use GET .../config)
  *
- * Get disposition traits and mission for a memory bank. Returns 404 if the bank does not exist.
+ * **Removed.** The bank profile endpoints have been removed. Disposition traits and the reflect mission are bank configuration: read them from GET /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`, `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config. The `name` field this endpoint also returned was a display-only label; read it from GET /v1/default/banks.
  *
  * @deprecated
  */
@@ -1153,9 +1260,9 @@ export const getBankProfile = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Update memory bank disposition
+ * Update memory bank disposition (removed — use PATCH .../config)
  *
- * Update bank's disposition traits (skepticism, literalism, empathy)
+ * **Removed.** The bank profile endpoints have been removed. Disposition traits and the reflect mission are bank configuration: read them from GET /v1/default/banks/{bank_id}/config as `disposition_skepticism`, `disposition_literalism`, `disposition_empathy` and `reflect_mission`, and write them with PATCH /v1/default/banks/{bank_id}/config. The `name` field this endpoint also returned was a display-only label; read it from GET /v1/default/banks.
  *
  * @deprecated
  */
@@ -1176,9 +1283,9 @@ export const updateBankDisposition = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Add/merge memory bank background (deprecated)
+ * Add/merge memory bank background (removed — use PATCH .../config)
  *
- * Deprecated: Use PUT /mission instead. This endpoint now updates the mission field.
+ * **Removed.** The bank background was folded into the reflect mission. Write it with PATCH /v1/default/banks/{bank_id}/config as `reflect_mission`. That call replaces the value rather than merging into it, so read the current mission from GET .../config first if you relied on this endpoint's append behaviour.
  *
  * @deprecated
  */
@@ -1191,6 +1298,74 @@ export const addBankBackground = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/background",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List the bank's aliases
+ *
+ * Extra bank ids that reach this bank. Every endpoint accepts an alias wherever it accepts a bank id, so callers can be moved onto a new id in phases while the old one keeps working.
+ */
+export const listBankAliases = <ThrowOnError extends boolean = false>(
+  options: Options<ListBankAliasesData, ThrowOnError>
+) =>
+  (options.client ?? client).get<ListBankAliasesResponses, ListBankAliasesErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/aliases",
+    ...options,
+  });
+
+/**
+ * Add an alias to the bank
+ *
+ * Give the bank another id to answer to. Nothing is copied or moved: the bank keeps its own id and all of its data, and the alias is only a second way to reach it — which is what makes it a zero-downtime alternative to renaming.
+ *
+ * Returns 409 if the name is already a bank or another alias.
+ */
+export const createBankAlias = <ThrowOnError extends boolean = false>(
+  options: Options<CreateBankAliasData, ThrowOnError>
+) =>
+  (options.client ?? client).post<CreateBankAliasResponses, CreateBankAliasErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/aliases",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Remove an alias from the bank
+ *
+ * Stop an id reaching this bank. The bank and its memories are untouched; only the extra name goes away, and callers still using it get the same 404 (or new empty bank) they would have got before it existed.
+ */
+export const deleteBankAlias = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteBankAliasData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<DeleteBankAliasResponses, DeleteBankAliasErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/aliases/{alias}",
+    ...options,
+  });
+
+/**
+ * Show this alias in place of the bank id
+ *
+ * Present the bank under one of its aliases. Purely cosmetic: the bank keeps its own `bank_id`, which every other part of the system — authorisation, metering, exports, audit logs — continues to use.
+ *
+ * Promoting an alias demotes whichever one was shown before, so a bank is presented under at most one alias. Send `primary: false` to go back to showing its own id.
+ */
+export const setBankAliasPrimary = <ThrowOnError extends boolean = false>(
+  options: Options<SetBankAliasPrimaryData, ThrowOnError>
+) =>
+  (options.client ?? client).patch<
+    SetBankAliasPrimaryResponses,
+    SetBankAliasPrimaryErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/aliases/{alias}",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -1261,7 +1436,14 @@ export const importBankTemplate = <ThrowOnError extends boolean = false>(
     ImportBankTemplateResponses,
     ImportBankTemplateErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/import", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Export bank template
@@ -1297,6 +1479,8 @@ export const exportDocumentsSyncRemoved = <ThrowOnError extends boolean = false>
  * Import documents (async)
  *
  * Submit a transfer archive (produced by the export endpoint) for import into a bank. Runs as a background operation: facts are re-embedded with the target bank's embedding model and entities are re-resolved — no LLM extraction. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and the imported/skipped counts in result_metadata. Use on_conflict to control existing document ids: skip (default), replace, or new-id.
+ *
+ * @deprecated
  */
 export const importDocuments = <ThrowOnError extends boolean = false>(
   options: Options<ImportDocumentsData, ThrowOnError>
@@ -1315,6 +1499,8 @@ export const importDocuments = <ThrowOnError extends boolean = false>(
  * Export documents (async)
  *
  * Submit an async export of a bank's documents (extracted facts, entity names, causal links, chunks) as a transfer ZIP archive. Embeddings and database ids are not included — importing re-embeds with the target bank's model and re-resolves entities. Runs as a background operation to avoid pinning the API on large banks. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id}. On completion the operation's result_metadata carries download_url (fetch the ZIP from GET /v1/default/files/download/{key}), storage_key, byte_size, and filename. Pass document_id query params to export specific documents, or omit to export the whole bank; include_observations=true carries consolidated observations and include_knowledge_base=true carries Mental Models plus Knowledge Pages (all whole-bank export only).
+ *
+ * @deprecated
  */
 export const exportDocuments = <ThrowOnError extends boolean = false>(
   options: Options<ExportDocumentsData, ThrowOnError>
@@ -1323,6 +1509,79 @@ export const exportDocuments = <ThrowOnError extends boolean = false>(
     url: "/v1/default/banks/{bank_id}/document-transfer/export",
     ...options,
   });
+
+/**
+ * Export a bank (async)
+ *
+ * Submit an async export of a bank as a transfer ZIP archive. Three flags choose what the archive carries: include_data (documents, facts, observations, attachments and their bytes, the curation archive, the operations log and the maintenance queues), include_bank_config (bank config, mental models and their history, knowledge pages), include_bank_config (the bank's config overrides, directives and webhooks) and include_history (audit_log, llm_requests). Embeddings and database ids are never carried — importing re-embeds with the target bank's model and re-resolves entities, so an archive moves between instances configured with different embedding models. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id}, then fetch the archive from the download_url in its result_metadata. Pass document_id to export specific documents instead of the whole bank (a document subset carries no bank-level sections).
+ */
+export const exportBankTransfer = <ThrowOnError extends boolean = false>(
+  options: Options<ExportBankTransferData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    ExportBankTransferResponses,
+    ExportBankTransferErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/transfer/export", ...options });
+
+/**
+ * Import a bank (async)
+ *
+ * Submit a transfer archive (produced by the export endpoint) for import. Runs as a background operation: facts are re-embedded with the target bank's embedding model and entities are re-resolved — no LLM extraction, so the import costs no tokens and invents no new facts.
+ *
+ * Two modes. `restore` (default) writes a whole bank into target_bank_id, which must NOT already exist — it restores a bank rather than merging into one, and is how a bank is moved between instances or copied under a new id. `merge` folds an archive's documents into this bank, with document_conflict deciding what happens to ids that already exist (skip, replace, new-id).
+ *
+ * The include flags narrow what is restored to a subset of what the archive holds; they cannot add what the producer did not export. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and per-component counts. The operation is recorded against {bank_id} even in restore mode, because the target bank does not exist yet.
+ */
+export const importBankTransfer = <ThrowOnError extends boolean = false>(
+  options: Options<ImportBankTransferData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    ImportBankTransferResponses,
+    ImportBankTransferErrors,
+    ThrowOnError
+  >({
+    ...formDataBodySerializer,
+    url: "/v1/default/banks/{bank_id}/transfer/import",
+    ...options,
+    headers: {
+      "Content-Type": null,
+      ...options.headers,
+    },
+  });
+
+/**
+ * Clone a bank (async)
+ *
+ * Copy this bank into a new one, in a single call. The clone starts with the source's memories as they are at clone time and evolves independently from then on: later retains, consolidation and edits on either bank leave the other alone.
+ *
+ * This is the export and import above run back to back on this instance, so nothing is re-extracted and no LLM is called — facts are re-embedded and entities re-resolved, exactly as a restore does. The same three flags choose what the clone inherits: include_data (documents, facts, observations, attachments, the curation archive, the operations log, and the mental models and knowledge pages synthesized from them), include_bank_config (the bank's config overrides, directives and **webhooks**) and include_history (audit_log, llm_requests).
+ *
+ * Note the webhooks: they travel with the bank's configuration, so a clone made with the default flags will call the source's webhook endpoints. Pass include_bank_config=false, or delete them on the clone, when they point at a per-bank consumer.
+ *
+ * target_bank_id must not already exist. Returns an operation_id, recorded against the source bank (the target does not exist yet); poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and the per-component counts.
+ */
+export const cloneBank = <ThrowOnError extends boolean = false>(
+  options: Options<CloneBankData, ThrowOnError>
+) =>
+  (options.client ?? client).post<CloneBankResponses, CloneBankErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/clone",
+    ...options,
+  });
+
+/**
+ * Fetch an attachment retained inline with a document
+ *
+ * Serve the bytes of an attachment retained as inline content. The id is the one inside a placeholder token, and is returned on `attachments[].url` by recall and by the document/chunk/memory reads — so an agent can show or reason over the original behind an attachment-derived fact.
+ *
+ * Bytes are served with the Content-Type the caller declared at retain. Access is authorized against the bank; a missing attachment and an invisible bank both return 404, so the endpoint cannot be used to probe what a bank holds.
+ */
+export const getBankAttachment = <ThrowOnError extends boolean = false>(
+  options: Options<GetBankAttachmentData, ThrowOnError>
+) =>
+  (options.client ?? client).get<GetBankAttachmentResponses, GetBankAttachmentErrors, ThrowOnError>(
+    { url: "/v1/default/banks/{bank_id}/attachments/{attachment_id}", ...options }
+  );
 
 /**
  * Download a stored file (async export archive)
@@ -1367,7 +1626,7 @@ export const clearObservations = <ThrowOnError extends boolean = false>(
 /**
  * List observation scopes
  *
- * Enumerate the distinct scopes across a bank's observations. Each observation lives under a scope: the exact set of tags it was consolidated with. Returns every distinct scope (tag order normalized) with the number of observations in it; the empty tag list is the global/untagged scope. Use a returned scope with the graph endpoint (tags=<scope> & tags_match=exact) to filter observations to exactly that scope.
+ * Enumerate the distinct scopes across a bank's observations. Each observation lives under a scope: the exact set of tags it was consolidated with. Returns every distinct scope (tag order normalized) with the number of observations in it; the empty tag list is the global/untagged scope. Use a returned scope with the graph endpoint (tags=<scope> & tags_match=exact) to filter observations to exactly that scope. Paged: `total` reports every distinct scope in the bank.
  */
 export const listObservationScopes = <ThrowOnError extends boolean = false>(
   options: Options<ListObservationScopesData, ThrowOnError>
@@ -1377,6 +1636,27 @@ export const listObservationScopes = <ThrowOnError extends boolean = false>(
     ListObservationScopesErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/observations/scopes", ...options });
+
+/**
+ * Preview consolidation strategies
+ *
+ * Report which of the bank's existing observation scopes each consolidation strategy would apply to, for a draft `consolidation_strategies` value (nothing is saved). Uses the same matching and first-strategy-wins rule as consolidation. Scans up to 10,000 distinct scopes; `complete` is false beyond that and the counts are lower bounds. Scopes with no observations yet do not exist and are not counted.
+ */
+export const previewConsolidationStrategies = <ThrowOnError extends boolean = false>(
+  options: Options<PreviewConsolidationStrategiesData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    PreviewConsolidationStrategiesResponses,
+    PreviewConsolidationStrategiesErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/consolidation-strategies/preview",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Recover failed consolidation
@@ -1422,7 +1702,7 @@ export const resetBankConfig = <ThrowOnError extends boolean = false>(
 /**
  * Get bank configuration
  *
- * Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides.
+ * Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides. Always available: HINDSIGHT_API_ENABLE_BANK_CONFIG_API gates only the write operations on this resource.
  */
 export const getBankConfig = <ThrowOnError extends boolean = false>(
   options: Options<GetBankConfigData, ThrowOnError>
@@ -1475,7 +1755,7 @@ export const triggerConsolidation = <ThrowOnError extends boolean = false>(
 /**
  * List webhooks
  *
- * List all webhooks registered for a bank.
+ * List the webhooks registered for a bank, oldest first. Paged: `total` reports every webhook on the bank.
  */
 export const listWebhooks = <ThrowOnError extends boolean = false>(
   options: Options<ListWebhooksData, ThrowOnError>

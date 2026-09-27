@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { createDshHooks, toDshParameters, type Workspace } from "./dsh";
+import { createDshHooks, dshSessionEvents, toDshParameters, type Workspace } from "./dsh";
+import { readDshEvents } from "./core/transcript-dsh";
 import type { ToolSpec } from "./core/knowledge-tools";
 import { z } from "zod";
 
@@ -51,8 +52,10 @@ describe("dsh pre-step injection", () => {
     expect(appended).toMatchObject({
       role: "user",
       content: [{ type: "text", text: "<hindsight_memory>past decision</hindsight_memory>" }],
-      source: { kind: "plugin", plugin: "hindsight", form: "recall" },
     });
+    // Exact, not a partial match: dsh 0.1.7 (session format V4) aborts the turn on the retired
+    // `kind: "plugin"` wrapper, so no `plugin` field may ride along either.
+    expect(appended.source).toEqual({ kind: "plugin:hindsight", form: "recall" });
     expect(appended.id).toEqual(expect.any(String));
   });
 
@@ -148,11 +151,77 @@ describe("dsh session start", () => {
   });
 });
 
+describe("dshSessionEvents (alpha.4+ transcript source)", () => {
+  const sampleEvents = [
+    {
+      type: "user/message",
+      time: Date.parse("2026-09-05T08:00:00Z"),
+      data: {
+        id: "m-1",
+        role: "user",
+        content: [{ type: "text", text: "why is chatDocs zero?" }],
+        source: { kind: "user" },
+      },
+    },
+    {
+      type: "assistant/message",
+      time: Date.parse("2026-09-05T08:00:01Z"),
+      data: {
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "session.events was removed." }],
+          source: { kind: "model" },
+        },
+      },
+    },
+  ];
+
+  it("reads snapshotEvents when the legacy events property is absent", () => {
+    const session = { snapshotEvents: () => sampleEvents };
+    expect(dshSessionEvents(session)).toEqual(sampleEvents);
+    expect(readDshEvents(dshSessionEvents(session))).toEqual([
+      {
+        role: "user",
+        content: "why is chatDocs zero?",
+        timestamp: "2026-09-05T08:00:00.000Z",
+      },
+      {
+        role: "assistant",
+        content: "session.events was removed.",
+        timestamp: "2026-09-05T08:00:01.000Z",
+      },
+    ]);
+  });
+
+  it("falls back to the legacy events property when snapshotEvents is missing", () => {
+    const session = { events: sampleEvents };
+    expect(dshSessionEvents(session)).toBe(sampleEvents);
+    expect(readDshEvents(dshSessionEvents(session))).toHaveLength(2);
+  });
+
+  it("returns an empty log when neither accessor exists (pre-fix alpha.4 breakage)", () => {
+    const session = {};
+    expect(dshSessionEvents(session)).toEqual([]);
+    expect(readDshEvents(dshSessionEvents(session))).toEqual([]);
+  });
+
+  it("prefers snapshotEvents over a stale events property", () => {
+    const session = { events: [], snapshotEvents: () => sampleEvents };
+    expect(dshSessionEvents(session)).toBe(sampleEvents);
+  });
+});
+
 describe("toDshParameters", () => {
   const spec = (inputSchema: ToolSpec["inputSchema"]): ToolSpec => ({
     name: "hindsight_capture_initiative",
     description: "…",
     inputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     handler: async () => ({ content: [] }),
   });
 

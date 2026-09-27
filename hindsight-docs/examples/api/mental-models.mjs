@@ -83,8 +83,9 @@ console.log(`Operation ID: ${result3.operation_id}`);
 await new Promise(r => setTimeout(r, 5000));
 
 // [docs:list-mental-models]
-// List all mental models in a bank
-const mentalModels = await client.listMentalModels(BANK_ID);
+// List all mental models in a bank. The list returns metadata by default;
+// detail: "content" adds source_query/content/trigger.
+const mentalModels = await client.listMentalModels(BANK_ID, { detail: "content" });
 
 for (const mm of mentalModels.items) {
     console.log(`- ${mm.name}: ${mm.source_query}`);
@@ -128,7 +129,7 @@ console.log(`Full refresh operation ID: ${fullRefreshResult.operation_id}`);
 // Update a mental model's metadata
 const updated = await client.updateMentalModel(BANK_ID, mentalModelId, {
     name: 'Updated Team Communication Preferences',
-    trigger: { refresh_after_consolidation: true },
+    trigger: { refreshAfterConsolidation: true },
 });
 
 console.log(`Updated name: ${updated.name}`);
@@ -143,6 +144,32 @@ for (const entry of history) {
     console.log(`Previous content: ${entry.previous_content}`);
 }
 // [/docs:get-mental-model-history]
+
+// [docs:mental-model-detail]
+// List: metadata only, the default (smallest response)
+await client.listMentalModels(BANK_ID);
+
+// List with content but without provenance chains (opt-in)
+await client.listMentalModels(BANK_ID, { detail: 'content' });
+
+// Get one model — full detail is the default here
+await client.getMentalModel(BANK_ID, mentalModelId);
+// [/docs:mental-model-detail]
+
+// [docs:dry-run-refresh]
+// Preview what a refresh would do, without writing anything
+const preview = await client.dryRunRefreshMentalModel(BANK_ID, mentalModelId);
+
+console.log(`Mode: ${preview.effective_mode}, would persist: ${preview.would_persist}`);
+console.log(preview.diff);
+// [/docs:dry-run-refresh]
+
+// [docs:keep-trace]
+// Record how every refresh (scheduled ones too) reached its result
+await client.updateMentalModel(BANK_ID, mentalModelId, {
+    trigger: { mode: 'delta', keepTrace: true },
+});
+// [/docs:keep-trace]
 
 // [docs:delete-mental-model]
 // Delete a mental model

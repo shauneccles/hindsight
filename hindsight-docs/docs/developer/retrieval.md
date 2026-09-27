@@ -2,25 +2,14 @@
 sidebar_position: 3
 ---
 
+import {Flow} from '@vectorize-io/interfig';
+import tempr from '@vectorize-io/interfig/figures/tempr';
+
 # Recall: How Hindsight Retrieves Memories
 
 When you call `recall()`, Hindsight uses multiple search strategies in parallel to find the most relevant memories, regardless of how you phrase your query.
 
-```mermaid
-graph LR
-    Q[Query] --> S[Semantic]
-    Q --> K[Keyword]
-    Q --> G[Graph]
-    Q --> T[Temporal]
-
-    S --> RRF[RRF Fusion]
-    K --> RRF
-    G --> RRF
-    T --> RRF
-
-    RRF --> CE[Cross-Encoder]
-    CE --> R[Results]
-```
+<Flow {...tempr.props} />
 
 ---
 
@@ -245,7 +234,7 @@ Where:
 - **rank_i(d)** = position of document *d* in strategy *i* (1-indexed)
 - The sum runs over all strategies where *d* appears
 
-**Within RRF, all four strategies are weighted equally** — fusion uses rank position, not the source, so no strategy gets an implicit multiplier. You can, however, deliberately bias a source with [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration): that boost is applied at a separate stage — before the reranking pre-filter cap and again after reranking — not inside the RRF fusion above.
+**Within RRF, all four strategies are weighted equally** — fusion uses rank position, not the source, so no strategy gets an implicit multiplier. You can, however, deliberately bias a source with [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration): that boost is applied at a separate stage — before the reranking pre-filter cap, and again after a cross-encoder rerank — not inside the RRF fusion above. The pre-cap step runs only when the merged pool exceeds the cap, and it does not rewrite RRF scores. A passthrough reranker (mode `rrf`, an `rrf` provider, or a failover chain that has degraded to `rrf`) skips the post-rerank nudge: within the cap the setting then does nothing, and above the cap it only changes who is kept.
 
 **Why RRF over raw score merging?** Each retrieval strategy produces scores on a different scale (cosine similarity, BM25 tf-idf, graph activation). These scores aren't comparable — a BM25 score of 12.5 and a cosine similarity of 0.85 don't mean the same thing. RRF sidesteps this by using only rank positions, making it robust across any scoring system without requiring calibration.
 
@@ -267,7 +256,7 @@ The first memory ranks higher because it has **consensus** across strategies.
 
 RRF gives a good initial ranking, but it's based on positions, not on deep query-document understanding. The cross-encoder evaluates each candidate against the query as a pair, producing a relevance score.
 
-**Pre-filtering:** Before reranking, candidates are trimmed to the top **300** (by RRF score) to limit computational cost. This is configurable via `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`. If [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration) is set, the boost is applied to the RRF scores before this cut, so candidates from a favoured source are more likely to survive it.
+**Pre-filtering:** Before reranking, candidates are trimmed to the top **300** (by RRF score) to limit computational cost. This is configurable via `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`. If [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration) is set, the boost is applied before this cut, so candidates from a favoured source are more likely to survive it. The boost promotes the favoured arm in *rank* space (its rank is divided by the level's divisor before the RRF contribution is computed) rather than scaling its score, so it reaches deeper into that arm without evicting the top-ranked hits of the others — including on banks whose merged pool is many times the cap. When `trace: true` is requested, the `rerank_prefilter` phase reports how many candidates were kept and dropped, the cap in force, the active boosts, and the per-arm composition of the survivors.
 
 **Why rerank after RRF?** RRF is position-based — it knows a memory ranked well across strategies, but it never actually reads the query and the memory together. The cross-encoder does: it takes the query and each candidate as a pair and produces a relevance score based on their full interaction. This catches nuances that position-based fusion misses, like a memory that ranked #1 in keyword search because it matched a common term but is actually irrelevant to the query's intent.
 
@@ -280,7 +269,7 @@ CE_normalized = 1 / (1 + e^(-raw_logit))
 **Batch processing:** Candidates are scored in batches — **32 pairs** for the local reranker, **128 pairs** for TEI.
 
 :::tip No cross-encoder?
-When running without a cross-encoder (e.g., slim image with no external reranker), the system falls back to RRF-derived scores: candidates are assigned synthetic scores spread across [0.1, 1.0] based on their RRF rank, so the combined scoring boosts below still work meaningfully.
+When running without a cross-encoder (e.g., slim image with no external reranker), the system falls back to RRF-derived scores: candidates are assigned synthetic scores spread across [0.1, 1.0] based on their RRF rank, so the combined scoring boosts below still work meaningfully. `HINDSIGHT_API_RECALL_STRATEGY_BOOSTS` does not add its post-rerank nudge on this path. If the merged pool is within the reranker cap, the setting changes nothing; if the pool is larger, it only changes which candidates are kept, and their order still follows these RRF-derived scores plus recency, temporal and proof.
 :::
 
 ---

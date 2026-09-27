@@ -30,10 +30,13 @@ import pytest
 
 from hindsight_api.engine.memories import create_memories, get_memories, set_memories
 from hindsight_api.engine.memories.base import (
+    DOC_META_FILE_STORAGE_KEY,
     EntityPrunePassResult,
     MemoriesExtension,
     RecallArms,
     RelinkPassResult,
+    RetainResult,
+    RetainSession,
     ScanPage,
     StoredMemory,
 )
@@ -51,16 +54,19 @@ class InMemoryMemories(MemoriesExtension):
     name = "in-memory"
     # This store keeps memory rows in its own dict, not in Postgres, so the engine must take the
     # store-delegating branches (never the inline-SQL fast paths that assume a live ``conn``).
-    writes_memory_rows_in_sql = False
     # It also owns the document/chunk bodies, so the retain and read paths route those through the
     # document methods below — exercising that half of the seam too.
-    owns_document_store = True
+    store_owned = True
     # When True the store carries each unit's entity ids on the recall result (a backend that
     # resolves the unit->entity posting inline), so recall builds the entity map from the result
     # and resolves only names via ``resolve_entity_names``. When False the result carries no ids
     # (the default store) and recall re-fetches via ``entity_map_for_units``. Both must produce
     # identical output — the parametrized entity tests pin that.
     carries_entity_ids_on_result = False
+    # Likewise for an observation's sources. When False the result carries none, and recall
+    # re-fetches the observation to read them (for the prefer_observations dedup and the chunk
+    # walk); when True it reads them off the result. Both must produce identical output.
+    carries_source_ids_on_result = False
 
     def __init__(self, config: dict[str, str] | None = None):
         super().__init__(config or {})
@@ -70,15 +76,28 @@ class InMemoryMemories(MemoriesExtension):
         self.archive: dict[str, StoredMemory] = {}
         self.invalidation_reason: dict[str, str | None] = {}
         self.embeddings: dict[str, object] = {}
+        # What `apply_edit` was handed, so a test can tell which door the vector came through and
+        # whether the caller supplied the pre-edit fact type.
+        self.edit_embedding: object = None
+        self.edit_current_fact_type: str | None = None
         # The document store: one record per document, each carrying its extracted text and the
         # ordered chunk texts — the bodies a store that owns them keeps out of Postgres.
         self.documents: dict[str, dict] = {}
+        # The knowledge-page index, per bank. Unlike the dicts above this one is DERIVED — the
+        # page's row lives in Postgres either way, so this holds only what a search needs.
+        self.knowledge_pages: dict[str, dict] = {}
         # Proof the engine went through the interface rather than around it.
         self.calls: list[str] = []
+        # Banks whose storage exists. A store that owns its storage creates it when the
+        # bank is created and keeps it for as long as the bank lives.
+        self.ensured: set[str] = set()
+        # Every DeletePredicate handed to delete_where, so a test can assert WHICH delete
+        # was asked for and not merely that one happened.
+        self.predicates: list = []
 
     # -- writes --------------------------------------------------------------
 
-    async def insert_facts(self, *, conn, ops, bank_id, facts, document_id=None, defer_index=False, txn=None):
+    async def insert_facts(self, *, conn, ops, bank_id, facts, document_id=None, defer_index=False):
         self.calls.append("insert_facts")
         unit_ids = self.allocate_unit_ids(len(facts))
         if not defer_index:
@@ -94,6 +113,16 @@ class InMemoryMemories(MemoriesExtension):
         if doc is not None:
             doc["tags"] = list(tags)
 
+    async def set_document_file(self, *, bank_id, document_id, storage_key, original_name, content_type):
+        self.calls.append("set_document_file")
+        doc = self.documents.get(str(document_id))
+        if doc is None:
+            return False
+        doc["metadata"][DOC_META_FILE_STORAGE_KEY] = storage_key
+        doc["file_original_name"] = original_name
+        doc["file_content_type"] = content_type
+        return True
+
     async def count_documents(self, *, bank_id):
         return len(self.documents)
 
@@ -101,7 +130,17 @@ class InMemoryMemories(MemoriesExtension):
         return {"nodes": [], "edges": []}
 
     async def list_documents(
-        self, *, bank_id, search_query=None, tags=None, tags_match="any_strict", limit=100, offset=0
+        self,
+        *,
+        bank_id,
+        search_query=None,
+        tags=None,
+        tags_match="any_strict",
+        time_field=None,
+        start_date=None,
+        end_date=None,
+        limit=100,
+        offset=0,
     ):
         items = [{"id": doc_id, **doc} for doc_id, doc in self.documents.items()]
         return {"items": items[offset : offset + limit], "total": len(items), "limit": limit, "offset": offset}
@@ -114,12 +153,24 @@ class InMemoryMemories(MemoriesExtension):
         document_id=None,
         unit_entity_names=None,
         replace_document_id="",
+        replace_chunk_ids=None,
+        replace_keep_chunk_ids=None,
         resolve_threshold=0.0,
+        enable_text_search=True,
+        enable_graph_retrieval=True,
     ):
         self.calls.append("retain")
         return None
 
-    async def index_facts(self, bank_id, unit_ids, facts, document_id=None, unit_entity_ids=None, txn=None):
+    async def begin_retain(self, *, bank_id, config):
+        """A session that buffers and commits once, which is the policy a store with no LLM in the
+        loop should pick. It writes through the same ``index_facts`` the non-session path uses, so
+        a test asserting on ``rows`` cannot tell which path produced them — the point being that the
+        session is a different WHEN, not a different WHAT."""
+        self.calls.append("begin_retain")
+        return _InMemoryRetainSession(self, bank_id)
+
+    async def index_facts(self, bank_id, unit_ids, facts, document_id=None, unit_entity_ids=None):
         self.calls.append("index_facts")
         for unit_id, fact in zip(unit_ids, facts):
             self.rows[unit_id] = StoredMemory(
@@ -131,17 +182,17 @@ class InMemoryMemories(MemoriesExtension):
                 created_at=datetime.now(timezone.utc),
             )
 
-    async def delete_facts(self, bank_id, unit_ids, *, txn=None):
+    async def delete_facts(self, bank_id, unit_ids):
         self.calls.append("delete_facts")
         for unit_id in unit_ids:
             self.rows.pop(str(unit_id), None)
 
-    async def delete_document(self, *, conn, fq_table, bank_id, document_id, txn=None):
+    async def delete_document(self, *, conn, fq_table, bank_id, document_id):
         self.calls.append("delete_document")
         for unit_id in [k for k, v in self.rows.items() if v.document_id == document_id]:
             del self.rows[unit_id]
 
-    async def delete_observations(self, *, conn, fq_table, bank_id, txn=None):
+    async def delete_observations(self, *, conn, fq_table, bank_id):
         self.calls.append("delete_observations")
         for unit_id in [k for k, v in self.rows.items() if v.fact_type == "observation"]:
             del self.rows[unit_id]
@@ -176,6 +227,7 @@ class InMemoryMemories(MemoriesExtension):
                 # A store that resolves the posting inline carries the ids on the result (a list,
                 # possibly empty); otherwise leave it None so recall re-fetches via the map path.
                 entity_ids=list(row.entity_ids) if self.carries_entity_ids_on_result else None,
+                source_memory_ids=(list(row.source_memory_ids) if self.carries_source_ids_on_result else None),
                 similarity=score if semantic else None,
                 bm25_score=None if semantic else score,
             )
@@ -304,7 +356,7 @@ class InMemoryMemories(MemoriesExtension):
             out = [r for r in out if set(scope_tags).issubset(set(r.tags))]
         return out[:limit]
 
-    async def mark_consolidated(self, *, conn, fq_table, bank_id, unit_ids, when, failed=False, txn=None):
+    async def mark_consolidated(self, *, conn, fq_table, bank_id, unit_ids, when, failed=False):
         for unit_id in unit_ids:
             row = self.rows.get(str(unit_id))
             if row is not None:
@@ -389,6 +441,8 @@ class InMemoryMemories(MemoriesExtension):
     async def list_memory_units(self, *, conn, ops, fq_table, bank_id, limit=100, offset=0, **kwargs):
         self.calls.append("list_memory_units")
         ordered = list(self.rows.values())
+        if kwargs.get("document_id") is not None:
+            ordered = [row for row in ordered if row.document_id == kwargs["document_id"]]
         return {"items": ordered[offset : offset + limit], "total": len(ordered), "limit": limit, "offset": offset}
 
     async def get_memory_unit(self, *, conn, ops, fq_table, bank_id, unit_id):
@@ -400,7 +454,7 @@ class InMemoryMemories(MemoriesExtension):
     async def get_archived_memory(self, *, conn, fq_table, bank_id, unit_id):
         return self.archive.get(str(unit_id))
 
-    async def invalidate_memory(self, *, conn, fq_table, bank_id, unit_id, reason, txn=None):
+    async def invalidate_memory(self, *, conn, fq_table, bank_id, unit_id, reason):
         row = self.rows.pop(str(unit_id), None)
         if row is None:
             return False
@@ -411,7 +465,7 @@ class InMemoryMemories(MemoriesExtension):
     async def set_invalidation_reason(self, *, conn, fq_table, bank_id, unit_id, reason):
         self.invalidation_reason[str(unit_id)] = reason
 
-    async def restore_memory(self, *, conn, fq_table, bank_id, unit_id, txn=None):
+    async def restore_memory(self, *, conn, fq_table, bank_id, unit_id):
         row = self.archive.pop(str(unit_id), None)
         if row is None:
             return None
@@ -419,7 +473,8 @@ class InMemoryMemories(MemoriesExtension):
         self.invalidation_reason.pop(str(unit_id), None)
         return row
 
-    async def set_memory_embedding(self, *, conn, fq_table, bank_id, unit_id, embedding, txn=None):
+    async def set_memory_embedding(self, *, conn, fq_table, bank_id, unit_id, embedding):
+        self.calls.append("set_memory_embedding")
         self.embeddings[str(unit_id)] = embedding
 
     async def list_entities(self, *, conn, fq_table, bank_id, search=None, limit=100, offset=0):
@@ -438,8 +493,22 @@ class InMemoryMemories(MemoriesExtension):
 
     # -- curation / bulk writes ----------------------------------------------
 
-    async def delete_where(self, bank_id, predicate, txn=None):
+    async def ensure_bank_storage(self, bank_id):
+        self.calls.append("ensure_bank_storage")
+        self.ensured.add(bank_id)
+
+    async def drop_bank_storage(self, bank_id):
+        self.calls.append("drop_bank_storage")
+        self.ensured.discard(bank_id)
+        self.rows = {k: v for k, v in self.rows.items() if False}
+
+    async def delete_where(self, bank_id, predicate):
         self.calls.append("delete_where")
+        self.predicates.append(predicate)
+        if predicate.delete_all:
+            n = len(self.rows)
+            self.rows.clear()
+            return n
         victims = []
         for uid, row in self.rows.items():
             if predicate.fact_types and row.fact_type not in predicate.fact_types:
@@ -455,7 +524,7 @@ class InMemoryMemories(MemoriesExtension):
             del self.rows[uid]
         return len(victims)
 
-    async def update_memories(self, bank_id, patches, txn=None):
+    async def update_memories(self, bank_id, patches):
         self.calls.append("update_memories")
         for patch in patches:
             row = self.rows.get(str(patch.unit_id))
@@ -488,12 +557,18 @@ class InMemoryMemories(MemoriesExtension):
         mentioned_at,
         entity_ids,
         entity_names=None,
-        txn=None,
+        embedding=None,
+        current_fact_type=None,
     ):
         self.calls.append("apply_edit")
+        self.edit_embedding = embedding
+        self.edit_current_fact_type = current_fact_type
         row = self.rows.get(str(unit_id))
         if row is None:
             return
+        if embedding is not None:
+            # Applying an edit includes writing its vector — the same call, not a following one.
+            self.embeddings[str(unit_id)] = embedding
         row.text = text
         row.context = context
         row.fact_type = fact_type
@@ -504,7 +579,7 @@ class InMemoryMemories(MemoriesExtension):
         if entity_ids is not None:
             row.entity_ids = list(entity_ids)
 
-    async def upsert_observation(self, *, conn, bank_id, record, txn=None):
+    async def upsert_observation(self, *, conn, bank_id, record):
         self.calls.append("upsert_observation")
         self.rows[str(record.unit_id)] = StoredMemory(
             unit_id=str(record.unit_id),
@@ -517,7 +592,7 @@ class InMemoryMemories(MemoriesExtension):
             created_at=record.created_at or datetime.now(timezone.utc),
         )
 
-    # -- document store (owns_document_store=True) ---------------------------
+    # -- document store (store_owned=True) -----------------------------------
 
     async def put_document(
         self,
@@ -532,7 +607,6 @@ class InMemoryMemories(MemoriesExtension):
         file_bytes=None,
         file_content_type="",
         file_original_name="",
-        txn=None,
         expect_watermark=None,
     ):
         self.calls.append("put_document")
@@ -543,6 +617,8 @@ class InMemoryMemories(MemoriesExtension):
             "chunk_texts": list(chunk_texts),
             "tags": list(tags or []),
             "metadata": dict(metadata or {}),
+            "file_content_type": file_content_type,
+            "file_original_name": file_original_name,
         }
 
     async def document_content_hash(self, *, bank_id, document_id):
@@ -555,7 +631,14 @@ class InMemoryMemories(MemoriesExtension):
         doc = self.documents.get(str(document_id))
         if doc is None:
             return None
-        record = {"id": doc["id"], "content_hash": doc["content_hash"], "tags": list(doc["tags"])}
+        record = {
+            "id": doc["id"],
+            "content_hash": doc["content_hash"],
+            "tags": list(doc["tags"]),
+            "metadata": dict(doc["metadata"]),
+            "file_content_type": doc.get("file_content_type", ""),
+            "file_original_name": doc.get("file_original_name", ""),
+        }
         if include_text:
             record["original_text"] = doc["original_text"]
         return record
@@ -572,12 +655,7 @@ class InMemoryMemories(MemoriesExtension):
         doc = self.documents.get(str(document_id))
         return list(doc["chunk_texts"]) if doc else None
 
-    async def count_chunks(self, *, bank_id, document_id):
-        self.calls.append("count_chunks")
-        doc = self.documents.get(str(document_id))
-        return len(doc["chunk_texts"]) if doc else 0
-
-    async def delete_document_record(self, *, bank_id, document_id, txn=None):
+    async def delete_document_record(self, *, bank_id, document_id):
         self.calls.append("delete_document_record")
         self.documents.pop(str(document_id), None)
 
@@ -608,9 +686,152 @@ class InMemoryMemories(MemoriesExtension):
         self.calls.append("memories_timeseries")
         return []
 
-    async def observation_scope_counts(self, *, conn, fq_table, bank_id):
+    async def observation_scope_counts(self, *, conn, fq_table, bank_id, limit=100, offset=0):
         self.calls.append("observation_scope_counts")
-        return []
+        # Same paged shape as list_tags above: the histogram is the store's to group,
+        # order and page, so the stub does it over its own rows rather than shipping
+        # every scope back for the engine to trim.
+        counts: dict[tuple[str, ...], int] = {}
+        for row in self.rows.values():
+            if row.fact_type != "observation":
+                continue
+            scope = tuple(sorted(row.tags or []))
+            counts[scope] = counts.get(scope, 0) + 1
+        scopes = [{"tags": list(scope), "count": count} for scope, count in counts.items()]
+        scopes.sort(key=lambda it: (-it["count"], it["tags"]))
+        return {
+            "scopes": scopes[offset : offset + limit],
+            "total": len(scopes),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    # -- the knowledge-page index -------------------------------------------
+    #
+    # Kept as a dict beside the memory rows, so the engine's routing is exercised end to end
+    # rather than mocked. The ranking is deliberately crude — substring for text, ordering by the
+    # first embedding component for vectors — because what these tests assert is that the engine
+    # ROUTES here and hydrates what comes back, not that a dict can rank.
+
+    store_owned = True
+
+    def _pages(self, bank_id):
+        return self.knowledge_pages.setdefault(bank_id, {})
+
+    async def index_knowledge_pages(self, bank_id, entries):
+        self.calls.append("index_knowledge_pages")
+        pages = self._pages(bank_id)
+        for e in entries:
+            pages[e.page_id] = e
+
+    async def delete_knowledge_pages(self, bank_id, page_ids):
+        self.calls.append("delete_knowledge_pages")
+        pages = self._pages(bank_id)
+        for pid in page_ids:
+            pages.pop(pid, None)
+
+    async def search_knowledge_pages(
+        self, bank_id, *, embedding, text, limit, tags=None, tags_match="any", tag_groups=None
+    ):
+        self.calls.append("search_knowledge_pages")
+        from hindsight_api.engine.memories.base import KnowledgePageMatch
+
+        needle = (text or "").lower()
+        hits = [
+            e
+            for e in self._pages(bank_id).values()
+            if (not needle or needle in e.index_text.lower()) and (not tags or set(tags) & set(e.tags))
+        ]
+        return [KnowledgePageMatch(page_id=e.page_id, score=1.0) for e in hits][:limit]
+
+    async def search_knowledge_pages_semantic(
+        self,
+        bank_id,
+        *,
+        embedding,
+        limit,
+        tags=None,
+        tags_match="any",
+        tag_groups=None,
+        exclude_ids=None,
+    ):
+        self.calls.append("search_knowledge_pages_semantic")
+        from hindsight_api.engine.memories.base import KnowledgePageMatch
+
+        excluded = set(exclude_ids or ())
+        hits = [
+            e
+            for e in self._pages(bank_id).values()
+            if e.page_id not in excluded and (not tags or set(tags) & set(e.tags))
+        ]
+        return [KnowledgePageMatch(page_id=e.page_id, score=0.9) for e in hits][:limit]
+
+    async def list_knowledge_pages(self, bank_id):
+        self.calls.append("list_knowledge_pages")
+        from hindsight_api.engine.memories.base import KnowledgePageRef
+
+        return [KnowledgePageRef(page_id=e.page_id, updated_at=e.updated_at) for e in self._pages(bank_id).values()]
+
+
+class _InMemoryRetainSession(RetainSession):
+    """Buffer-then-commit. Deliberately the whole-retain policy rather than a per-part flush: it is
+    the one that would break if `commit` ever stopped being called, so a leak in the orchestrator's
+    session handling shows up as missing rows instead of passing on a partial write."""
+
+    def __init__(self, store: "InMemoryMemories", bank_id: str):
+        self._store = store
+        self._bank_id = bank_id
+        self._parts: list = []
+
+    async def add(self, part) -> None:
+        self._store.calls.append("session.add")
+        self._parts.append(part)
+
+    async def commit(self) -> RetainResult:
+        self._store.calls.append("session.commit")
+        unit_ids: dict[str, list[str]] = {}
+        for part in self._parts:
+            # Session parts carry FactRecord objects and the store's document schema,
+            # not the SQL pipeline's processed facts or an alternate chunks/text shape.
+            if part.document_id not in self._store.documents:
+                await self._store.put_document(
+                    bank_id=self._bank_id,
+                    document_id=part.document_id,
+                    content_hash=part.content_hash,
+                    original_text=part.document_body or "",
+                    chunk_texts=[],
+                    tags=part.tags,
+                    metadata=part.metadata,
+                )
+            doc = self._store.documents[part.document_id]
+            if part.document_body is not None:
+                doc["original_text"] = part.document_body
+            doc["content_hash"] = part.content_hash
+            if part.chunk_texts:
+                # `chunk_offset` is per document, so a part is placed at its offset rather than
+                # appended — two parts of one document can arrive in either order.
+                needed = part.chunk_offset + len(part.chunk_texts)
+                if len(doc["chunk_texts"]) < needed:
+                    doc["chunk_texts"].extend([""] * (needed - len(doc["chunk_texts"])))
+                doc["chunk_texts"][part.chunk_offset : needed] = list(part.chunk_texts)
+            if part.facts:
+                ids = [fact.unit_id for fact in part.facts]
+                for fact in part.facts:
+                    self._store.rows[fact.unit_id] = StoredMemory(
+                        unit_id=fact.unit_id,
+                        text=fact.text,
+                        fact_type=fact.fact_type,
+                        document_id=part.document_id,
+                        tags=list(fact.tags),
+                        created_at=fact.created_at or datetime.now(timezone.utc),
+                    )
+                unit_ids.setdefault(part.document_id, []).extend(ids)
+        self._parts.clear()
+        return RetainResult(unit_ids=unit_ids)
+
+    async def abort(self) -> None:
+        self._store.calls.append("session.abort")
+        self._parts.clear()
 
 
 @pytest.fixture
@@ -718,6 +939,11 @@ async def test_engine_list_tags_routes_through_the_installed_store(memory, reque
 
     await store.insert_facts(conn=None, ops=None, bank_id="seam-bank", facts=[_Fact()], document_id="d")
 
+    # The read 404s for a bank nobody created (#4175). A store owns the facts, never the bank row
+    # itself, so a real deployment always has this row — a retain writes it before the store sees
+    # anything. Only the stub reaches an engine read without one.
+    await memory.ensure_bank_profile("seam-bank", request_context=request_context)
+
     result = await memory.list_tags("seam-bank", request_context=request_context)
 
     assert result["items"] == [{"tag": "only-in-the-store", "count": 1}]
@@ -746,7 +972,7 @@ async def test_maintenance_passes_are_optional(restore_default_store):
 # ---------------------------------------------------------------------------
 # Per-bank store capabilities. A store may route different banks to different
 # backends, so every BANK-SCOPED call site asks per bank —
-# writes_memory_rows_in_sql_for(bank_id) / owns_document_store_for(bank_id) —
+# store_owned_for(bank_id) —
 # rather than reading the process-global class attribute. The class attribute
 # stays the single-store default the _for methods fall back to.
 # ---------------------------------------------------------------------------
@@ -756,13 +982,12 @@ def test_per_bank_capability_defaults_to_the_class_attribute():
     """A single-store extension needs no override: the _for methods return the class attr, so
     every existing store keeps its exact behaviour for every bank."""
     pg = PostgresMemories({})
-    assert (pg.writes_memory_rows_in_sql, pg.owns_document_store) == (True, False)
-    assert pg.writes_memory_rows_in_sql_for("any-bank") is True
-    assert pg.owns_document_store_for("any-bank") is False
+    assert pg.store_owned is False
+    assert pg.store_owned_for("any-bank") is False
 
     mem = InMemoryMemories({})  # owns its rows AND its document store
-    assert mem.writes_memory_rows_in_sql_for("any-bank") is False
-    assert mem.owns_document_store_for("any-bank") is True
+    assert mem.store_owned is True
+    assert mem.store_owned_for("any-bank") is True
 
 
 def test_a_store_answers_capabilities_per_bank():
@@ -771,29 +996,25 @@ def test_a_store_answers_capabilities_per_bank():
 
     class PerBankStore(InMemoryMemories):
         name = "per-bank"
-        # The loop-level class attr stays False so cross-store txn recovery still runs; the
-        # per-bank answer is what every bank-scoped site consults.
-        writes_memory_rows_in_sql = False
+        # The process-level class attr stays False; the per-bank answer is what every
+        # bank-scoped site consults.
+        store_owned = False
 
         def __init__(self, config=None):
             super().__init__(config)
             self.sql_banks = {"legacy-bank"}
 
-        def writes_memory_rows_in_sql_for(self, bank_id):
-            return bank_id in self.sql_banks
-
-        def owns_document_store_for(self, bank_id):
+        def store_owned_for(self, bank_id):
             return bank_id not in self.sql_banks
 
     store = PerBankStore({})
-    # A SQL-backed bank looks like Postgres (host does inline SQL, keeps documents in SQL)...
-    assert store.writes_memory_rows_in_sql_for("legacy-bank") is True
-    assert store.owns_document_store_for("legacy-bank") is False
-    # ...a store-backed bank owns its rows and its document store.
-    assert store.writes_memory_rows_in_sql_for("new-bank") is False
-    assert store.owns_document_store_for("new-bank") is True
-    # The process-level gate (cross-store recovery loop) still fires off the class attr.
-    assert store.writes_memory_rows_in_sql is False
+    # A SQL-backed bank looks like Postgres: the caller writes the rows and the documents.
+    assert store.store_owned_for("legacy-bank") is False
+    # ...a store-backed bank owns its rows, its document store and its retain.
+    assert store.store_owned_for("new-bank") is True
+    # The process-level gate (the cross-store recovery loop) still reads the class attribute, which
+    # stays False so that loop keeps running even though some banks answer True per bank.
+    assert store.store_owned is False
 
 
 def test_assert_writable_defaults_to_allowing_everything():
@@ -886,7 +1107,7 @@ def test_stub_instantiates_all_abstract_methods_present():
 def test_stub_answers_every_interface_method(method_name):
     """The stub must not fall through to a ``NotImplementedError`` default for any method — a
     store that owns its rows has to answer them all. The interface's *safe* defaults (the no-op
-    txn / maintenance / lifecycle hooks that return None/0/{}) may be inherited; a method the
+    maintenance / lifecycle hooks that return None/0/{}) may be inherited; a method the
     interface leaves as ``raise NotImplementedError`` must be implemented here. Add such a method
     to the interface and this surfaces it, instead of a real provider discovering it in production."""
     if method_name in vars(InMemoryMemories):
@@ -932,6 +1153,7 @@ async def _seed(store, bank_id, **fact_kwargs):
 async def test_engine_recall_routes_search_through_store(memory, request_context, restore_default_store):
     store = InMemoryMemories({})
     set_memories(store)
+    await memory.ensure_bank_profile("seam-bank", request_context=request_context)  # see #4175 above
     await memory.recall_async("seam-bank", "anything at all", request_context=request_context)
     assert "search" in store.calls  # the semantic/bm25 arm went through the interface, not SQL
 
@@ -940,14 +1162,49 @@ async def test_engine_list_memory_units_routes_through_store(memory, request_con
     store = InMemoryMemories({})
     set_memories(store)
     await _seed(store, "seam-bank", text="only in the store", fact_type="world")
+    await memory.ensure_bank_profile("seam-bank", request_context=request_context)  # see #4175 above
     res = await memory.list_memory_units("seam-bank", request_context=request_context)
     assert "list_memory_units" in store.calls
     assert res["total"] == 1  # the row exists only in the stub, so it can only have come from it
 
 
+async def test_an_edit_writes_its_vector_in_the_edit_itself(memory, request_context, restore_default_store):
+    """Applying an edit writes its re-embedded vector — with no second call to do it.
+
+    The property is not "the vector ends up stored": that passed while the edit was making two
+    writes to get it there, which is the whole cost of an edit again for a store whose write is a
+    durable append rather than a row update. It is that the vector arrives through `apply_edit`
+    and that nothing follows it to write the same row again.
+    """
+    store = InMemoryMemories({})
+    set_memories(store)
+    unit_ids = await _seed(store, "seam-bank", text="before the edit", fact_type="world")
+
+    await memory.update_memory_unit("seam-bank", unit_ids[0], text="after the edit", request_context=request_context)
+
+    assert "apply_edit" in store.calls
+    assert store.edit_embedding is not None, "the store is handed the re-embedded vector"
+    assert store.embeddings.get(unit_ids[0]) is not None, "…and applying the edit stored it"
+    assert "set_memory_embedding" not in store.calls, "a second write of the row just written"
+
+
+async def test_apply_edit_is_told_the_pre_edit_fact_type(memory, request_context, restore_default_store):
+    """A store that can apply a type-preserving edit more cheaply needs to know the type did not
+    change, and re-reading the memory to find that out costs the round trip the cheap path saves.
+    The caller has it from the re-read it already did, so it passes it."""
+    store = InMemoryMemories({})
+    set_memories(store)
+    unit_ids = await _seed(store, "seam-bank", text="before the edit", fact_type="world")
+
+    await memory.update_memory_unit("seam-bank", unit_ids[0], text="after the edit", request_context=request_context)
+
+    assert store.edit_current_fact_type == "world"
+
+
 async def test_engine_list_entities_routes_through_store(memory, request_context, restore_default_store):
     store = InMemoryMemories({})
     set_memories(store)
+    await memory.ensure_bank_profile("seam-bank", request_context=request_context)  # see #4175 above
     await memory.list_entities("seam-bank", request_context=request_context)
     assert "list_entities" in store.calls
 
@@ -975,8 +1232,8 @@ async def test_engine_clear_observations_routes_through_store(memory, request_co
 
 # ---------------------------------------------------------------------------
 # Recall enrichment through the seam. These lock the input combinations that a
-# store owning its rows/bodies (writes_memory_rows_in_sql=False,
-# owns_document_store=True) must hydrate FROM THE STORE, not from SQL. The class
+# store owning its rows/bodies (store_owned=True) must hydrate FROM THE STORE,
+# not from SQL. The class
 # of bug they guard against: recall(include_chunks=True) through such a store
 # returned EMPTY chunk text because the engine read the (empty) SQL chunks row
 # and never overlaid the store's body. Each test seeds a memory in the stub,
@@ -1053,18 +1310,54 @@ async def test_store_document_bodies_omits_absent_retain_params(restore_default_
     assert "retain_params" not in store.documents[doc_id]["metadata"]
 
 
+async def test_file_convert_retain_records_the_upload_on_the_store_record(memory, restore_default_store):
+    """A store-owned bank has no SQL `documents` row, so the file-metadata UPDATE after a
+    file-convert retain matched nothing and the reference to the upload was silently dropped.
+    It must land on the store's record."""
+    store = InMemoryMemories({})
+    set_memories(store)
+    suffix = uuid.uuid4().hex[:8]
+    bank_id = f"seam-file-{suffix}"
+    doc_id = f"doc-{suffix}"
+
+    async def _retain(**kwargs):
+        # Stands in for the retain the task runs first: it is what writes the record.
+        await store.put_document(
+            bank_id=bank_id, document_id=doc_id, content_hash="h", original_text="text", chunk_texts=["text"]
+        )
+
+    memory.retain_batch_async = _retain
+    await memory._handle_batch_retain(
+        {
+            "bank_id": bank_id,
+            "contents": [{"content": "text", "document_id": doc_id}],
+            "_file_metadata": {
+                "file_storage_key": f"banks/{bank_id}/files/report.pdf",
+                "file_original_name": "report.pdf",
+                "file_content_type": "application/pdf",
+            },
+        }
+    )
+
+    record = await store.get_document_record(bank_id=bank_id, document_id=doc_id)
+    assert record["metadata"][DOC_META_FILE_STORAGE_KEY] == f"banks/{bank_id}/files/report.pdf"
+    assert record["file_original_name"] == "report.pdf"
+    assert record["file_content_type"] == "application/pdf"
+
+
 async def test_recall_include_chunks_hydrates_body_from_store(memory, request_context, restore_default_store):
     """include_chunks must overlay chunk TEXT from the store, not the empty SQL chunks row.
 
     This is the regression guard: the SQL ``chunks`` row a store that owns bodies writes carries an
     EMPTY ``chunk_text``; the real text lives in the store. Remove the overlay in ``recall_async``
-    (~line 5271, the ``owns_document_store`` block) and the returned text falls back to that empty
+    (~line 5271, the ``store_owned`` block) and the returned text falls back to that empty
     string — this assertion then fails, which is exactly the bug that slipped through before.
     """
     store = InMemoryMemories({})
     set_memories(store)
     suffix = uuid.uuid4().hex[:8]
     bank_id = f"seam-chunks-{suffix}"
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)  # see #4175 above
     doc_id = f"doc-{suffix}"
     chunk_id = f"chunk-{suffix}"
     fact_id = str(uuid.uuid4())
@@ -1132,6 +1425,7 @@ async def test_recall_include_source_facts_hydrates_from_store(memory, request_c
     store = InMemoryMemories({})
     set_memories(store)
     bank_id = f"seam-srcfacts-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)  # see #4175 above
     obs_id = str(uuid.uuid4())
     src_id = str(uuid.uuid4())
     src_text = "Alice deployed the hotfix on Tuesday afternoon"
@@ -1176,6 +1470,7 @@ async def test_recall_include_entities_hydrates_names_from_registry(
     store.carries_entity_ids_on_result = carries_ids_on_result
     set_memories(store)
     bank_id = f"seam-entities-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)  # see #4175 above
     fact_id = str(uuid.uuid4())
 
     pool = await memory._get_pool()
@@ -1223,6 +1518,7 @@ async def test_recall_include_entities_omits_entityless_unit(
     store.carries_entity_ids_on_result = carries_ids_on_result
     set_memories(store)
     bank_id = f"seam-entities-omit-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)  # see #4175 above
     with_entity_id = str(uuid.uuid4())
     without_entity_id = str(uuid.uuid4())
 
@@ -1286,7 +1582,10 @@ def test_entity_map_from_results_shape(ids_by_unit, names, expected):
     assert _entity_map_from_results(ids_by_unit, names) == expected
 
 
-async def test_recall_all_enrichments_together_through_store(memory, request_context, restore_default_store):
+@pytest.mark.parametrize("carries_source_ids", [False, True], ids=["refetch", "ids-on-result"])
+async def test_recall_all_enrichments_together_through_store(
+    memory, request_context, restore_default_store, carries_source_ids
+):
     """All three flags at once, with prefer_observations=True, through the owning store.
 
     The observation supersedes its raw source fact (prefer_observations drops it from results), so:
@@ -1295,11 +1594,23 @@ async def test_recall_all_enrichments_together_through_store(memory, request_con
     - source_facts come back populated from the store's rows;
     - entities on the observation resolve to registry names.
     One recall exercises the whole enrichment surface for a store that owns its rows and bodies.
+
+    Parametrized over the two ways recall can learn an observation's sources, because both consumers
+    of that list are in this one recall:
+
+    - ``refetch``: the result carries none, so the dedup re-fetches the observation to read them —
+      once, writing them back onto the result for the chunk walk and source-facts block to reuse;
+    - ``ids-on-result``: the store carried them on the hydrated result and neither read happens.
+
+    The assertions are the same for both. That is the point: the output must not depend on which
+    path recall took, or the fast path is an approximation rather than an optimisation.
     """
     store = InMemoryMemories({})
+    store.carries_source_ids_on_result = carries_source_ids
     set_memories(store)
     suffix = uuid.uuid4().hex[:8]
     bank_id = f"seam-all-{suffix}"
+    await memory.ensure_bank_profile(bank_id, request_context=request_context)  # see #4175 above
     doc_id = f"doc-{suffix}"
     chunk_id = f"chunk-{suffix}"
     src_id = str(uuid.uuid4())
@@ -1365,6 +1676,14 @@ async def test_recall_all_enrichments_together_through_store(memory, request_con
         assert result.chunks[chunk_id].chunk_text == body
 
         # source_facts: the raw fact, populated from the store
+        # Reads of the OBSERVATION: with sources on the result, none; without, exactly one — the
+        # dedup's, which writes the sources back onto the result so the chunk walk and the
+        # source-facts block reuse them (before that write-back each re-read it: 5 reads total).
+        # Asserted as a count rather than "it was faster", because the point is WHICH reads stopped
+        # happening; the two that always remain fetch the observation's SOURCES, memories recall
+        # never retrieved, for their chunk ids and their text.
+        assert store.calls.count("get_memories") == (2 if carries_source_ids else 3), store.calls
+
         assert result.source_facts and src_id in result.source_facts
         assert result.source_facts[src_id].text == src_text
         assert by_id[obs_id].source_fact_ids == [src_id]
@@ -1377,3 +1696,196 @@ async def test_recall_all_enrichments_together_through_store(memory, request_con
             await conn.execute("DELETE FROM chunks WHERE bank_id = $1", bank_id)
             await conn.execute("DELETE FROM documents WHERE bank_id = $1", bank_id)
             await conn.execute("DELETE FROM entities WHERE bank_id = $1", bank_id)
+
+
+# ---------------------------------------------------------------------------
+# Bank storage lifecycle. A store that owns its storage relies on exactly one
+# thing: the storage exists for as long as the bank does. Both halves live here
+# because neither is visible from the store's own suite — they are engine
+# behaviour, and a store can only observe them through these calls.
+#
+# `_ensure_bank_exists` is called directly rather than through a public entry
+# point: it IS the seam under test, and reaching it via retain would drag in
+# embeddings and an LLM to assert something neither is involved in.
+# ---------------------------------------------------------------------------
+
+
+async def test_ensuring_a_bank_ensures_its_storage(memory, request_context, restore_default_store):
+    """A bank that exists must have storage behind it.
+
+    Without this the storage is only ever created implicitly by a write, so "bank exists, storage
+    does not" is a routine state every read path has to decide what to do about. The store cannot
+    tell that apart from an empty bank, so it reports empty — and a bank whose storage went
+    missing then serves empty results, successfully, until somebody notices the data is gone.
+    """
+    store = InMemoryMemories({})
+    set_memories(store)
+
+    await memory._ensure_bank_exists("lifecycle-bank", request_context)
+
+    assert "ensure_bank_storage" in store.calls
+    assert "lifecycle-bank" in store.ensured
+
+
+async def test_ensuring_an_existing_bank_still_ensures_its_storage(memory, request_context, restore_default_store):
+    """Ensuring is not gated on the bank row having just been inserted.
+
+    `created` is False for a bank that already exists in SQL but has no storage — one predating
+    this call, or whose storage went away out of band. Those are exactly the banks that need it,
+    so a second ensure must still reach the store. That is also what backfills them.
+    """
+    store = InMemoryMemories({})
+    set_memories(store)
+    await memory._ensure_bank_exists("twice-bank", request_context)
+    store.calls.clear()
+    store.ensured.clear()
+
+    await memory._ensure_bank_exists("twice-bank", request_context)
+
+    assert "ensure_bank_storage" in store.calls, "the second ensure must still reach the store"
+    assert "twice-bank" in store.ensured
+
+
+async def test_clearing_a_banks_memories_keeps_its_storage(memory, request_context, restore_default_store):
+    """Clearing empties the bank; it does not delete the bank's storage.
+
+    `delete_bank_profile=False` is the API's clear endpoint — the bank goes on existing. Dropping
+    the storage there left it existing in SQL with nothing behind it, and discarded the
+    namespace's declared metadata keys, which are fixed at creation: the facets then stayed empty
+    even after the bank was written to again.
+    """
+    store = InMemoryMemories({})
+    set_memories(store)
+    await memory._ensure_bank_exists("clear-bank", request_context)
+    await _seed(store, "clear-bank", text="wipe me")
+    assert store.rows
+
+    await memory.delete_bank("clear-bank", delete_bank_profile=False, request_context=request_context)
+
+    assert "drop_bank_storage" not in store.calls, "a clear must not delete the bank's storage"
+    assert "clear-bank" in store.ensured, "the storage outlives the memories it held"
+    assert store.predicates and store.predicates[-1].delete_all, "an unfiltered clear is a delete-all"
+    assert store.rows == {}, "and it really did empty the bank"
+
+
+async def test_a_typed_clear_counts_where_the_memories_live(memory, request_context, restore_default_store):
+    """A fact_type-scoped delete counts through the store, not through `memory_units`.
+
+    The unfiltered branch already does. This one did not: it took its count from a SELECT on
+    `memory_units`, which is empty for a store-owned bank, so the `delete_where` below removed
+    the rows and the call reported having removed none of them. The API's clear endpoint
+    returns that number, so the caller was told the erasure had done nothing.
+    """
+    store = InMemoryMemories({})
+    set_memories(store)
+    await memory._ensure_bank_exists("typed-clear-bank", request_context)
+    await _seed(store, "typed-clear-bank", text="a world fact", fact_type="world")
+    await _seed(store, "typed-clear-bank", text="another world fact", fact_type="world")
+    await _seed(store, "typed-clear-bank", text="an experience", fact_type="experience")
+
+    result = await memory.delete_bank(
+        "typed-clear-bank", fact_type="world", delete_bank_profile=False, request_context=request_context
+    )
+
+    assert result["memory_units_deleted"] == 2, "the count has to come from the store, not memory_units"
+    assert store.predicates[-1].fact_types == ["world"], "and only that type was deleted"
+    assert [row.fact_type for row in store.rows.values()] == ["experience"]
+
+
+async def test_deleting_a_bank_drops_its_storage(memory, request_context, restore_default_store):
+    """The other side of the same coin: when the BANK goes, its storage goes with it.
+
+    This direction needs guarding as much as the first. Routing a real bank deletion to a
+    delete-all would leave the namespace behind for a bank that no longer exists — storage nothing
+    will ever read, delete, or account for.
+    """
+    store = InMemoryMemories({})
+    set_memories(store)
+    await memory._ensure_bank_exists("doomed-bank", request_context)
+    await _seed(store, "doomed-bank", text="going away")
+
+    await memory.delete_bank("doomed-bank", request_context=request_context)
+
+    assert "drop_bank_storage" in store.calls, "deleting the bank must drop its storage, not orphan it"
+    assert "doomed-bank" not in store.ensured
+
+
+# ---------------------------------------------------------------------------
+# Retain routing: which write path a bank takes
+# ---------------------------------------------------------------------------
+
+
+def test_every_bank_deltas_on_the_first_sub_batch():
+    """Delta is not gated on the store any more.
+
+    A store-owned bank's delta is one `retain` whose replace names the chunks that moved, so there
+    is nothing left for a store to be unable to express. What remains is the sub-batch rule: delta
+    runs on the FIRST sub-batch only, because the caller keeps one result list per sub-batch item
+    and advances `chunk_index_offset` by the splitter's per-slice count rather than by what a delta
+    wrote.
+    """
+    from hindsight_api.engine.retain.orchestrator import attempts_delta_retain
+
+    class StoreOwned(InMemoryMemories):
+        name = "store-owned"
+        store_owned = True
+
+    for store in (InMemoryMemories({}), StoreOwned({})):
+        assert attempts_delta_retain(store, "b", True) is True
+        assert attempts_delta_retain(store, "b", False) is False
+
+
+async def test_store_owned_bank_stops_writing_the_postgres_page_search_columns(
+    memory, request_context, restore_default_store
+):
+    """Postgres keeps the page ROW and stops carrying its two derived search columns.
+
+    This is what makes leaving `idx_mental_models_embedding` / `idx_mental_models_text_search` in
+    place cheap for a store-owned bank: the indexes still exist for the Postgres banks in the same
+    schema, but nothing new is written into them here, so no ANN insert and (on VectorChord) no
+    `tokenize()` call through the extension is paid per page write.
+
+    Asserted on the columns rather than on a call count, because the cost being avoided is the
+    index maintenance the column write triggers, not the code path.
+    """
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.engine.schema import fq_table
+
+    store = InMemoryMemories({})
+    set_memories(store)
+    bank = "seam-kp-bank"
+    try:
+        page = await memory.create_knowledge_page(
+            bank,
+            name="Quarterly revenue",
+            source_query="revenue",
+            content="Revenue forecast for the platform team.",
+            request_context=request_context,
+        )
+        # It reached the store's index -- otherwise "not in Postgres" would just mean "lost".
+        assert "index_knowledge_pages" in store.calls
+        assert store.knowledge_pages.get(bank), "the page must be searchable in the store"
+
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            row = await conn.fetchrow(
+                f"SELECT name, content, embedding, search_vector "
+                f"FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                bank,
+                page["mental_model_id"],
+            )
+        assert row is not None, "the page row itself must still live in Postgres"
+        # The readable half is untouched: this is not the row moving.
+        assert row["name"] == "Quarterly revenue"
+        assert row["content"]
+        # The ANN column is not written, so `idx_mental_models_embedding` takes no insert for this
+        # bank. True on every backend, because the application is what writes this column.
+        assert row["embedding"] is None, "the ANN column must not be maintained for a store-owned bank"
+        # `search_vector` is deliberately NOT asserted NULL. On vchord the application writes it and
+        # the gate does skip it, but on the native backend the column is
+        # `GENERATED ALWAYS AS (to_tsvector(...)) STORED`, so Postgres computes it and maintains the
+        # GIN index on every write whatever the application does. Only dropping the column or the
+        # index stops that, and both are per-SCHEMA, so they need the deployment-level decision this
+        # per-bank flag cannot make. Asserting NULL here would encode a saving that does not exist.
+    finally:
+        await memory.delete_bank(bank, request_context=request_context)

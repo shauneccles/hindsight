@@ -20,6 +20,7 @@ import pytest_asyncio
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.db import DatabaseConnection
 from hindsight_api.engine.memory_engine import Budget
+from tests import consolidation_actions
 from tests.test_bank_config_atomicity import (
     assert_one_sided_budget_update_sees_stored_state,
     assert_recall_budget_race_is_serialized,
@@ -82,7 +83,7 @@ class TestCoreCRUD:
     async def test_create_bank(self, oracle_memory: MemoryEngine, request_context: RequestContext):
         bank_id = _bank_id("bank")
         try:
-            profile = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            profile = await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             assert profile is not None
             assert profile["bank_id"] == bank_id
         finally:
@@ -300,7 +301,7 @@ class TestCoreCRUD:
         bank_id = _bank_id("profile")
         try:
             # Create
-            profile = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            profile = await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             assert profile["bank_id"] == bank_id
 
             # Update. mission is an Oracle CLOB; regression guard for ORA-00932 —
@@ -313,7 +314,7 @@ class TestCoreCRUD:
                 mission="Testing Oracle integration",
                 request_context=request_context,
             )
-            updated = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            updated = await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             assert updated["name"] == "Test Oracle Bank"
             assert updated["mission"] == "Testing Oracle integration"
 
@@ -323,7 +324,7 @@ class TestCoreCRUD:
                 mission="Revised Oracle mission",
                 request_context=request_context,
             )
-            remissioned = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            remissioned = await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             assert remissioned["mission"] == "Revised Oracle mission"
             assert remissioned["name"] == "Test Oracle Bank"
         finally:
@@ -878,7 +879,7 @@ class TestAdvancedFeatures:
     async def test_mental_model_crud(self, oracle_memory: MemoryEngine, request_context: RequestContext):
         bank_id = _bank_id("mmcrud")
         try:
-            await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
             model = await oracle_memory.create_mental_model(
                 bank_id=bank_id,
@@ -1033,7 +1034,7 @@ class TestAdvancedFeatures:
     async def test_directives_crud(self, oracle_memory: MemoryEngine, request_context: RequestContext):
         bank_id = _bank_id("directives")
         try:
-            await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
             directive = await oracle_memory.create_directive(
                 bank_id=bank_id,
@@ -1100,7 +1101,7 @@ class TestAdvancedFeatures:
     async def test_bank_config(self, oracle_memory: MemoryEngine, request_context: RequestContext):
         bank_id = _bank_id("config")
         try:
-            profile = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            profile = await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             assert profile is not None
 
             # Update bank name
@@ -1109,7 +1110,7 @@ class TestAdvancedFeatures:
                 name="Config Test Bank",
                 request_context=request_context,
             )
-            updated = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            updated = await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             assert updated["name"] == "Config Test Bank"
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
@@ -1184,14 +1185,14 @@ class TestOracleSpecific:
         bank_id = _bank_id("json")
         try:
             # Bank profile is stored as JSON CLOB in Oracle
-            await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             await oracle_memory.update_bank(
                 bank_id=bank_id,
                 name="JSON Test Bank",
                 mission="Test JSON CLOB storage",
                 request_context=request_context,
             )
-            profile = await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            profile = await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             assert profile is not None
             assert profile["name"] == "JSON Test Bank"
             assert profile["mission"] == "Test JSON CLOB storage"
@@ -1223,8 +1224,6 @@ class TestOracleSpecific:
         """
         from hindsight_api.config import _get_raw_config
         from hindsight_api.engine.consolidation.consolidator import (
-            _execute_create_action,
-            _execute_update_action,
             _TemporalBounds,
         )
         from hindsight_api.engine.response_models import MemoryFact
@@ -1236,7 +1235,7 @@ class TestOracleSpecific:
         previous_observations = config.enable_observations
         config.enable_observations = False  # the test drives consolidation itself
         try:
-            await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             await oracle_memory.retain_async(
                 bank_id=bank_id,
                 content="Dana learned to sail.",
@@ -1253,7 +1252,7 @@ class TestOracleSpecific:
 
             # An observation built from an undated fact: event_date/mentioned_at are stamped at
             # creation time, occurred_start/occurred_end stay NULL.
-            action = await _execute_create_action(
+            action = await consolidation_actions.execute_create_action(
                 pool=backend,
                 memory_engine=oracle_memory,
                 bank_id=bank_id,
@@ -1269,7 +1268,7 @@ class TestOracleSpecific:
                 )
             assert seeded["occurred_start"] is None and seeded["occurred_end"] is None
 
-            await _execute_update_action(
+            await consolidation_actions.execute_update_action(
                 pool=backend,
                 memory_engine=oracle_memory,
                 bank_id=bank_id,
@@ -1462,7 +1461,7 @@ class TestEdgeCases:
         bank_id = _bank_id("emptyrecall")
         try:
             # Create bank
-            await oracle_memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
             result = await oracle_memory.recall_async(
                 bank_id=bank_id,
                 query="anything at all",

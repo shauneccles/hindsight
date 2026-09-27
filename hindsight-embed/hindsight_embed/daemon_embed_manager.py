@@ -10,29 +10,28 @@ import math
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
 import sysconfig
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from typing import IO, Optional
 
-import httpx
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from ._http_probe import ProbeResponse, probe_get
 from .embed_manager import EmbedManager
 from .profile_manager import ProfileLockTimeout, ProfileManager, lock_file, unlock_file
 
 logger = logging.getLogger(__name__)
 console = Console(stderr=True)
-
-# Suppress noisy httpx logs
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _parse_float_env(name: str, default: float) -> float:
@@ -71,6 +70,7 @@ def _parse_non_negative_int(value: str | None, default: int, name: str) -> int:
 # unpacks and runs initdb on first boot, which takes noticeably longer on cold
 # runners than POSIX.
 DAEMON_STARTUP_TIMEOUT = int(os.getenv("HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT", "180"))
+DAEMON_STARTUP_TERMINATE_TIMEOUT = 10
 DEFAULT_DAEMON_IDLE_TIMEOUT = 0  # 0 = disabled (no auto-exit)
 ENV_DAEMON_LOG_MAX_BYTES = "HINDSIGHT_EMBED_DAEMON_LOG_MAX_BYTES"
 ENV_DAEMON_LOG_BACKUP_COUNT = "HINDSIGHT_EMBED_DAEMON_LOG_BACKUP_COUNT"
@@ -140,16 +140,18 @@ _PROBE_TIMEOUT_S = 5.0
 _WINDOWS_PROBE_TIMEOUT_S = 30.0
 
 
-def _probe_timeout(read: float) -> httpx.Timeout:
-    """Timeout with a short connect and a caller-chosen read budget."""
-    return httpx.Timeout(read, connect=min(read, PROBE_CONNECT_TIMEOUT))
+def _probe(url: str, read: float) -> ProbeResponse | None:
+    """GET url with a short connect and a caller-chosen read budget; None if nothing answered."""
+    return probe_get(url, read_timeout=read, connect_timeout=min(read, PROBE_CONNECT_TIMEOUT))
 
 
 def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
     """Cross-platform kwargs to spawn a subprocess detached from the caller.
 
     On POSIX, `start_new_session=True` calls setsid(2) so the child
-    survives the parent's terminal. On Windows there is no setsid: we use
+    survives the parent's terminal; `stdin` is pinned to /dev/null so the
+    child never inherits a caller fd 0 that may be CLOEXEC (closed at exec,
+    leaving ``sys.stdin = None``). On Windows there is no setsid: we use
     `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, which also means the
     child has no console, so stdin/stdout/stderr MUST be redirected or any
     write from the child crashes with "handle is invalid".
@@ -173,9 +175,48 @@ def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
         }
     return {
         "start_new_session": True,
+        "stdin": subprocess.DEVNULL,
         "stdout": log_handle,
         "stderr": log_handle,
     }
+
+
+def _signal_startup_process(process: subprocess.Popen, *, force: bool) -> None:
+    """Signal the daemon child's whole process group on POSIX.
+
+    The child may be the ``uvx`` launcher rather than hindsight-api itself;
+    signalling only its pid can leave the real API running as an orphan.
+    ``_detach_popen_kwargs`` starts it with ``start_new_session``, so its pid is
+    also its process group id. On Windows there is no group to signal, and
+    ``terminate()`` is already an alias for ``kill()``.
+    """
+    if platform.system() == "Windows":
+        process.kill()
+    else:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
+def _terminate_startup_process(process: subprocess.Popen) -> None:
+    """Stop the daemon child owned by a failed startup attempt, escalating to kill."""
+    if process.poll() is not None:
+        return
+    try:
+        _signal_startup_process(process, force=False)
+        try:
+            process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _signal_startup_process(process, force=True)
+            process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
+    except ProcessLookupError:
+        return
+
+
+@dataclass(frozen=True)
+class UvTrampoline:
+    """A uv venv's Scripts/pythonw.exe, resolved to what it actually launches."""
+
+    base_pythonw: str
+    venv_root: Path
 
 
 class DaemonEmbedManager(EmbedManager):
@@ -255,12 +296,8 @@ class DaemonEmbedManager(EmbedManager):
         which consults the long probe before deciding anything destructive.
         """
         daemon_url = self.get_url(profile)
-        try:
-            with httpx.Client(timeout=_probe_timeout(LIVENESS_PROBE_TIMEOUT)) as client:
-                response = client.get(f"{daemon_url}/health")
-                return response.status_code == 200
-        except Exception:
-            return False
+        response = _probe(f"{daemon_url}/health", LIVENESS_PROBE_TIMEOUT)
+        return response is not None and response.status_code == 200
 
     def _dev_api_command(self) -> list[str] | None:
         """Return the dev-mode launch command when running inside the monorepo."""
@@ -270,7 +307,43 @@ class DaemonEmbedManager(EmbedManager):
         return None
 
     @staticmethod
-    def _windows_gui_interpreter(preferred_dir: Path | None = None) -> str | None:
+    def _uv_trampoline_target(pythonw: Path) -> UvTrampoline | None:
+        """For a uv venv trampoline, resolve the base pythonw.exe it launches.
+
+        uv does not put a real interpreter in a venv's Scripts dir: the small
+        ``pythonw.exe`` there is a trampoline that CreateProcess's the base
+        interpreter recorded in ``pyvenv.cfg``. That relaunch lands on the CUI
+        ``python.exe`` and allocates the console our DETACHED_PROCESS flags were
+        meant to prevent — the flags applied to the trampoline, not to the
+        process the trampoline went on to spawn (issue #4466). Launching the
+        base pythonw.exe ourselves keeps the whole tree GUI-subsystem.
+
+        Returns None unless pyvenv.cfg carries uv's own ``uv =`` marker: a
+        stdlib venv's pythonw.exe is the GUI venvwlauncher, which already
+        redirects to the base *pythonw*, so bypassing it here would drop it out
+        of its venv for no gain.
+        """
+        for venv_root in (pythonw.parent.parent, pythonw.parent):
+            cfg = venv_root / "pyvenv.cfg"
+            try:
+                if not cfg.is_file():
+                    continue
+                text = cfg.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            entries = {
+                key.strip().lower(): value.strip()
+                for key, _, value in (line.partition("=") for line in text.splitlines())
+            }
+            if "uv" not in entries or "home" not in entries:
+                continue
+            base_pythonw = Path(entries["home"]) / "pythonw.exe"
+            if base_pythonw.is_file():
+                return UvTrampoline(base_pythonw=str(base_pythonw), venv_root=venv_root)
+        return None
+
+    @staticmethod
+    def _windows_gui_interpreter(preferred_dir: Path | None = None, env: dict[str, str] | None = None) -> str | None:
         """Path to the GUI-subsystem Python (pythonw.exe), or None.
 
         Returns None on non-Windows, or when pythonw.exe can't be located next
@@ -284,15 +357,33 @@ class DaemonEmbedManager(EmbedManager):
         never allocates a console, so no window appears. Prefer the scripts dir
         that contains hindsight-api.exe because wrapper entry points can make
         sys.executable point at a different launcher directory (issue #2389).
+
+        When the pythonw we find is a uv trampoline and ``env`` is a writable
+        dict, resolve the base interpreter instead and put the venv's
+        site-packages on PYTHONPATH so hindsight_api stays importable (#4466).
         """
         if platform.system() != "Windows":
             return None
+        candidates: list[Path] = []
         if preferred_dir is not None:
-            pythonw = preferred_dir / "pythonw.exe"
-            if pythonw.exists():
-                return str(pythonw)
-        pythonw = Path(sys.executable).with_name("pythonw.exe")
-        return str(pythonw) if pythonw.exists() else None
+            candidates.append(preferred_dir / "pythonw.exe")
+        candidates.append(Path(sys.executable).with_name("pythonw.exe"))
+        for pythonw in candidates:
+            if not pythonw.exists():
+                continue
+            target = DaemonEmbedManager._uv_trampoline_target(pythonw)
+            # Only bypass the trampoline when we can hand the base interpreter
+            # the venv's packages: without them it can't import hindsight_api,
+            # and a daemon that won't start is worse than a console flash.
+            if target is not None and env is not None:
+                site_packages = target.venv_root / "Lib" / "site-packages"
+                if site_packages.is_dir():
+                    env["PYTHONPATH"] = os.pathsep.join(
+                        part for part in (str(site_packages), env.get("PYTHONPATH", "")) if part
+                    )
+                    return target.base_pythonw
+            return str(pythonw)
+        return None
 
     def _component_version(self, profile: str, env_key: str) -> str:
         """Resolve a component version: profile .env override > env var > embed version.
@@ -352,7 +443,7 @@ class DaemonEmbedManager(EmbedManager):
             # The console exe lives in sys.executable's scripts dir, so
             # hindsight_api is importable by the GUI interpreter; prefer it on
             # Windows to avoid ConPTY popping a terminal tab (issue #1885).
-            gui_python = self._windows_gui_interpreter(scripts_dir)
+            gui_python = self._windows_gui_interpreter(scripts_dir, env if isinstance(env, dict) else None)
             if gui_python is not None:
                 return [gui_python, "-m", "hindsight_api.main"]
             return [str(candidate)]
@@ -400,12 +491,28 @@ class DaemonEmbedManager(EmbedManager):
 
     @staticmethod
     def _run_probe(cmd: list[str], timeout: float = _PROBE_TIMEOUT_S) -> str | None:
-        """Run a short read-only probe command, returning stdout or None."""
+        """Run a short read-only probe command, returning stdout or None.
+
+        The decode is pinned rather than left to the locale. These probes run
+        Windows-native CLIs (`netstat`, `powershell`, `wmic`) that emit localized
+        text in the console code page, while `text=True` alone decodes with
+        `locale.getpreferredencoding(False)` - which is `utf-8` in a UTF-8-mode
+        process. The mismatch raises inside `subprocess`'s own reader thread, where
+        nothing here can catch it: the thread dies, `run()` returns normally with
+        `stdout=None` and returncode 0, and the caller reads "no listeners" from a
+        host that has plenty.
+
+        `errors="replace"` is the half that makes it deterministic; `encoding` alone
+        still raises. Only the localized header carries non-ASCII, so every line the
+        parsers read survives intact and neither needed changing.
+        """
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
@@ -568,17 +675,14 @@ class DaemonEmbedManager(EmbedManager):
     @staticmethod
     def _port_health_ok(port: int) -> bool:
         """Return True when the listener on port responds like initialized Hindsight."""
+        response = _probe(f"http://127.0.0.1:{port}/health", HEALTH_PROBE_TIMEOUT)
+        if response is None or response.status_code != 200:
+            return False
         try:
-            with httpx.Client(timeout=_probe_timeout(HEALTH_PROBE_TIMEOUT)) as client:
-                response = client.get(f"http://127.0.0.1:{port}/health")
-                if response.status_code != 200:
-                    return False
-                try:
-                    health = response.json()
-                except Exception:
-                    return False
-                return health.get("status") == "healthy" and health.get("database") == "connected"
-        except Exception:
+            health = response.json()
+            return health.get("status") == "healthy" and health.get("database") == "connected"
+        except (ValueError, AttributeError):
+            # Not JSON, or JSON that is not an object: not Hindsight's payload.
             return False
 
     def _wait_for_port_health(self, port: int, timeout: float | None = None) -> bool:
@@ -720,31 +824,21 @@ class DaemonEmbedManager(EmbedManager):
         merged_config = {**profile_config, **config}
         config = merged_config
 
-        # Build environment with LLM config
-        # Support both formats: simple keys ("llm_api_key") and env var format ("HINDSIGHT_API_LLM_API_KEY")
+        # Build the daemon environment: every HINDSIGHT_* key in the merged
+        # profile/explicit config, forwarded verbatim under its own name.
+        #
+        # There is deliberately no whitelist of known settings. There used to be
+        # one — LLM/log/idle_timeout, keyed by lowercase aliases — and a setting
+        # missing from it (HINDSIGHT_API_LLM_BASE_URL, issue #4094) was reported
+        # as silently ignored while KEY/MODEL applied. hindsight-api owns the
+        # set of settings that exist and adds to it every release; mirroring
+        # that set here can only ever drift behind it.
+        #
+        # An explicit "" is forwarded, not skipped: that is how a caller clears
+        # an inherited setting — e.g. blanking the API key for a local LLM
+        # service that has no authentication (issue #3253). Only None means
+        # "not specified".
         env = os.environ.copy()
-
-        # Map of simple key -> env var key
-        key_mapping = {
-            "llm_api_key": "HINDSIGHT_API_LLM_API_KEY",
-            "llm_provider": "HINDSIGHT_API_LLM_PROVIDER",
-            "llm_model": "HINDSIGHT_API_LLM_MODEL",
-            "llm_base_url": "HINDSIGHT_API_LLM_BASE_URL",
-            "log_level": "HINDSIGHT_API_LOG_LEVEL",
-            "idle_timeout": "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
-        }
-
-        for simple_key, env_key in key_mapping.items():
-            # Check both simple format and env var format
-            value = config.get(simple_key) or config.get(env_key)
-            if value:
-                env[env_key] = str(value)
-
-        # Propagate any other HINDSIGHT_* keys from the merged profile/explicit
-        # config into the daemon env. Without this, arbitrary settings in the
-        # profile's .env file (e.g. HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU,
-        # HINDSIGHT_API_EMBEDDINGS_PROVIDER) are silently dropped because the
-        # whitelist above only covers LLM/log/idle_timeout keys.
         for key, value in config.items():
             if key.startswith("HINDSIGHT_") and value is not None:
                 env[key] = str(value)
@@ -791,8 +885,12 @@ class DaemonEmbedManager(EmbedManager):
         env["HINDSIGHT_API_DAEMON_LOG"] = str(daemon_log)
 
         # Build command
+        # No --daemon: _HINDSIGHT_DAEMON_CHILD above already puts hindsight-api
+        # in daemon mode, and this Popen already detaches it. Passing --daemon
+        # too was redundant, and API versions older than the Popen-based
+        # daemonize() (#1519) fork on it, which can deadlock native libraries
+        # on macOS.
         cmd = self._find_api_command(self._component_version(profile, "HINDSIGHT_EMBED_API_VERSION"), env=env) + [
-            "--daemon",
             "--idle-timeout",
             str(idle_timeout),
             "--port",
@@ -810,7 +908,7 @@ class DaemonEmbedManager(EmbedManager):
             # Popen dups the fd into the child during spawn, so the parent
             # can close its handle as soon as Popen returns.
             with open(daemon_log, "ab") as daemon_log_handle:
-                subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
+                daemon_process = subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
 
             # Wait for daemon to be ready with rich UI
             start_time = time.time()
@@ -827,10 +925,26 @@ class DaemonEmbedManager(EmbedManager):
                 live.refresh()
 
                 while time.time() - start_time < DAEMON_STARTUP_TIMEOUT:
+                    # Polling keeps going through a missed health probe (below),
+                    # so a child that actually died is detected here instead of
+                    # waiting out the whole startup deadline.
+                    exit_code = daemon_process.poll()
+                    if exit_code is not None:
+                        log_lines.append("")
+                        log_lines.append(f"✗ Daemon exited during initialization (exit code {exit_code})")
+                        log_lines.append(f"See full log: {daemon_log}")
+                        content = Text("\n".join(log_lines), style="dim")
+                        fail_title = f"[bold red]✗ Daemon Failed[/bold red] [dim]({profile} @ :{port})[/dim]"
+                        panel = Panel(content, title=fail_title, border_style="red", padding=(1, 2))
+                        live.update(panel)
+                        live.refresh()
+                        console.print()
+                        return False
+
                     # Tail daemon logs
                     if daemon_log.exists():
                         try:
-                            with open(daemon_log, "r") as f:
+                            with open(daemon_log, "r", encoding="utf-8", errors="replace") as f:
                                 f.seek(last_log_position)
                                 new_lines = f.readlines()
                                 last_log_position = f.tell()
@@ -875,14 +989,16 @@ class DaemonEmbedManager(EmbedManager):
                             return True
                         else:
                             log_lines.append("")
-                            log_lines.append("✗ Daemon crashed during initialization")
+                            log_lines.append("Health probe failed after readiness; continuing to wait...")
                             content = Text("\n".join(log_lines), style="dim")
-                            fail_title = f"[bold red]✗ Daemon Failed[/bold red] [dim]({profile} @ :{port})[/dim]"
-                            panel = Panel(content, title=fail_title, border_style="red", padding=(1, 2))
+                            panel = Panel(content, title=title, border_style="cyan", padding=(1, 2))
                             live.update(panel)
                             live.refresh()
-                            console.print()
-                            break
+                            # /health shares the daemon event loop with startup
+                            # backlog processing. A single missed stability probe
+                            # is not evidence that the process exited; keep polling
+                            # within the existing startup deadline.
+                            continue
 
                     # Periodic progress
                     if time.time() - last_check_time > 3:
@@ -910,6 +1026,11 @@ class DaemonEmbedManager(EmbedManager):
             panel = Panel(content, title=timeout_title, border_style="red", padding=(1, 2))
             console.print(panel)
             console.print()
+            # Before this cleanup, the manager returned at the deadline but left
+            # the detached child initializing. A supervisor retry could then
+            # accumulate overlapping daemons that had not bound the port yet, so
+            # port-based cleanup could not see them.
+            _terminate_startup_process(daemon_process)
             return False
 
         except FileNotFoundError:
@@ -948,12 +1069,17 @@ class DaemonEmbedManager(EmbedManager):
             api_config = {k: v for k, v in config.items() if k.startswith("HINDSIGHT_API_")}
             if not api_config:
                 return
-            # Merge onto the existing .env so persisted keys (UI port, idle
-            # timeout, etc.) survive — create_profile overwrites the file, so we
-            # must carry the existing non-alias keys forward.
+            # Additive: seed keys the profile doesn't have yet, never overwrite
+            # ones it does. create_profile rewrites the whole file, so the
+            # existing keys have to be carried forward regardless (UI port, idle
+            # timeout, ...), and `config` here is the merged profile + this
+            # invocation's ambient HINDSIGHT_* environment — letting it win would
+            # make a one-off `HINDSIGHT_API_LLM_MODEL=... hindsight-embed recall`
+            # permanently rewrite the user's profile. The profile file is owned
+            # by `configure` and the control center; a daemon start only fills
+            # in what is missing.
             existing = self._profile_manager.load_profile_config(profile)
-            merged = {k: v for k, v in existing.items() if not k.islower()}
-            merged.update(api_config)
+            merged = {**api_config, **existing}
             self._profile_manager.create_profile(profile, port, merged)
         except Exception as e:
             logger.debug(f"Failed to register profile '{profile}' in metadata: {e}")
@@ -1004,12 +1130,9 @@ class DaemonEmbedManager(EmbedManager):
         for host in LOOPBACK_HOSTS:
             # IPv6 literals have to be bracketed in a URL authority.
             base = f"http://[{host}]:{ui_port}" if ":" in host else f"http://{host}:{ui_port}"
-            try:
-                with httpx.Client(timeout=_probe_timeout(LIVENESS_PROBE_TIMEOUT)) as client:
-                    if client.get(f"{base}/api/health").status_code == 200:
-                        return host
-            except Exception:
-                continue
+            response = _probe(f"{base}/api/health", LIVENESS_PROBE_TIMEOUT)
+            if response is not None and response.status_code == 200:
+                return host
         return None
 
     @staticmethod
@@ -1203,7 +1326,7 @@ class DaemonEmbedManager(EmbedManager):
         Ensure daemon is running, starting it if needed.
 
         Args:
-            config: Environment configuration dict (HINDSIGHT_API_* vars)
+            config: Environment configuration dict (HINDSIGHT_* vars)
             profile: Profile name for isolation
             extra_args: Extra CLI arguments to pass to hindsight-api (e.g. ["--offline"])
 

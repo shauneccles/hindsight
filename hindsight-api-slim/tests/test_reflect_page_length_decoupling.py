@@ -13,6 +13,7 @@ truncates the visible answer mid-word. These tests pin the decoupled contract:
   text.
 """
 
+from hindsight_api.engine.response_models import LLMCallResult
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,12 +66,17 @@ def _mock_llm(final_answer: str = "Synthesized final answer."):
     llm = MagicMock()
     llm.provider = "gemini"
     llm.model = "gemini-2.5-flash"
-    llm.call = AsyncMock(return_value=(final_answer, TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52)))
+    llm.call = AsyncMock(
+        return_value=LLMCallResult(
+            content=final_answer, usage=TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52)
+        )
+    )
     return llm
 
 
 def _mock_functions():
     return {
+        "read_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
         "search_mental_models_fn": AsyncMock(
             return_value={"mental_models": [{"id": "mm-1", "name": "Prefs", "content": "Fresh.", "is_stale": False}]}
         ),
@@ -144,6 +150,35 @@ async def test_forced_synthesis_uses_config_cap_when_set(monkeypatch):
         clear_config_cache()
 
 
+@pytest.mark.asyncio
+async def test_tool_call_loop_uses_config_cap(monkeypatch):
+    """The per-iteration loop gets the same cap as the synthesis calls (#4437).
+
+    Left unset it fell through to the provider's own default, which on Anthropic
+    is a fixed number (the Messages API requires ``max_tokens``) — truncating a
+    long ``done`` payload before the answer field was written.
+    """
+    monkeypatch.setenv("HINDSIGHT_API_REFLECT_MAX_COMPLETION_TOKENS", "12345")
+    clear_config_cache()
+    try:
+        llm = _mock_llm()
+        _stop_after_evidence(llm)
+        await run_reflect_agent(
+            llm_config=llm,
+            bank_id="b",
+            query="q",
+            bank_profile=BANK,
+            has_mental_models=True,
+            budget="low",
+            max_tokens=64,
+            **_mock_functions(),
+        )
+        for call in llm.call_with_tools.await_args_list:
+            assert call.kwargs["max_completion_tokens"] == 12345
+    finally:
+        clear_config_cache()
+
+
 # --------------------------------------------------------------------------- #
 # Gemini surfaces MAX_TOKENS truncation instead of a silent success
 # --------------------------------------------------------------------------- #
@@ -166,7 +201,9 @@ async def test_gemini_warns_on_max_tokens_truncation(caplog):
     llm._provider_impl._client.aio.models.generate_content = AsyncMock(return_value=response)
 
     with caplog.at_level(logging.WARNING):
-        out = await llm._provider_impl.call([{"role": "user", "content": "write a page"}], max_completion_tokens=500)
+        out = (
+            await llm._provider_impl.call([{"role": "user", "content": "write a page"}], max_completion_tokens=500)
+        ).content
 
     assert out == "A page that was cut off mid-wor"
     assert any("truncated at max_output_tokens" in r.message for r in caplog.records)

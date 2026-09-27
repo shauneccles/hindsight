@@ -19,27 +19,29 @@
  *   - empty set (cold)                 -> start the background seed, seededAt written, note added
  */
 import { readFileSync } from "node:fs";
-import { gitHeadSha, hasGitHistory, commitsSince } from "./git";
+import { gitHeadSha, hasGitHistory, commitsSince, repoNameOf } from "./git";
 import { DEEPEN_DIFF_TARGET } from "./status";
 import { startBackgroundSeed } from "./seed";
+import { maybeAutoUpdate } from "./auto-update";
 import { syncCompanionSkill } from "./skill-sync";
 import { SURVEY_DOC_IDS, startCodebaseSurvey, type SurveyHarness } from "./survey";
 import { applyBankConfig, loadConfig } from "./config";
 import { DAEMON_WAIT_SESSION_START_MS, ensureDaemon } from "./daemon";
 import type { Config } from "./config";
-import { deriveBankId } from "./bank";
+import { deriveBankIdOrSkip } from "./bank";
 import { brandWord } from "./brand";
 import { diag } from "./diag";
 import { setLogLevel } from "./log";
 import { parsePageList, buildKnowledgePreamble, type PageRef } from "./knowledge-injection";
 import type { ClientOpts, RetainOpts } from "./hindsight";
 import { buildRetainStamp } from "./retain-stamp";
+import { detectLegacyClaudePlugin, legacyClaudePluginWarning } from "./legacy";
 import { HindsightClient } from "./hindsight";
 import { sessionCacheFile, sessionRootDir, writeSessionCache } from "./session-cache";
 
 /** Minimal client shape `buildSessionStartContext` needs. */
 interface SeedContextClient {
-  listDocumentIds(tag: string): Promise<Set<string>>;
+  listDocumentIds(tag: string, tagsMatch?: "all" | "all_strict"): Promise<Set<string>>;
   listPages(): Promise<unknown>;
   knowledgePagesSupported?: boolean;
   // Optional: used to write the survey-baseline marker (Option A). HindsightClient has it; the
@@ -87,8 +89,8 @@ async function gitSyncNote(args: {
   const head = gitHeadSha(cwd);
   if (!head) return undefined;
   const gitlogCurrent = await client
-    .listDocumentIds(`gitlog-head:${head}`)
-    .then((s) => s.size > 0)
+    .listDocumentIds(`gitlog-head:${head}`, "all_strict")
+    .then((s) => s.has(`gitlog:${repoNameOf(cwd)}`))
     .catch(() => undefined);
   if (gitlogCurrent === undefined) return undefined; // server hiccup: say nothing rather than guess
   if (mode === "message") return gitlogCurrent ? "git in sync" : "catching up on new commits";
@@ -101,6 +103,7 @@ async function gitSyncNote(args: {
       execFileSync("git", ["-C", cwd, "rev-list", "--count", "HEAD"], {
         encoding: "utf8",
         windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"], // do not corrupt the host banner on a late git failure
       }).trim()
     );
     if (n > 0) target = Math.min(DEEPEN_DIFF_TARGET, n);
@@ -146,12 +149,12 @@ export async function buildSessionStartContext(args: {
   stateDir?: string;
   hasGit?: (dir: string) => boolean;
   startSeed?: (repoDir: string, opts?: { limit?: number; harness?: string }) => void;
-  startSurvey?: (
-    repoDir: string,
-    opts?: { harness?: SurveyHarness; model?: string; budgetUsd?: number }
-  ) => void;
+  startSurvey?: typeof startCodebaseSurvey;
   headSha?: (dir: string) => string | null;
   commitsSince?: (dir: string, sinceSha: string) => number | null;
+  /** Registry key of the old Claude Code plugin still active for `cwd`; defaults to reading
+   *  Claude's plugin files, and only for the claude-code harness. */
+  detectLegacyPlugin?: (cwd: string) => string | undefined;
 }): Promise<SessionStartOutput> {
   const { cwd, bankId, cfg, client, stateDir } = args;
   const t0 = Date.now();
@@ -210,7 +213,7 @@ export async function buildSessionStartContext(args: {
       {
         let docIds: Set<string> | undefined;
         try {
-          docIds = await client.listDocumentIds("source:git");
+          docIds = await client.listDocumentIds("source:git", "all_strict");
         } catch {
           docIds = undefined; // server unreachable: transient — do nothing, try again next session
         }
@@ -231,13 +234,13 @@ export async function buildSessionStartContext(args: {
           if (docIds.size === 0) {
             if (cfg.codebaseSurvey !== false) {
               // Run the survey under the current harness's own CLI (falls back to any available agent).
-              startSurvey(cwd, {
+              const started = await startSurvey(cwd, {
                 harness: harness as SurveyHarness,
                 model: cfg.surveyModel,
                 budgetUsd: cfg.surveyBudgetUsd,
               });
               const sha = resolveHeadSha(cwd);
-              if (sha) recordSurveyBaseline(sha); // baseline for the commit-count re-survey below
+              if (started && sha) recordSurveyBaseline(sha);
             }
             diag(harness, "seed_started", { bank: bankId });
           } else if (cfg.codebaseSurvey !== false && cfg.surveyRefreshCommits > 0) {
@@ -250,7 +253,7 @@ export async function buildSessionStartContext(args: {
             const sha = resolveHeadSha(cwd);
             if (sha) {
               const markers = await client
-                .listDocumentIds(SURVEY_BASELINE_TAG)
+                .listDocumentIds(SURVEY_BASELINE_TAG, "all_strict")
                 .catch(() => new Set<string>());
               const counts: number[] = [];
               for (const id of markers) {
@@ -262,22 +265,24 @@ export async function buildSessionStartContext(args: {
               // A baseline without FINDINGS means the surveyed agent died before ingesting (no
               // CLI on PATH, budget kill) — the marker alone must not suppress retries forever.
               const uploads = await client
-                .listDocumentIds("source:upload")
+                .listDocumentIds("source:upload", "all_strict")
                 .catch(() => new Set<string>());
               const findingsAbsent =
                 counts.length > 0 && !SURVEY_DOC_IDS.some((id) => uploads.has(id));
               if ((sinceLast !== null && sinceLast >= cfg.surveyRefreshCommits) || findingsAbsent) {
-                startSurvey(cwd, {
+                const started = await startSurvey(cwd, {
                   harness: harness as SurveyHarness,
                   model: cfg.surveyModel,
                   budgetUsd: cfg.surveyBudgetUsd,
                 });
-                recordSurveyBaseline(sha);
-                diag(harness, "survey_refresh", {
-                  bank: bankId,
-                  commits: sinceLast,
-                  retry: findingsAbsent,
-                });
+                if (started) {
+                  recordSurveyBaseline(sha);
+                  diag(harness, "survey_refresh", {
+                    bank: bankId,
+                    commits: sinceLast,
+                    retry: findingsAbsent,
+                  });
+                }
               } else if (sinceLast === null) {
                 recordSurveyBaseline(sha); // first baseline, or reset after a rebase — no survey
               }
@@ -301,7 +306,9 @@ export async function buildSessionStartContext(args: {
     }
     /* fail-open preamble; preserve first-prompt reflect eligibility on a transient outage */
   }
-  const additionalContext = buildKnowledgePreamble(pages, { reflectOnNewGoals: !cfg.autoReflect });
+  const additionalContext = buildKnowledgePreamble(pages, {
+    reflectOnNewGoals: cfg.autoInject !== "reflect",
+  });
   const deferInitialReflect = cold === true || (pageListKnown && pages.length === 0);
 
   // The banner shows on EVERY session — Hindsight's presence is part of the product, not a
@@ -318,6 +325,16 @@ export async function buildSessionStartContext(args: {
     }).catch(() => undefined);
   }
   systemMessage = buildSeedBanner(bankId, cold === true, gitNote);
+
+  // The old per-agent plugin keeps running next to this one until the user removes it — say so
+  // where they will see it. Only Claude Code had that plugin.
+  const detectLegacy =
+    args.detectLegacyPlugin ?? (harness === "claude-code" ? detectLegacyClaudePlugin : undefined);
+  const legacyPlugin = detectLegacy?.(cwd);
+  if (legacyPlugin) {
+    systemMessage += `\n${legacyClaudePluginWarning(legacyPlugin)}`;
+    diag(harness, "legacy_plugin_active", { plugin: legacyPlugin });
+  }
 
   // ALWAYS record the session start (warm sessions used to log nothing — undebuggable).
   diag(harness, "session_start", { bank: bankId, cold, pages: pages.length, ms: Date.now() - t0 });
@@ -352,11 +369,19 @@ export async function runSessionStartHook(
     setLogLevel(cfg.logLevel);
     syncCompanionSkill(harness); // keep the installed skill current with the package version
     if (cfg.disabled) return;
+    // …and keep the package itself current. AFTER the disabled check, unlike the skill sync above:
+    // `disabled` means an inert plugin, and a network call plus a background npm install is not
+    // inert. It also keeps the two harness families symmetric — the plugin hosts never construct a
+    // RuntimeCore when disabled (harness/plugin-entry.ts), so they already skip this.
+    // Detached and rate-limited to once a day; the update lands for the NEXT session.
+    void maybeAutoUpdate(cfg);
 
     // Recorded HERE, on the session's first hook, so every later hook of this session resolves the
     // same bank however far the agent navigates (#3563).
     const sessionRoot = sessionRootDir(harness, sessionId, cwd);
-    const resolved = applyBankConfig(cfg, deriveBankId(cfg, cwd, harness, sessionRoot), cwd);
+    const derived = deriveBankIdOrSkip(cfg, cwd, harness, sessionRoot);
+    if (derived === null) return; // repository unidentifiable: no bank, no seed, no injection
+    const resolved = applyBankConfig(cfg, derived, cwd);
     cfg = resolved.cfg;
     const bankId = resolved.bankId;
     if (cfg.disabled) return; // per-bank opt-out (banks.<id> override)

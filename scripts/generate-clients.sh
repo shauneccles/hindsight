@@ -341,6 +341,100 @@ else:
 PATCH_SCRIPT
 fi
 
+# Patch content models in Python SDK to support deserializing and serializing block dicts
+echo "Patching content models in Python client..."
+python3 << PATCH_CONTENT_SCRIPT
+import os
+
+inner_file = "$PYTHON_CLIENT_DIR/hindsight_client_api/models/content_any_of_inner.py"
+if os.path.exists(inner_file):
+    with open(inner_file, 'r') as f:
+        content = f.read()
+
+    old_init = '''    def __init__(self, *args, **kwargs) -> None:
+        if args:
+            if len(args) > 1:
+                raise ValueError("If a position argument is used, only 1 is allowed to set \`actual_instance\`")
+            if kwargs:
+                raise ValueError("If a position argument is used, keyword arguments cannot be used.")
+            super().__init__(actual_instance=args[0])
+        else:
+            super().__init__(**kwargs)'''
+
+    new_init = '''    def __init__(self, *args, **kwargs) -> None:
+        if args:
+            if len(args) > 1:
+                raise ValueError("If a position argument is used, only 1 is allowed to set \`actual_instance\`")
+            if kwargs:
+                raise ValueError("If a position argument is used, keyword arguments cannot be used.")
+            value = args[0]
+        elif "actual_instance" in kwargs:
+            super().__init__(**kwargs)
+            return
+        elif kwargs:
+            value = kwargs
+        else:
+            super().__init__()
+            return
+
+        if isinstance(value, dict):
+            block_class = {
+                "text": TextContentBlock,
+                "image": ImageContentBlock,
+                "file": FileContentBlock,
+            }.get(value.get("type"))
+            if block_class is None:
+                raise ValueError(f"Unknown content block type: {value.get('type')!r}")
+            value = block_class.from_dict(value)
+        super().__init__(actual_instance=value)'''
+
+    if old_init in content:
+        content = content.replace(old_init, new_init)
+        with open(inner_file, 'w') as f:
+            f.write(content)
+        print("  ✓ content_any_of_inner.py patched successfully")
+    else:
+        raise SystemExit("Could not find expected __init__ in content_any_of_inner.py")
+
+content_file = "$PYTHON_CLIENT_DIR/hindsight_client_api/models/content.py"
+if os.path.exists(content_file):
+    with open(content_file, 'r') as f:
+        c_content = f.read()
+
+    old_to_dict = '''    def to_dict(self) -> Optional[Union[Dict[str, Any], List[ContentAnyOfInner], str]]:
+        """Returns the dict representation of the actual instance"""
+        if self.actual_instance is None:
+            return None
+
+        if hasattr(self.actual_instance, "to_dict") and callable(self.actual_instance.to_dict):
+            return self.actual_instance.to_dict()
+        else:
+            return self.actual_instance'''
+
+    new_to_dict = '''    def to_dict(self) -> Optional[Union[Dict[str, Any], List[ContentAnyOfInner], str]]:
+        """Returns the dict representation of the actual instance"""
+        if self.actual_instance is None:
+            return None
+
+        if hasattr(self.actual_instance, "to_dict") and callable(self.actual_instance.to_dict):
+            return self.actual_instance.to_dict()
+        elif isinstance(self.actual_instance, list):
+            return [
+                item.to_dict() if hasattr(item, "to_dict") and callable(item.to_dict) else item
+                for item in self.actual_instance
+            ]
+        else:
+            return self.actual_instance'''
+
+    if old_to_dict in c_content:
+        c_content = c_content.replace(old_to_dict, new_to_dict)
+        with open(content_file, 'w') as f:
+            f.write(c_content)
+        print("  ✓ content.py patched successfully")
+    else:
+        raise SystemExit("Could not find expected to_dict in content.py")
+PATCH_CONTENT_SCRIPT
+
 echo "✓ Python client generated at $PYTHON_CLIENT_DIR"
 echo ""
 
@@ -427,6 +521,7 @@ else
     [ -f "integration_test.go" ] && cp integration_test.go "$TEMP_DIR/"
     [ -f "null_test.go" ] && cp null_test.go "$TEMP_DIR/"
     [ -f "trace_test.go" ] && cp trace_test.go "$TEMP_DIR/"
+    [ -f "content_marshal_test.go" ] && cp content_marshal_test.go "$TEMP_DIR/"
     [ -f "hindsight_client.go" ] && cp hindsight_client.go "$TEMP_DIR/"
     # go.mod/go.sum are maintained, not regenerated: a fresh `go mod tidy`
     # resolves unpinned deps (e.g. testify, pulled in by the maintained tests)
@@ -468,11 +563,32 @@ else
     [ -f "$TEMP_DIR/integration_test.go" ] && mv "$TEMP_DIR/integration_test.go" .
     [ -f "$TEMP_DIR/null_test.go" ] && mv "$TEMP_DIR/null_test.go" .
     [ -f "$TEMP_DIR/trace_test.go" ] && mv "$TEMP_DIR/trace_test.go" .
+    [ -f "$TEMP_DIR/content_marshal_test.go" ] && mv "$TEMP_DIR/content_marshal_test.go" .
     [ -f "$TEMP_DIR/hindsight_client.go" ] && mv "$TEMP_DIR/hindsight_client.go" .
     # Overwrites the generator-emitted go.mod/go.sum with the maintained ones.
     [ -f "$TEMP_DIR/go.mod" ] && mv "$TEMP_DIR/go.mod" .
     [ -f "$TEMP_DIR/go.sum" ] && mv "$TEMP_DIR/go.sum" .
     rm -rf "$TEMP_DIR"
+
+    # Fix known generator issue: anyOf/oneOf models get a POINTER-receiver
+    # MarshalJSON, but they are embedded in requests BY VALUE (e.g.
+    # MemoryItem.Content). encoding/json only reaches a pointer-receiver
+    # marshaller through an addressable value, and the top level of
+    # json.Marshal(v) is not addressable — so the custom marshaller is skipped
+    # and the union serialises as its raw struct:
+    #     {"content":{"ArrayOfContentAnyOfInner":null,"String":"hi"}}
+    # which the API rejects with 422. A value receiver is found in both cases,
+    # and these marshallers are pure reads, so widening the receiver is safe.
+    # Nullable wrappers (NullableTimestamp) already use value receivers, which
+    # is why only the non-nullable unions are affected.
+    for f in model_*.go; do
+        [ -e "$f" ] || continue
+        if grep -q 'func (src \*[A-Za-z]*) MarshalJSON' "$f"; then
+            echo "Patching $f: union MarshalJSON to a value receiver..."
+            sed -i.bak -E 's|func \(src \*([A-Za-z]+)\) MarshalJSON|func (src \1) MarshalJSON|' "$f"
+            rm -f "$f.bak"
+        fi
+    done
 
     # Fix known generator issue: api_files.go uses os.File but generator omits "os" import
     if [ -f "api_files.go" ] && grep -q 'os\.File' api_files.go && ! grep -q '"os"' api_files.go; then

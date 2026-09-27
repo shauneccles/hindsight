@@ -73,16 +73,26 @@ await client.retainBatch('my-bank', [
 
 ```bash
 # Retain content with document ID
-hindsight memory retain my-bank "Meeting notes content..." --doc-id notes-2024-03-15
+hindsight memory retain "$BANK_ID" "Meeting notes content..." --doc-id notes-2024-03-15
 
 # Batch retain from files
-hindsight memory retain-files my-bank docs/
+hindsight memory retain-files "$BANK_ID" docs/
 ```
 
 ### Go
 
 ```go
-# Section 'document-retain' not found in api/documents.go
+// Retain with document ID
+docID := "meeting-2024-03-15"
+client.MemoryAPI.RetainMemories(ctx, "my-bank").
+	RetainRequest(hindsight.RetainRequest{
+		Items: []hindsight.MemoryItem{
+			{
+				Content:    hindsight.TextContent("Alice presented the Q4 roadmap..."),
+				DocumentId: *hindsight.NewNullableString(&docID),
+			},
+		},
+	}).Execute()
 ```
 
 ## Update Documents
@@ -125,16 +135,37 @@ await client.retain('my-bank', 'Project deadline: April 15 (extended)', {
 
 ```bash
 # Original
-hindsight memory retain my-bank "Project deadline: March 31" --doc-id project-plan
+hindsight memory retain "$BANK_ID" "Project deadline: March 31" --doc-id project-plan
 
 # Update
-hindsight memory retain my-bank "Project deadline: April 15 (extended)" --doc-id project-plan
+hindsight memory retain "$BANK_ID" "Project deadline: April 15 (extended)" --doc-id project-plan
 ```
 
 ### Go
 
 ```go
-# Section 'document-update' not found in api/documents.go
+// Original
+planDoc := "project-plan"
+client.MemoryAPI.RetainMemories(ctx, "my-bank").
+	RetainRequest(hindsight.RetainRequest{
+		Items: []hindsight.MemoryItem{
+			{
+				Content:    hindsight.TextContent("Project deadline: March 31"),
+				DocumentId: *hindsight.NewNullableString(&planDoc),
+			},
+		},
+	}).Execute()
+
+// Update (deletes old facts, creates new ones)
+client.MemoryAPI.RetainMemories(ctx, "my-bank").
+	RetainRequest(hindsight.RetainRequest{
+		Items: []hindsight.MemoryItem{
+			{
+				Content:    hindsight.TextContent("Project deadline: April 15 (extended)"),
+				DocumentId: *hindsight.NewNullableString(&planDoc),
+			},
+		},
+	}).Execute()
 ```
 
 ## Get Document
@@ -188,70 +219,116 @@ console.log(`Created: ${doc.created_at}`);
 ### CLI
 
 ```bash
-hindsight document get my-bank meeting-2024-03-15
+hindsight document get "$BANK_ID" notes-2024-03-15
 ```
 
 ### Go
 
 ```go
-# Section 'document-get' not found in api/documents.go
+doc, _, err := client.DocumentsAPI.GetDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
+if err != nil {
+	log.Fatalf("Failed to get document: %v", err)
+}
+fmt.Printf("Document ID: %s\n", doc.GetId())
+fmt.Printf("Memory units: %d\n", doc.GetMemoryUnitCount())
 ```
 
 ## Update Document
 
 Update mutable fields on an existing document without re-processing the content. Currently supports updating `tags`.
 
+The `tags` array **replaces** the document's tags — it is not merged into them. Send the complete set you want the document to end up with: any tag you leave out is dropped, and an empty array clears them all. To remove a single tag, read the document's current tags, drop the one you want gone, and send the rest. Omitting the field entirely is not an update at all and is rejected with a `422`.
+
 ### Python
 
 ```python
-# Original
-client.retain(
-    bank_id="my-bank",
-    content="Project deadline: March 31",
-    document_id="project-plan"
-)
+from hindsight_client_api import ApiClient, Configuration
+from hindsight_client_api.api import DocumentsApi
+from hindsight_client_api.models import UpdateDocumentRequest
 
-# Update (deletes old facts, creates new ones)
-client.retain(
-    bank_id="my-bank",
-    content="Project deadline: April 15 (extended)",
-    document_id="project-plan"
-)
+async def update_document_example():
+    config = Configuration(host="http://localhost:8888")
+    api_client = ApiClient(config)
+    api = DocumentsApi(api_client)
+
+    # Fix tags on a document retained with the wrong scope
+    result = await api.update_document(
+        bank_id="my-bank",
+        document_id="meeting-2024-03-15",
+        update_document_request=UpdateDocumentRequest(tags=["team-a", "team-b"]),
+    )
+    print(f"Updated: {result.success}")
+
+    # Remove all tags (make document visible everywhere)
+    await api.update_document(
+        bank_id="my-bank",
+        document_id="meeting-2024-03-15",
+        update_document_request=UpdateDocumentRequest(tags=[]),
+    )
+
+asyncio.run(update_document_example())
 ```
 
 ### Node.js
 
 ```javascript
-// Original
-await client.retain('my-bank', 'Project deadline: March 31', {
-    document_id: 'project-plan'
+// Fix tags on a document retained with the wrong scope
+const { data: updateResult, error: updateError } = await sdk.updateDocument({
+    client: apiClient,
+    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15-section-1' },
+    body: { tags: ['team-a', 'team-b'] }
 });
 
-// Update
-await client.retain('my-bank', 'Project deadline: April 15 (extended)', {
-    document_id: 'project-plan'
+if (updateError) {
+    throw new Error(`Failed to update tags: ${JSON.stringify(updateError)}`);
+}
+
+console.log(`Updated: ${updateResult.success}`);
+
+// Remove all tags (make document visible everywhere)
+await sdk.updateDocument({
+    client: apiClient,
+    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15-section-1' },
+    body: { tags: [] }
 });
 ```
 
 ### CLI
 
 ```bash
-# Replace tags with new values
-hindsight document update-tags my-bank meeting-2024-03-15 --tags team-a --tags team-b
+# Replace tags with new values (comma-separated)
+hindsight document update "$BANK_ID" notes-2024-03-15 --tags team-a,team-b
 
-# Remove all tags
-hindsight document update-tags my-bank meeting-2024-03-15
+# Remove all tags (make document visible everywhere)
+hindsight document update "$BANK_ID" notes-2024-03-15 --tags ""
 ```
 
 ### Go
 
 ```go
-# Section 'document-update' not found in api/documents.go
+// Replace the document's tags (the full set it should end up with)
+updateResult, _, err := client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+	UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{"team-a", "team-b"}}).
+	Execute()
+if err != nil {
+	log.Fatalf("Failed to update document: %v", err)
+}
+fmt.Printf("Updated: %v\n", updateResult.GetSuccess())
+
+// Remove all tags (make document visible everywhere). Pass an empty slice, not nil:
+// a nil slice is left out of the request, and the server rejects an update with no tags.
+client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+	UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{}}).
+	Execute()
 ```
 
 > **ℹ️ Observations are re-consolidated**
 >
 When tags change, any consolidated observations derived from the document's memories are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+
+This is required for correctness rather than incidental: consolidation scopes a memory by its tag set, so an observation built under the old tags is no longer valid, and deleting it would strand every other memory that observation was consolidated from unless those are requeued too. The size of that requeue is the number of memories co-sourced with this document's — on a densely co-sourced bank it can be many times the document's own memory count.
+
+Tags are compared as a **set** against the document's current tags, and an update that leaves the set unchanged — including one that only reorders the array — performs no retag and queues no re-consolidation. A repeatable tag-normalisation sweep therefore only pays the re-consolidation cost on the run that actually changes something.
 ## Delete Document
 
 Remove a document and all its associated memories:
@@ -293,13 +370,13 @@ console.log(`Deleted ${deleteResult.memory_units_deleted} memories`);
 ### CLI
 
 ```bash
-hindsight document delete my-bank meeting-2024-03-15
+hindsight document delete "$BANK_ID" notes-2024-03-15
 ```
 
 ### Go
 
 ```go
-# Section 'document-delete' not found in api/documents.go
+client.DocumentsAPI.DeleteDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
 ```
 
 > **⚠️ Warning**
@@ -307,7 +384,11 @@ hindsight document delete my-bank meeting-2024-03-15
 Deleting a document permanently removes all memories extracted from it. This action cannot be undone.
 ## List Documents
 
-List documents in a bank with optional filtering by ID and tags.
+List documents in a bank with optional filtering by ID, tags, and time.
+
+`start_date=` and `end_date=` restrict the results to a half-open range `[start, end)` on the timestamp named by `time_field=` — either `created_at` (when the document first arrived) or `updated_at` (its last write, and the default ordering). `time_field` also becomes the sort order, newest first.
+
+Because filtering and ordering follow the same column, `total` counts only the documents inside the window rather than the whole bank. Omit all three parameters to keep the default listing.
 
 ### Python
 
@@ -396,19 +477,23 @@ console.log(`Page items: ${page.items.length}`);
 
 ```bash
 # List all documents
-hindsight document list my-bank
+hindsight document list "$BANK_ID"
 
 # Filter by ID substring
-hindsight document list my-bank --q report
-
-# Filter by tags
-hindsight document list my-bank --tags team-a --tags team-b
+hindsight document list "$BANK_ID" --query notes
 ```
 
 ### Go
 
 ```go
-# Section 'document-list' not found in api/documents.go
+// List all documents
+docs, _, err := client.DocumentsAPI.ListDocuments(ctx, "my-bank").Execute()
+if err != nil {
+	log.Fatalf("Failed to list documents: %v", err)
+}
+for _, d := range docs.Items {
+	fmt.Printf("%s: %d memories\n", d.Id, d.GetMemoryUnitCount())
+}
 ```
 
 ### Filtering Options

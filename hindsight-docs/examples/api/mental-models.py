@@ -90,8 +90,9 @@ print(f"Operation ID: {result.operation_id}")
 time.sleep(5)
 
 # [docs:list-mental-models]
-# List all mental models in a bank
-mental_models = client.list_mental_models(bank_id=BANK_ID)
+# List all mental models in a bank. The list returns metadata by default;
+# detail="content" adds source_query/content/trigger.
+mental_models = client.list_mental_models(bank_id=BANK_ID, detail="content")
 
 for mental_model in mental_models.items:
     print(f"- {mental_model.name}: {mental_model.source_query}")
@@ -166,6 +167,37 @@ if mental_model_id:
         print(f"Changed at: {entry['changed_at']}")
         print(f"Previous content: {entry['previous_content']}")
     # [/docs:get-mental-model-history]
+
+    # [docs:mental-model-detail]
+    # List: metadata only, the default (smallest response)
+    client.list_mental_models(bank_id=BANK_ID)
+
+    # List with content but without provenance chains (opt-in)
+    client.list_mental_models(bank_id=BANK_ID, detail="content")
+
+    # Get one model — full detail is the default here
+    client.get_mental_model(bank_id=BANK_ID, mental_model_id=mental_model_id)
+    # [/docs:mental-model-detail]
+
+    # [docs:dry-run-refresh]
+    # Preview what a refresh would do, without writing anything
+    preview = client.dry_run_refresh_mental_model(
+        bank_id=BANK_ID,
+        mental_model_id=mental_model_id
+    )
+
+    print(f"Mode: {preview.effective_mode}, would persist: {preview.would_persist}")
+    print(preview.diff)
+    # [/docs:dry-run-refresh]
+
+    # [docs:keep-trace]
+    # Record how every refresh (scheduled ones too) reached its result
+    client.update_mental_model(
+        bank_id=BANK_ID,
+        mental_model_id=mental_model_id,
+        trigger={"mode": "delta", "keep_trace": True}
+    )
+    # [/docs:keep-trace]
 
     # [docs:delete-mental-model]
     # Delete a mental model

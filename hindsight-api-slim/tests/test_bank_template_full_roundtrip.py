@@ -91,14 +91,27 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "retain_default_strategy": "meetings",
     "retain_strategies": {"meetings": {"retain_chunk_size": 1200, "retain_extraction_mode": "verbose"}},
     "retain_chunk_batch_size": 7,
+    "retain_max_attachments_per_chunk": 3,
     "mcp_enabled_tools": ["recall", "retain"],
     "consolidation_llm_batch_size": 11,
     "consolidation_source_facts_max_tokens": 2048,
     "consolidation_source_facts_max_tokens_per_observation": 256,
     "max_observations_per_scope": 13,
     "observation_scope_limits": [{"scope": ["run_*"], "limit": 2}],
+    "consolidation_strategies": [
+        {
+            "scopes": [{"tags": ["company:*"]}],
+            "observations_mission": "Record only generalized trends.",
+            "max_observations_per_scope": 20,
+        }
+    ],
     "reflect_source_facts_max_tokens": 4096,
     "mental_model_min_refresh_interval_seconds": 900,
+    "knowledge_page_default_trigger": {"refresh_cron": "0 * * * *", "mode": "full"},
+    "reflect_default_options": {
+        "reflect_search_observations_max_tokens": 3000,
+        "reflect_search_observations_include_entities": False,
+    },
     "llm_gemini_safety_settings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}],
     "recall_budget_function": "adaptive",
     "recall_budget_fixed_low": 50,

@@ -12,9 +12,11 @@ import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from hindsight_api.engine.token_encoding import count_tokens
 from openai import OpenAI
 from pydantic import BaseModel
 from rich.console import Console
@@ -24,7 +26,88 @@ console = Console()
 GITHUB_REPO = "vectorize-io/hindsight"
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 GITHUB_COMMIT_URL = f"https://github.com/{GITHUB_REPO}/commit"
+GITHUB_PULL_URL = f"https://github.com/{GITHUB_REPO}/pull"
 REPO_PATH = Path(__file__).parent.parent.parent
+# Alembic migrations are enumerated deterministically from git (never via the LLM).
+MIGRATIONS_DIR = "hindsight-api-slim/hindsight_api/alembic/versions"
+
+
+@dataclass(frozen=True)
+class VolumeTier:
+    """How much data a table holds, and how that is labelled in the changelog."""
+
+    label: str
+    color: str
+
+
+# Tiers in descending volume; the order doubles as the sort order in a migration line.
+HIGH_VOLUME = VolumeTier("high volume", "var(--ifm-color-danger)")
+MEDIUM_VOLUME = VolumeTier("medium", "var(--ifm-color-warning-darker)")
+LOW_VOLUME = VolumeTier("small", "var(--ifm-color-emphasis-600)")
+VOLUME_ORDER = (HIGH_VOLUME, MEDIUM_VOLUME, LOW_VOLUME)
+
+# How much data a table holds in a real deployment, which is what decides how long a
+# migration touching it runs and how wide the lock it takes is. This is a property of
+# the schema, not of any one release, so it is a reviewed map rather than a per-run
+# LLM judgement: the same table must never be labelled differently in two releases.
+# `tests/test_generate_changelog_migrations.py` fails if a migration creates a table
+# that is missing here, so new tables have to be classified deliberately.
+TABLE_VOLUME: dict[str, VolumeTier] = {
+    # Grows with every retained fact, link and entity; can reach millions of rows.
+    "memory_units": HIGH_VOLUME,
+    "memory_units_bm25": HIGH_VOLUME,
+    "memory_links": HIGH_VOLUME,
+    "unit_entities": HIGH_VOLUME,
+    "entities": HIGH_VOLUME,
+    "entity_cooccurrences": HIGH_VOLUME,
+    "chunks": HIGH_VOLUME,
+    "invalidated_memory_units": HIGH_VOLUME,
+    "observation_history": HIGH_VOLUME,
+    "llm_requests": HIGH_VOLUME,
+    "audit_log": HIGH_VOLUME,
+    # Grows with documents, operations and consolidated knowledge.
+    "documents": MEDIUM_VOLUME,
+    "mental_models": MEDIUM_VOLUME,
+    "mental_model_history": MEDIUM_VOLUME,
+    "mental_model_versions": MEDIUM_VOLUME,
+    "observation_sources": MEDIUM_VOLUME,
+    "async_operations": MEDIUM_VOLUME,
+    "knowledge_pages": MEDIUM_VOLUME,
+    "learnings": MEDIUM_VOLUME,
+    "directives": MEDIUM_VOLUME,
+    "pinned_reflections": MEDIUM_VOLUME,
+    "graph_maintenance_queue": MEDIUM_VOLUME,
+    "entity_maintenance_queue": MEDIUM_VOLUME,
+    "file_storage": MEDIUM_VOLUME,
+    # One row per distinct inline attachment per bank, and one per document that
+    # references it — so both grow with documents, not with facts. Content
+    # addressing means an image reused across an article set is stored once.
+    "attachments": MEDIUM_VOLUME,
+    "document_attachments": MEDIUM_VOLUME,
+    # Configuration-sized: a handful of rows per bank or tenant.
+    "banks": LOW_VOLUME,
+    "bank_aliases": LOW_VOLUME,
+    "webhooks": LOW_VOLUME,
+    "bank_stats_cache": LOW_VOLUME,
+}
+
+# Table positions in Alembic ops and in raw SQL. Matches are intersected with
+# TABLE_VOLUME, so prose and column names picked up by the SQL patterns drop out.
+_TABLE_PATTERNS = (
+    r"op\.(?:create_table|drop_table|add_column|drop_column|alter_column|rename_table)\(\s*[\"']([a-z_][a-z0-9_]*)[\"']",
+    r"table_name=[\"']([a-z_][a-z0-9_]*)[\"']",
+    r"(?i)\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:\{schema\}|\"[^\"]*\"\.)?\"?([a-z_][a-z0-9_]*)",
+    r"(?i)\b(?:CREATE|DROP)\s+(?:MATERIALIZED\s+VIEW|TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?(?:\{schema\}|\"[^\"]*\"\.)?\"?([a-z_][a-z0-9_]*)",
+    r"(?i)\bON\s+(?:ONLY\s+)?(?:\{schema\}|\"[^\"]*\"\.)?\"?([a-z_][a-z0-9_]*)\"?\s*(?:USING|\()",
+    r"(?i)\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:\{schema\}|\"[^\"]*\"\.)?\"?([a-z_][a-z0-9_]*)",
+)
+
+# `DROP INDEX idx_memory_units_embedding` names no table but takes ACCESS EXCLUSIVE on
+# one, so the table is recovered from the index identifier (longest known name wins).
+_INDEX_PATTERNS = (
+    r"(?i)\b(?:CREATE|DROP)\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+(?:NOT\s+)?EXISTS\s+)?(?:\{schema\}|\"[^\"]*\"\.)?\"?([a-z_][a-z0-9_]*)",
+    r"op\.(?:create_index|drop_index)\(\s*[\"']([a-z_][a-z0-9_]*)[\"']",
+)
 CHANGELOG_PATH = REPO_PATH / "hindsight-docs" / "src" / "pages" / "changelog" / "index.md"
 INTEGRATION_CHANGELOG_DIR = REPO_PATH / "hindsight-docs" / "src" / "pages" / "changelog" / "integrations"
 
@@ -79,11 +162,17 @@ INTEGRATIONS: dict[str, IntegrationMeta] = {
     "dify": IntegrationMeta("hindsight-dify", "Dify"),
     "vapi": IntegrationMeta("hindsight-vapi", "Vapi"),
     "gemini-spark": IntegrationMeta("hindsight-gemini-spark", "Gemini Spark"),
+    "meta-muse": IntegrationMeta("hindsight-meta-muse", "Meta Muse"),
     "flowise": IntegrationMeta("@vectorize-io/flowise-nodes-hindsight", "Flowise"),
     "google-adk": IntegrationMeta("hindsight-google-adk", "Google ADK"),
     "superagent": IntegrationMeta("hindsight-superagent", "Superagent"),
     "obsidian": IntegrationMeta("@vectorize-io/hindsight-obsidian", "Obsidian"),
     "haystack": IntegrationMeta("hindsight-haystack", "Haystack"),
+    "agno": IntegrationMeta("hindsight-agno", "Agno"),
+    # Git-distributed: Hermes installs the plugin from this repo at a catalog-pinned commit, so
+    # `package_name` is the Hermes plugin id rather than a registry package, and _package_url
+    # points at the source tree (see the carve-out there).
+    "hermes": IntegrationMeta("hindsight", "Hermes Agent"),
     "roo-code": IntegrationMeta("hindsight-roo-code", "Roo Code"),
     "omo": IntegrationMeta("hindsight-omo", "OMO"),
     "composio": IntegrationMeta("hindsight-composio", "Composio"),
@@ -116,6 +205,152 @@ class Commit:
 
     hash: str
     message: str
+
+
+@dataclass(frozen=True)
+class Migration:
+    """An Alembic migration added in a release, enumerated from git history."""
+
+    revision: str
+    description: str
+    path: str
+    commit: str
+    pr: int | None
+    tables: tuple[str, ...] = ()
+
+
+def _pr_number_from_subject(subject: str) -> int | None:
+    """Extract the merge PR number from a squash-merge commit subject.
+
+    Subjects end with the PR that merged them, e.g.
+    `fix(x): ... (#3361, #3273) (#3622)` -> 3622. Earlier `(#N)` groups are
+    issue references, so the *last* match is the PR.
+    """
+    matches = re.findall(r"\(#(\d+)\)", subject)
+    return int(matches[-1]) if matches else None
+
+
+def _file_at_ref(ref: str, path: str) -> str | None:
+    """Read a file's contents at a git ref, or None if it doesn't exist there."""
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{path}"],
+        cwd=REPO_PATH,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def _strip_prose(source: str) -> str:
+    """Drop the module docstring and `#` comments so prose can't look like a table.
+
+    Only the *module* docstring is removed: migration SQL lives in triple-quoted
+    strings further down, and stripping every triple-quoted block would throw away
+    the statements this scan exists to read.
+    """
+    without_docstring = re.sub(r'\A\s*(?:"""|\'\'\')(?:.|\n)*?(?:"""|\'\'\')', "", source)
+    return re.sub(r"(?m)#.*$", "", without_docstring)
+
+
+def extract_tables(source: str) -> tuple[str, ...]:
+    """Return the known tables a migration touches, ordered by volume then name.
+
+    Intersected with TABLE_VOLUME: the SQL patterns are deliberately loose (an
+    index expression or a stray identifier can match), and a reviewed table list
+    is a cheaper filter than trying to parse every dialect's DDL.
+    """
+    body = _strip_prose(source)
+    found = {match for pattern in _TABLE_PATTERNS for match in re.findall(pattern, body)}
+    known = found & TABLE_VOLUME.keys()
+    for pattern in _INDEX_PATTERNS:
+        for index_name in re.findall(pattern, body):
+            owners = [table for table in TABLE_VOLUME if table in index_name]
+            if owners:
+                known.add(max(owners, key=len))
+    return tuple(sorted(known, key=lambda table: (VOLUME_ORDER.index(TABLE_VOLUME[table]), table)))
+
+
+@dataclass(frozen=True)
+class MigrationDoc:
+    """The revision id and one-line description read out of a migration file."""
+
+    revision: str
+    description: str
+
+
+def _parse_migration_file(source: str, path: str) -> MigrationDoc:
+    """Read the revision id and description from a migration file's contents."""
+    revision_match = re.search(r"^revision:\s*str\s*=\s*[\"']([^\"']+)[\"']", source, re.MULTILINE)
+    revision = revision_match.group(1) if revision_match else Path(path).name.split("_", 1)[0]
+
+    docstring_match = re.search(r'^\s*"""(.*?)$', source, re.MULTILINE)
+    if docstring_match and docstring_match.group(1).strip():
+        description = docstring_match.group(1).strip()
+    else:
+        # Fall back to the filename slug: `abc123_add_foo_index.py` -> `add foo index`
+        stem = Path(path).stem.split("_", 1)
+        description = stem[1].replace("_", " ") if len(stem) > 1 else Path(path).stem
+    return MigrationDoc(revision=revision, description=description)
+
+
+def get_new_migrations(from_ref: str | None, to_ref: str) -> list[Migration]:
+    """Enumerate Alembic migrations added between two refs, oldest commit first.
+
+    Deterministic: this reads git history directly, it never goes through the LLM.
+    Migrations added and later removed within the same range are skipped (they
+    don't exist at `to_ref`).
+    """
+    range_arg = f"{from_ref}..{to_ref}" if from_ref else to_ref
+    result = subprocess.run(
+        [
+            "git",
+            "log",
+            "--diff-filter=A",
+            "--no-merges",
+            "--format=%x00%h|%s",
+            "--name-only",
+            range_arg,
+            "--",
+            MIGRATIONS_DIR,
+        ],
+        cwd=REPO_PATH,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    migrations: list[Migration] = []
+    seen_paths: set[str] = set()
+    for block in result.stdout.split("\0"):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        commit_hash, _, subject = lines[0].partition("|")
+        pr = _pr_number_from_subject(subject)
+        for path in sorted(lines[1:]):
+            if not path.endswith(".py") or Path(path).name == "__init__.py":
+                continue
+            if path in seen_paths:
+                continue
+            source = _file_at_ref(to_ref, path)
+            if source is None:
+                continue
+            seen_paths.add(path)
+            doc = _parse_migration_file(source, path)
+            migrations.append(
+                Migration(
+                    revision=doc.revision,
+                    description=doc.description,
+                    path=path,
+                    commit=commit_hash,
+                    pr=pr,
+                    tables=extract_tables(source),
+                )
+            )
+
+    # git log is newest-first; present migrations in the order they were applied.
+    migrations.reverse()
+    return migrations
 
 
 def parse_semver(version: str) -> tuple[int, int, int]:
@@ -343,16 +578,122 @@ def _render_entry_meta(commit_id: str, commit_url: str, login: str | None) -> st
     return "".join(parts)
 
 
-def analyze_commits_with_llm(
-    client: OpenAI,
-    model: str,
+def _render_migration_meta(migration: Migration) -> str:
+    """Render the trailing link for a migration: · #PR (or the commit as fallback)."""
+    sep = '<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span>'
+    if migration.pr is not None:
+        href = f"{GITHUB_PULL_URL}/{migration.pr}"
+        label = f"#{migration.pr}"
+    else:
+        href = f"{GITHUB_COMMIT_URL}/{migration.commit}"
+        label = migration.commit
+    link = (
+        f'<a href="{href}" target="_blank" rel="noopener noreferrer" '
+        f'style={{{{fontFamily: "var(--ifm-font-family-monospace, monospace)", '
+        f'fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}}}>{label}</a>'
+    )
+    return sep + link
+
+
+def _render_tables(tables: tuple[str, ...]) -> str:
+    """Render the tables a migration touches, each tagged with its data volume."""
+    if not tables:
+        return ""
+    sep = '<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span>'
+    rendered = []
+    for table in tables:
+        tier = TABLE_VOLUME[table]
+        rendered.append(
+            f"<code>{table}</code>"
+            f'<span style={{{{fontSize: "0.75em", color: "{tier.color}", marginLeft: "0.25em"}}}}>'
+            f"{tier.label}</span>"
+        )
+    return sep + " ".join(rendered)
+
+
+def render_migrations_section(migrations: list[Migration]) -> list[str]:
+    """Render the deterministic "Database Migrations" section lines."""
+    if not migrations:
+        return []
+    lines = ["**Database Migrations**", ""]
+    hot = sorted({t for m in migrations for t in m.tables if TABLE_VOLUME[t] is HIGH_VOLUME})
+    if hot:
+        lines.append(
+            f"This release alters high-volume tables ({', '.join(f'`{t}`' for t in hot)}). "
+            "Migrations run on startup, so allow extra time on large deployments."
+        )
+        lines.append("")
+    for migration in migrations:
+        lines.append(
+            f"- `{migration.revision}` — {_escape_mdx_text(migration.description)}"
+            f"{_render_tables(migration.tables)}"
+            f"{_render_migration_meta(migration)}"
+        )
+    lines.append("")
+    return lines
+
+
+# A release's commits are summarized in token-sized batches rather than in one call.
+# One call over a whole release makes the model compress: 0.10.0's 220 commits came
+# back as 37 entries against 65 for the 145-commit release before it, with whole
+# user-facing fixes unlisted. A batch is small enough that every commit in it can be
+# considered on its own, and batches are independent, so they run concurrently.
+#
+# The budget is deliberately far below the model's input limit. Commit subjects are
+# short: a 245-commit release is ~8500 tokens in total, so any budget near the context
+# window is one batch and changes nothing. What is being bounded here is how much the
+# model is asked to hold at once before it starts summarizing away, not what fits.
+BATCH_TOKEN_BUDGET = 2000
+MAX_PARALLEL_BATCHES = 8
+# gpt-5.6-terra bills reasoning tokens against the response budget, so this has to
+# leave room for the reasoning that precedes the first entry, not just the entries.
+RESPONSE_TOKEN_BUDGET = 100000
+
+
+class PromptCommit(BaseModel):
+    """One commit as the summarization prompt shows it, and what batching counts tokens over."""
+
+    commit_id: str
+    message: str
+
+
+def _prompt_commit(commit: Commit) -> PromptCommit:
+    return PromptCommit(commit_id=commit.hash, message=commit.message)
+
+
+def batch_commits(commits: list[Commit], token_budget: int | None = None) -> list[list[Commit]]:
+    """Split commits into batches of at most ``token_budget`` tokens of commit text.
+
+    Batches follow the input order, so each one holds a contiguous run of the
+    release's history and the merged result stays in commit order. A single commit
+    over budget gets a batch to itself rather than being dropped or truncated.
+    """
+    # Read the module constant at call time rather than binding it as a default:
+    # a default is bound at import, so raising BATCH_TOKEN_BUDGET to compare batched
+    # against unbatched output silently measures two batched runs.
+    token_budget = BATCH_TOKEN_BUDGET if token_budget is None else token_budget
+    batches: list[list[Commit]] = []
+    current: list[Commit] = []
+    current_tokens = 0
+    for commit in commits:
+        tokens = count_tokens(json.dumps(_prompt_commit(commit).model_dump()))
+        if current and current_tokens + tokens > token_budget:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(commit)
+        current_tokens += tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _build_analysis_prompt(
     version: str,
     commits: list[Commit],
     file_diff: str,
-    integration: str | None = None,
-) -> list[ChangelogEntry]:
-    """Use LLM to analyze commits and return structured changelog entries."""
-    commits_json = json.dumps([{"commit_id": c.hash, "message": c.message} for c in commits], indent=2)
+    integration: str | None,
+) -> str:
+    commits_json = json.dumps([_prompt_commit(c).model_dump() for c in commits], indent=2)
 
     subject = f"the {integration} integration for Hindsight" if integration else f"release {version} of Hindsight"
 
@@ -366,7 +707,7 @@ def analyze_commits_with_llm(
         "its own package) — integrations are versioned and changelogged separately"
     )
 
-    prompt = f"""Analyze the following git commits for {subject} (an AI memory system).
+    return f"""Analyze the following git commits for {subject} (an AI memory system).
 
 For each meaningful change, create a changelog entry with:
 - category: one of "feature", "improvement", "bugfix", "breaking", "other"
@@ -374,12 +715,21 @@ For each meaningful change, create a changelog entry with:
 - commit_id: the commit hash from the input
 
 Rules:
-- Group related commits into a single entry if they're part of the same change
+- Group related commits into a single entry ONLY when they are literally parts of one
+  change (a fix and its follow-up, the same feature landed across two commits). Do not
+  merge distinct fixes into one summary because they touch the same area
+- Be complete rather than selective: every commit that changes what a user, operator or
+  API caller can observe gets its own entry. A bug fix in retain, recall, reflect,
+  consolidation, embeddings, the CLI, the control plane, a provider integration, the
+  Docker images or the Helm chart is user-facing even when its title reads as internal
 - Skip trivial changes (typo fixes, formatting, internal refactoring)
 - Skip repository-only changes: README updates, CI/GitHub Actions, release scripts, changelog updates, version bumps{skip_integrations_rule}
 - Focus on user-facing changes that affect the product functionality
 - Use the exact commit_id from the input (pick the most relevant one if grouping)
 - If no meaningful changes remain after filtering, return an empty list
+
+This is one batch of the release's commits, so judge each commit on its own; do not
+assume a change is absent because its other half is not in this batch.
 
 Commits:
 {commits_json}
@@ -387,14 +737,94 @@ Commits:
 Files changed summary:
 {file_diff[:4000]}"""
 
+
+def _parse_entries(client: OpenAI, model: str, prompt: str) -> list[ChangelogEntry]:
     response = client.beta.chat.completions.parse(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         response_format=ChangelogResponse,
-        max_completion_tokens=16000,
+        max_completion_tokens=RESPONSE_TOKEN_BUDGET,
     )
+    parsed = response.choices[0].message.parsed
+    return parsed.entries if parsed else []
 
-    return response.choices[0].message.parsed.entries
+
+def deduplicate_entries(
+    client: OpenAI,
+    model: str,
+    entries: list[ChangelogEntry],
+    commit_order: list[str],
+) -> list[ChangelogEntry]:
+    """Merge entries that describe the same change across batch boundaries.
+
+    Batches are contiguous, but a feature and its follow-up fix can still straddle
+    two of them, and two batches can describe one rollout twice. A deterministic
+    pass drops repeated commit_ids first — that needs no model — and the LLM pass
+    only has to catch the same change described in two different ways.
+
+    The result is re-ordered by the release's own commit order and filtered to
+    commit_ids that were actually in the input, so a dropped or invented commit_id
+    cannot reorder the changelog or point a reader at a commit that isn't there.
+    """
+    seen: set[str] = set()
+    unique: list[ChangelogEntry] = []
+    for entry in entries:
+        if entry.commit_id in seen:
+            continue
+        seen.add(entry.commit_id)
+        unique.append(entry)
+
+    if len(unique) > 1:
+        prompt = f"""These changelog entries were produced independently from separate batches of one
+release's commits, so the same change may appear more than once, worded differently.
+
+Return the entries to keep:
+- Drop an entry only when another entry describes the same underlying change. When two
+  entries describe one change, keep the clearer summary and its commit_id
+- Keep everything else exactly as it is: same summary text, same category, same commit_id
+- Do not merge distinct changes, do not reword what you keep, and do not invent entries
+
+Entries:
+{json.dumps([e.model_dump() for e in unique], indent=2)}"""
+        deduped = _parse_entries(client, model, prompt)
+        by_id = {e.commit_id: e for e in unique}
+        # Keep the model's text but never its idea of which commits exist.
+        unique = [e for e in deduped if e.commit_id in by_id] or unique
+
+    position = {commit_id: i for i, commit_id in enumerate(commit_order)}
+    return sorted(unique, key=lambda e: position.get(e.commit_id, len(position)))
+
+
+def analyze_commits_with_llm(
+    client: OpenAI,
+    model: str,
+    version: str,
+    commits: list[Commit],
+    file_diff: str,
+    integration: str | None = None,
+) -> list[ChangelogEntry]:
+    """Use LLM to analyze commits and return structured changelog entries."""
+    batches = batch_commits(commits)
+
+    if len(batches) == 1:
+        return _parse_entries(client, model, _build_analysis_prompt(version, batches[0], file_diff, integration))
+
+    console.print(f"[blue]Summarizing {len(commits)} commits in {len(batches)} batches...[/blue]")
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BATCHES) as pool:
+        results = list(
+            pool.map(
+                lambda batch: _parse_entries(
+                    client, model, _build_analysis_prompt(version, batch, file_diff, integration)
+                ),
+                batches,
+            )
+        )
+
+    entries = [entry for batch_entries in results for entry in batch_entries]
+    console.print(f"[blue]{len(entries)} entries before deduplication[/blue]")
+    deduped = deduplicate_entries(client, model, entries, [c.hash for c in commits])
+    console.print(f"[blue]{len(deduped)} entries after deduplication[/blue]")
+    return deduped
 
 
 def build_changelog_markdown(
@@ -403,6 +833,7 @@ def build_changelog_markdown(
     entries: list[ChangelogEntry],
     integration: str | None = None,
     authors: dict[str, str] | None = None,
+    migrations: list[Migration] | None = None,
 ) -> str:
     """Build markdown changelog from structured entries."""
     tag_url = (
@@ -430,6 +861,14 @@ def build_changelog_markdown(
     # Build markdown
     lines = [f"## [{version}]({tag_url})", ""]
 
+    # Integrations that install from git are pinned by commit, not by version: the Hermes catalog
+    # pins a sha, and `hermes plugins install --ref` takes a full 40-character sha and rejects tag
+    # names outright. The release's own sha cannot be printed here — this file is written *before*
+    # the release commit that contains it exists — so link the commits page at the tag, where the
+    # top entry is that commit and GitHub offers its full hash.
+    if integration:
+        lines += [f"[Commits in this release →](https://github.com/{GITHUB_REPO}/commits/{tag})", ""]
+
     has_entries = False
     for cat_key in ["breaking", "feature", "improvement", "bugfix", "other"]:
         cat_name, cat_entries = categories[cat_key]
@@ -444,7 +883,10 @@ def build_changelog_markdown(
                 lines.append(f"- {_escape_mdx_text(entry.summary)}{meta}")
             lines.append("")
 
-    if not has_entries:
+    migration_lines = render_migrations_section(migrations or [])
+    lines.extend(migration_lines)
+
+    if not has_entries and not migration_lines:
         lines.append("*This release contains internal maintenance and infrastructure changes only.*")
         lines.append("")
 
@@ -488,7 +930,7 @@ def write_changelog(path: Path, header: str, new_entry: str, existing_releases: 
 
 def generate_changelog_entry(
     version: str,
-    llm_model: str = "gpt-5.2",
+    llm_model: str = "gpt-5.6-terra",
 ) -> None:
     """Generate changelog entry for a specific version."""
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -560,7 +1002,15 @@ def generate_changelog_entry(
     unique = sorted(set(authors.values()))
     console.print(f"[blue]Found {len(unique)} contributors: {', '.join('@' + c for c in unique)}[/blue]")
 
-    new_entry = build_changelog_markdown(display_version, tag, entries, authors=authors)
+    console.print("[blue]Enumerating new database migrations...[/blue]")
+    migrations = get_new_migrations(previous_tag, actual_tag)
+    for migration in migrations:
+        pr = f"#{migration.pr}" if migration.pr else migration.commit
+        console.print(f"  {migration.revision} {migration.description} ({pr})")
+    if not migrations:
+        console.print("[blue]No new migrations in this release[/blue]")
+
+    new_entry = build_changelog_markdown(display_version, tag, entries, authors=authors, migrations=migrations)
 
     default_header = """---
 hide_table_of_contents: true
@@ -588,7 +1038,7 @@ For full release details, see [GitHub Releases](https://github.com/vectorize-io/
 def generate_integration_changelog_entry(
     integration: str,
     version: str,
-    llm_model: str = "gpt-5.2",
+    llm_model: str = "gpt-5.6-terra",
 ) -> None:
     """Generate changelog entry for a specific integration version."""
     if integration not in VALID_INTEGRATIONS:
@@ -689,7 +1139,7 @@ def _get_package_name(integration: str) -> str:
 def _package_url(integration: str, package_name: str) -> str:
     # Git-distributed plugin bundles have no npm/pypi package — link to the
     # source tree instead of a registry page.
-    if integration in ("claude-code", "agent-plugin"):
+    if integration in ("claude-code", "agent-plugin", "hermes"):
         return f"https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/{integration}"
     if package_name.startswith("@"):
         return f"https://www.npmjs.com/package/{package_name}"
@@ -711,8 +1161,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="gpt-5.2",
-        help="OpenAI model to use (default: gpt-5.2)",
+        default="gpt-5.6-terra",
+        help="OpenAI model to use (default: gpt-5.6-terra)",
     )
     parser.add_argument(
         "--integration",

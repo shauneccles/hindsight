@@ -3,13 +3,19 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PageRef } from "./knowledge-injection";
 import type { RetainCursor, RetainCursorStore } from "./retain-cursor";
+import type { UsageCursorStore } from "./usage";
 
 /** Process-shared state for hook harnesses. SessionStart and prompt hooks are separate Node
  * processes, so this temp-file handoff carries lifecycle decisions without writing user config or
  * bank state. */
 export interface SessionCache {
   turns?: number;
-  reflectAnswer?: string; // present (even "") = reflect already ran this session
+  reflectAnswer?: string; // present (even "") = reflect already resolved this session
+  /** How many times auto-inject has been ATTEMPTED this session — every source, not just reflect.
+   *  A failure leaves `reflectAnswer` unset so a later turn can retry; this bounds that retry (see
+   *  HOOK_INJECT_ATTEMPTS). Named for reflect like `reflectAnswer` above, whose name also predates
+   *  the other two sources. */
+  reflectAttempts?: number;
   /** SessionStart saw a new/empty bank; consume this on prompt one, then allow reflect. */
   deferInitialReflect?: boolean;
   pages?: { atTurn: number; list: PageRef[] };
@@ -105,6 +111,33 @@ export function sessionRootDir(
     /* best-effort: an unrecorded root costs stability, never data */
   }
   return cwd;
+}
+
+/**
+ * How many of a session's turns core/usage.ts has recorded. Its own file for the same reason as
+ * the retain cursor below; losing it re-records the session's turns, which the report dedupes.
+ */
+export function fileUsageCursorStore(harness: string): UsageCursorStore {
+  const file = (sessionId: string) =>
+    join(tmpdir(), `hindsight-${harness}`, `${sessionId}.usage.json`);
+  return {
+    read: (sessionId) => {
+      try {
+        const turns = (JSON.parse(readFileSync(file(sessionId), "utf8")) as { turns?: unknown })
+          .turns;
+        return typeof turns === "number" ? turns : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+    write: (sessionId, turns) => {
+      try {
+        writeFileAtomic(file(sessionId), JSON.stringify({ turns }));
+      } catch {
+        /* best-effort */
+      }
+    },
+  };
 }
 
 /** The cursor's own file, deliberately NOT the shared session cache — see fileCursorStore. */

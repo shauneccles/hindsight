@@ -12,6 +12,7 @@ Tests cover:
 
 import asyncio
 import json
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,16 +37,94 @@ async def _ensure_bank(pool, bank_id: str) -> None:
 pytestmark = pytest.mark.xdist_group("worker_tests")
 
 
+@pytest.fixture(scope="session")
+def isolated_ops_schema(pg0_db_url):
+    """A private, migrated Postgres schema for this file's claim tests.
+
+    ``WorkerPoller.claim_batch`` claims across the whole schema on the
+    connection's search_path, bounded by ``max_slots`` minus the reservations,
+    and ordered by ``created_at``. Sharing ``public`` with the rest of the suite
+    therefore makes an exact claim count unassertable: any concurrently running
+    test that leaves a claimable row (``status='pending'`` with a non-null
+    ``task_payload``) competes for the same batch, and older foreign rows
+    *displace* this file's own — filtering the result to our own bank sees the
+    shortfall but cannot prevent it (#3963).
+
+    That is not hypothetical. ``tests/test_operation_status.py`` writes exactly
+    such rows, and once ``pytest-split`` put it in the same shard the batch came
+    back one row short; with enough foreign rows it comes back with none of ours
+    at all.
+
+    So give this file its own schema, the way the claim-serialisation tests
+    already do (``test_claim_bank_serialization.py``): "the whole schema" is then
+    only its own rows. One schema per worker, created + migrated once and dropped
+    at session end. ``search_path`` is set on the pool in :func:`backend`, so
+    every unqualified table reference here resolves into it.
+    """
+    from hindsight_api.engine.db import create_database_backend
+    from hindsight_api.pg0 import resolve_database_url
+
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    schema = f"workerclaim_iso_{worker}"
+
+    async def _provision() -> str:
+        url = await resolve_database_url(pg0_db_url)
+        b = create_database_backend("postgresql")
+        await b.initialize(url, min_size=1, max_size=2)
+        try:
+            async with b.get_pool().acquire() as conn:
+                # Rebuild from scratch so a schema left by a crashed prior run
+                # can't carry stale state into this session.
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                await conn.execute(f'CREATE SCHEMA "{schema}"')
+            # run_migrations is sync; call it with the loop running (as elsewhere
+            # in the suite) — it builds banks/async_operations/etc. in the schema.
+            b.run_migrations(url, schema=schema)
+        finally:
+            await b.shutdown()
+        return url
+
+    async def _drop(url: str) -> None:
+        b = create_database_backend("postgresql")
+        await b.initialize(url, min_size=1, max_size=2)
+        try:
+            async with b.get_pool().acquire() as conn:
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            await b.shutdown()
+
+    loop = asyncio.new_event_loop()
+    try:
+        url = loop.run_until_complete(_provision())
+    finally:
+        loop.close()
+
+    yield schema
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_drop(url))
+    finally:
+        loop.close()
+
+
 @pytest_asyncio.fixture
-async def backend(pg0_db_url):
-    """Create a DatabaseBackend for worker tests."""
+async def backend(pg0_db_url, isolated_ops_schema):
+    """Create a DatabaseBackend whose pool is pinned to this file's private schema."""
     from hindsight_api.engine.db import create_database_backend
     from hindsight_api.pg0 import resolve_database_url
 
     resolved_url = await resolve_database_url(pg0_db_url)
 
+    async def _use_isolated_schema(conn):
+        # init runs once per new connection, setup runs on every acquire (after
+        # asyncpg's release-time RESET ALL), so this pins search_path for the
+        # pool's whole lifetime — every unqualified table resolves into the
+        # private schema, so claims and cleanup never see the shared public one.
+        await conn.execute(f'SET search_path TO "{isolated_ops_schema}", public')
+
     b = create_database_backend("postgresql")
-    await b.initialize(resolved_url, min_size=2, max_size=10, command_timeout=30)
+    await b.initialize(resolved_url, min_size=2, max_size=10, command_timeout=30, init_callback=_use_isolated_schema)
     yield b
     await b.shutdown()
 
@@ -58,29 +137,26 @@ async def pool(backend):
 
 @pytest_asyncio.fixture
 async def clean_operations(pool):
-    """Clean up this file's async_operations rows before and after each test.
+    """Clear this file's async_operations rows before and after each test.
 
-    Scoped to the worker-test bank prefixes. This used to be a global
-    ``DELETE FROM async_operations WHERE status = 'pending'`` to keep the
-    whole-schema ``WorkerPoller.claim_batch`` from picking up rows other tests
-    left behind — but under pytest-xdist this file shares the ``public`` schema
-    with every test running in parallel, so that global delete removed *other
-    workers'* in-flight operations mid-run. A refresh op, for instance, sits
-    ``pending`` for the brief window between ``_submit_async_operation``
-    committing it and ``SyncTaskBackend`` marking it ``completed``; deleting it
-    in that window makes ``get_operation_status`` read back ``not_found`` and
-    flakes an unrelated test.
+    Safe to be broad now: the pool is pinned to this file's private schema
+    (:func:`isolated_ops_schema`), so this only ever touches its own rows. It
+    must also *be* broad — a delete scoped to the worker-test bank prefixes
+    leaves rows from any other id a test invents, and those stay claimable for
+    the next test's ``claim_batch``.
 
-    The claim tests here don't need a globally empty table: they filter claims to
-    their own bank or assert only against ``max_slots``, so foreign pending rows
-    are harmless. (The claim-*serialisation* tests, which do need an exact view,
-    isolate themselves in a private schema instead — see
-    test_graph_maintenance_claim_serialization.py.)
+    This deliberately no longer runs against ``public``. The scoped form it
+    replaced was itself a fix for a global ``DELETE FROM async_operations WHERE
+    status = 'pending'`` that, under pytest-xdist, removed *other* workers'
+    in-flight operations mid-run (a refresh op sits ``pending`` for the window
+    between ``_submit_async_operation`` committing it and ``SyncTaskBackend``
+    marking it ``completed``; deleting it there made ``get_operation_status``
+    read back ``not_found`` and flaked an unrelated test). Owning the schema
+    removes the conflict at its source instead of trading one flake for another.
     """
-    scoped_delete = "DELETE FROM async_operations WHERE bank_id LIKE 'test-worker-%' OR bank_id LIKE 'test_worker_%'"
-    await pool.execute(scoped_delete)
+    await pool.execute("DELETE FROM async_operations")
     yield
-    await pool.execute(scoped_delete)
+    await pool.execute("DELETE FROM async_operations")
 
 
 def test_metric_operation_label_normalises_retain_variants():
@@ -451,6 +527,55 @@ class TestWorkerPoller:
             assert row["worker_id"] == "test-worker-1"
 
     @pytest.mark.asyncio
+    async def test_claim_batch_cannot_see_rows_outside_this_files_schema(self, pool, clean_operations):
+        """Rows in ``public`` are invisible here, so they can never crowd out our claims (#3963).
+
+        ``claim_batch`` takes at most ``max_slots`` minus the reservations, oldest
+        first, across the whole schema on the connection's search_path. That makes
+        an exact claim count unassertable while this file shares ``public`` with
+        the rest of the suite: any concurrently running test that leaves a
+        claimable row (``status='pending'`` with a non-null ``task_payload``)
+        competes for the same batch, and older foreign rows *displace* ours.
+        Filtering the result to our own bank sees the shortfall but cannot prevent
+        it — the isolation has to come from owning the schema.
+
+        That is not hypothetical: ``tests/test_operation_status.py`` writes exactly
+        such rows, and once ``pytest-split`` moved it into this shard the batch
+        came back a row short.
+
+        The row planted below is deliberately unclaimable (``task_payload`` NULL)
+        so this test can never itself become the neighbour it is guarding against.
+        What it pins is visibility: unqualify the table and it must resolve into
+        this file's private schema, never ``public``.
+        """
+        marker = uuid.uuid4()
+        await pool.execute(
+            "INSERT INTO public.banks (bank_id, name) VALUES ($1, $1) ON CONFLICT DO NOTHING",
+            f"test-worker-public-{marker.hex[:8]}",
+        )
+        try:
+            await pool.execute(
+                """
+                INSERT INTO public.async_operations (operation_id, bank_id, operation_type, status)
+                VALUES ($1, $2, 'retain', 'pending')
+                """,
+                marker,
+                f"test-worker-public-{marker.hex[:8]}",
+            )
+
+            # Unqualified: resolves through search_path into the private schema.
+            visible = await pool.fetchval("SELECT count(*) FROM async_operations WHERE operation_id = $1", marker)
+            assert visible == 0, "public rows are visible here — the pool is not pinned to the private schema"
+
+            # And the row really does exist, so the count above is isolation, not a failed insert.
+            in_public = await pool.fetchval(
+                "SELECT count(*) FROM public.async_operations WHERE operation_id = $1", marker
+            )
+            assert in_public == 1
+        finally:
+            await pool.execute("DELETE FROM public.async_operations WHERE operation_id = $1", marker)
+            await pool.execute("DELETE FROM public.banks WHERE bank_id = $1", f"test-worker-public-{marker.hex[:8]}")
+
     async def test_claim_batch_respects_max_slots(self, pool, backend, clean_operations):
         """Test that claim_batch respects the max_slots limit."""
         from hindsight_api.worker import WorkerPoller
@@ -3292,6 +3417,89 @@ class TestMarkFailedParentPropagation:
         )
 
     @pytest.mark.asyncio
+    async def test_cancelled_sibling_counts_as_done_and_settles_parent(self, pool, backend, clean_operations):
+        """A cancelled child must not strand the parent in 'processing' (issue #4131).
+
+        The poller's copy of the rollup mirrors MemoryEngine._maybe_update_parent_operation:
+        'cancelled' is a done state, and with no failures the parent settles on 'cancelled'.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        cancelled_child_id = uuid.uuid4()
+        last_child_id = uuid.uuid4()
+
+        await self._insert_op(
+            pool, op_id=parent_id, bank_id=bank_id, operation_type="batch_retain", status="processing"
+        )
+        await self._insert_op(
+            pool,
+            op_id=cancelled_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="cancelled",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+        await self._insert_op(
+            pool,
+            op_id=last_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="processing",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-1", executor=lambda x: None)
+        await poller._mark_completed(str(last_child_id), None)
+
+        parent_status = await pool.fetchval("SELECT status FROM async_operations WHERE operation_id = $1", parent_id)
+        assert parent_status == "cancelled", f"parent must not be left in 'processing', got '{parent_status}'"
+
+    @pytest.mark.asyncio
+    async def test_failed_sibling_outranks_cancelled_one(self, pool, backend, clean_operations):
+        """A real failure still wins over a cancellation — it carries a cause to surface."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        cancelled_child_id = uuid.uuid4()
+        last_child_id = uuid.uuid4()
+
+        await self._insert_op(
+            pool, op_id=parent_id, bank_id=bank_id, operation_type="batch_retain", status="processing"
+        )
+        await self._insert_op(
+            pool,
+            op_id=cancelled_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="cancelled",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+        await self._insert_op(
+            pool,
+            op_id=last_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="processing",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-1", executor=lambda x: None)
+        await poller._mark_failed(str(last_child_id), "DB constraint violation", schema=None)
+
+        parent_row = await pool.fetchrow(
+            "SELECT status, error_message FROM async_operations WHERE operation_id = $1", parent_id
+        )
+        assert parent_row["status"] == "failed"
+        assert "DB constraint violation" in parent_row["error_message"]
+
+    @pytest.mark.asyncio
     async def test_mark_failed_finalises_parent_when_last_sibling_fails(self, pool, backend, clean_operations):
         """When the last pending child fails, parent batch_retain is marked failed."""
         from hindsight_api.worker import WorkerPoller
@@ -4931,3 +5139,114 @@ class TestTerminalOperationRetention:
             'ALTER SESSION SET CURRENT_SCHEMA = "APP_USER"',
         ]
         assert backend._default_schema == "APP_USER"
+
+
+class TestCancelledStatusIsFinal:
+    """`DELETE /operations/{id}` may now cancel a 'processing' row (issue #4131).
+
+    Cancellation is cooperative: the worker running the operation only notices at
+    its next checkpoint, so every one of its status writes can still land *after*
+    an operator cancelled. None of them may overwrite 'cancelled' — otherwise the
+    operator's decision is silently reverted, and `_schedule_retry` in particular
+    would put the cancelled work back on the queue to be re-claimed.
+    """
+
+    async def _cancelled_op(self, pool, op_type: str = "consolidation") -> uuid.UUID:
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        await _ensure_bank(pool, bank_id)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, worker_id)
+            VALUES ($1, $2, $3, 'cancelled', 'test-worker-1')
+            """,
+            op_id,
+            bank_id,
+            op_type,
+        )
+        return op_id
+
+    def _poller(self, backend):
+        from hindsight_api.worker import WorkerPoller
+
+        return WorkerPoller(backend=backend, worker_id="test-worker-1", executor=AsyncMock())
+
+    @pytest.mark.asyncio
+    async def test_mark_failed_does_not_overwrite_cancelled(self, pool, backend, clean_operations):
+        op_id = await self._cancelled_op(pool)
+
+        await self._poller(backend)._mark_failed(str(op_id), "boom", None)
+
+        row = await pool.fetchrow("SELECT status, error_message FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled"
+        assert row["error_message"] is None
+
+    @pytest.mark.asyncio
+    async def test_schedule_retry_does_not_requeue_cancelled(self, pool, backend, clean_operations):
+        """The important one: without the guard the row goes back to 'pending' and is re-claimed."""
+        op_id = await self._cancelled_op(pool)
+
+        retry_at = datetime.now(UTC) + timedelta(seconds=60)
+        await self._poller(backend)._schedule_retry(str(op_id), retry_at, "transient", None)
+
+        row = await pool.fetchrow(
+            "SELECT status, retry_count, next_retry_at FROM async_operations WHERE operation_id = $1", op_id
+        )
+        assert row["status"] == "cancelled"
+        assert (row["retry_count"] or 0) == 0
+        assert row["next_retry_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_defer_does_not_requeue_cancelled(self, pool, backend, clean_operations):
+        op_id = await self._cancelled_op(pool)
+
+        exec_date = datetime.now(UTC) + timedelta(seconds=60)
+        await self._poller(backend)._defer_operation(str(op_id), exec_date, "quota", None)
+
+        row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_mark_completed_does_not_overwrite_cancelled(self, pool, backend, clean_operations):
+        """Already guarded on status='processing' — asserted here so it stays that way."""
+        op_id = await self._cancelled_op(pool)
+
+        await self._poller(backend)._mark_completed(str(op_id), None)
+
+        row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_executor_failure_after_cancel_leaves_row_cancelled(self, pool, backend, clean_operations):
+        """End-to-end: a task cancelled mid-flight that then raises stays 'cancelled'."""
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.poller import ClaimedTask
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "consolidation", "operation_id": str(op_id), "bank_id": bank_id})
+        await _ensure_bank(pool, bank_id)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id)
+            VALUES ($1, $2, 'consolidation', 'processing', $3::jsonb, 'test-worker-1')
+            """,
+            op_id,
+            bank_id,
+            payload,
+        )
+
+        async def cancel_then_fail(task_dict):
+            # An operator cancels while the task is running, then the task raises.
+            await pool.execute(
+                "UPDATE async_operations SET status = 'cancelled', updated_at = now() WHERE operation_id = $1",
+                op_id,
+            )
+            raise RuntimeError("boom")
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-1", executor=cancel_then_fail)
+        await poller.execute_task(ClaimedTask(operation_id=str(op_id), task_dict=json.loads(payload), schema=None))
+        assert await poller.wait_for_active_tasks(timeout=5.0)
+
+        row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled", "a cancelled operation must not be resurrected by the failure path"

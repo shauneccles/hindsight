@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config";
 import type { HindsightClient } from "./hindsight";
@@ -28,6 +31,32 @@ describe("RuntimeCore", () => {
     expect(client.reflect).toHaveBeenCalledTimes(1);
     expect(runtime.getInjection("runtime-shared-lifecycle")).toContain("shared reflect");
   });
+
+  it("the knowledge roster tracks the pages a SESSION sees, not the ones plugin load saw", async () => {
+    // These hosts outlive every session. A preamble frozen at load told each new session "No
+    // knowledge pages yet" for the process's whole life, while the same turn's memory block listed
+    // pages by id — the agent was told both, and believed the stale half (#4607).
+    let pages: { id: string; name: string }[] = [];
+    const client = {
+      listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
+      listPages: vi.fn(async () => ({ items: pages })),
+      reflect: vi.fn(async () => ""),
+    } as unknown as HindsightClient;
+    const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
+
+    await runtime.seedIfCold("/definitely-not-a-git-repository"); // cold: zero pages
+    await runtime.onPrompt("session-cold", "first prompt");
+    expect(runtime.getInjection("session-cold")).toContain("No knowledge pages yet");
+
+    pages = [
+      { id: "kp-1", name: "Component map" },
+      { id: "kp-2", name: "Key decisions and rationale" },
+    ];
+    await runtime.onPrompt("session-warm", "first prompt");
+    const warm = runtime.getInjection("session-warm") ?? "";
+    expect(warm).toContain("2 knowledge pages cover");
+    expect(warm).not.toContain("No knowledge pages yet");
+  });
 });
 
 /**
@@ -54,7 +83,7 @@ describe("RuntimeCore session-idle write-back", () => {
     const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
 
     // The turn-driven path sees only what existed BEFORE the reply.
-    await runtime.onTranscript("s1", [turn("user", "how do we round?")]);
+    await runtime.onTranscript("s1", [turn("user", "how do we round?")], false);
     await new Promise((r) => setTimeout(r, 0)); // retain is fire-and-forget
     expect(retained).toHaveLength(1);
     expect(String(retained[0].turns)).not.toContain("we round half up");
@@ -80,7 +109,7 @@ describe("RuntimeCore session-idle write-back", () => {
     const { client, retained } = makeClient();
     const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
 
-    await runtime.onTranscript("s2", [turn("user", "only turn")]);
+    await runtime.onTranscript("s2", [turn("user", "only turn")], false);
     await new Promise((r) => setTimeout(r, 0));
     expect(retained).toHaveLength(1);
 
@@ -99,6 +128,42 @@ describe("RuntimeCore session-idle write-back", () => {
     await runtime.onSessionIdle("s3");
     await new Promise((r) => setTimeout(r, 0));
     expect(retained).toHaveLength(1);
+  });
+
+  it("records Hindsight usage for a turn only once its reply is in", async () => {
+    const usageFile = join(mkdtempSync(join(tmpdir(), "hs-rt-usage-")), "usage.jsonl");
+    vi.stubEnv("HINDSIGHT_USAGE_FILE", usageFile);
+    try {
+      const { client } = makeClient();
+      const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}), "kilo");
+
+      // Built before the reply: recording turn 1 now would log it with no calls, for good.
+      await runtime.onTranscript("s6", [turn("user", "how do we round?")], false);
+      expect(existsSync(usageFile)).toBe(false);
+
+      runtime.setTranscriptSource(async () => [
+        turn("user", "how do we round?"),
+        turn("action", "hindsight_search_knowledge_pages rounding"),
+        turn("assistant", "🧠 From Hindsight memory — half up"),
+      ]);
+      await runtime.onSessionIdle("s6");
+      const recorded = readFileSync(usageFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      expect(recorded).toMatchObject([
+        {
+          harness: "kilo",
+          session: "s6",
+          bank: "bank-1",
+          turn: 1,
+          calls: ["hindsight_search_knowledge_pages"],
+          credited: true,
+        },
+      ]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("no-ops when the host cannot refetch, rather than retaining a stale transcript", async () => {
@@ -145,8 +210,8 @@ describe("RuntimeCore daemon lifecycle", () => {
     expect(daemonSpy).toHaveBeenCalledWith(daemonCfg, "dsh", { waitMs: 12_000 });
   });
 
-  // The daemon retires itself after daemonIdleTimeout (300s), so a session that thinks longer than
-  // that would lose its whole exchange with no second chance to start one.
+  // A daemon that is gone by write-back time — crashed, or stopped by the user between turns —
+  // would lose the whole exchange with no second chance to start one.
   it("starts the daemon again on write-back — the Stop hook these hosts don't have", async () => {
     const core = new RuntimeCore(client, "bank-1", daemonCfg, "dsh", "/repos/one");
     core.setTranscriptSource(async () => [{ role: "user", content: "hi" }] as never);

@@ -4,7 +4,7 @@
  * These tests require a running Hindsight API server.
  */
 
-import { HindsightClient, sdk } from "../src";
+import { HindsightClient, HindsightError, sdk } from "../src";
 
 // Test configuration
 const HINDSIGHT_API_URL = process.env.HINDSIGHT_API_URL || "http://localhost:8888";
@@ -219,22 +219,31 @@ describe("TestEndToEndWorkflow", () => {
 });
 
 describe("TestBankProfile", () => {
-  test("get bank profile", async () => {
+  // The bank profile endpoint was retired: it answers 410. Disposition traits and the
+  // reflect mission are bank configuration and are read from getBankConfig instead.
+  test("the profile endpoint is gone and the config carries its data", async () => {
     const bankId = randomBankId();
 
-    // Create bank with background
     await client.createBank(bankId, {
       name: "Test Agent",
-      background: "I am a helpful assistant for testing.",
+      reflectMission: "I am a helpful assistant for testing.",
     });
 
-    // Get bank profile
-    const profile = await client.getBankProfile(bankId);
+    // Plain try/catch rather than `.rejects`: this file runs under both jest and
+    // Deno's @std/expect shim, and only the matchers used elsewhere here are known
+    // to behave identically in both.
+    let caught: unknown;
+    try {
+      await client.getBankProfile(bankId);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(HindsightError);
+    expect((caught as HindsightError).statusCode).toBe(410);
 
-    expect(profile).not.toBeNull();
-    expect(profile.bank_id).toBe(bankId);
-    expect(profile.name).toBe("Test Agent");
-    expect(profile.background).toBe("I am a helpful assistant for testing.");
+    const { config } = await client.getBankConfig(bankId);
+    expect(config.reflect_mission).toBe("I am a helpful assistant for testing.");
+    expect(config.disposition_skepticism).toBeDefined();
   });
 });
 
@@ -408,9 +417,8 @@ describe("TestDeleteBank", () => {
     expect(response).not.toBeNull();
     expect(response!.success).toBe(true);
 
-    // Verify bank data is deleted - memories should be gone
-    const memories = await client.listMemories(bankId);
-    expect(memories.total).toBe(0);
+    // The bank is gone: reading it fails as not found, the same as a bank that never existed
+    await expect(client.listMemories(bankId)).rejects.toThrow(/not found/);
   });
 });
 

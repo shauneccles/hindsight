@@ -1,9 +1,14 @@
 # Hindsight Docker Image
 # Supports building API-only, Control Plane-only, or both
 #
+# Composition is selected with --target, not with a build arg. Docker only builds the
+# stages the chosen target depends on, so --target api-only never runs the Control Plane
+# build at all:
+#   standalone (default) - API + Control Plane
+#   api-only             - API
+#   cp-only              - Control Plane
+#
 # Build args:
-#   INCLUDE_API=true/false         - Include API (default: true)
-#   INCLUDE_CP=true/false          - Include Control Plane (default: true)
 #   INCLUDE_LOCAL_MODELS=true/false - Include local ML models for embeddings/reranking (default: true)
 #                                     Set to false when using external providers (TEI, OpenAI, Cohere)
 #   PRELOAD_ML_MODELS=true/false   - Pre-download ML models during build (default: true)
@@ -11,13 +16,11 @@
 #
 # Examples:
 #   docker build -t hindsight .                                          # Both (standalone)
-#   docker build -t hindsight-api --build-arg INCLUDE_CP=false .         # API only
-#   docker build -t hindsight-cp --build-arg INCLUDE_API=false .         # Control Plane only
+#   docker build -t hindsight-api --target api-only .                    # API only
+#   docker build -t hindsight-cp --target cp-only .                      # Control Plane only
 #   docker build -t hindsight --build-arg PRELOAD_ML_MODELS=false .      # Skip ML model preload
 #   docker build -t hindsight --build-arg INCLUDE_LOCAL_MODELS=false .   # Skip local ML deps (for external providers)
 
-ARG INCLUDE_API=true
-ARG INCLUDE_CP=true
 ARG PRELOAD_ML_MODELS=true
 ARG INCLUDE_LOCAL_MODELS=true
 
@@ -26,17 +29,18 @@ ARG INCLUDE_LOCAL_MODELS=true
 # =============================================================================
 FROM python:3.11-slim AS api-builder
 
-ARG INCLUDE_API
 ARG INCLUDE_LOCAL_MODELS
-RUN if [ "$INCLUDE_API" != "true" ]; then echo "Skipping API build" && exit 0; fi
 
 WORKDIR /app
 
 # Install system dependencies and uv
-RUN apt-get update && apt-get install -y \
+# ca-certificates is listed explicitly: with --no-install-recommends it no longer
+# arrives as a recommend of curl, and TLS for curl/pip must not depend on that.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv
 
@@ -54,7 +58,7 @@ COPY hindsight-embed/pyproject.toml ./hindsight-embed/
 RUN ln -s api hindsight-api-slim
 
 # Sync dependencies using appropriate extras based on INCLUDE_LOCAL_MODELS
-# local-ml: torch, sentence-transformers, transformers, einops, flashrank, mlx (optional)
+# local-ml: torch, sentence-transformers, transformers, einops, flashrank (mlx is macOS arm64 only)
 # embedded-db: pg0-embedded (always included for embedded PostgreSQL support)
 # ONNX Runtime embeddings are intentionally not bundled into the official
 # standalone image; install the local-onnx extra in custom images when needed.
@@ -81,10 +85,7 @@ RUN if [ "$INCLUDE_LOCAL_MODELS" = "true" ]; then \
 # =============================================================================
 # Stage: SDK Builder (needed for Control Plane)
 # =============================================================================
-FROM node:20-slim AS sdk-builder
-
-ARG INCLUDE_CP
-RUN if [ "$INCLUDE_CP" != "true" ]; then echo "Skipping SDK build" && exit 0; fi
+FROM node:24-slim AS sdk-builder
 
 WORKDIR /app
 
@@ -93,16 +94,13 @@ COPY package.json package-lock.json ./
 COPY hindsight-clients/typescript/ ./hindsight-clients/typescript/
 
 # Install and build SDK using workspace (--ignore-scripts skips git hooks setup)
-RUN npm ci --ignore-scripts -w @vectorize-io/hindsight-client
-RUN npm run build -w @vectorize-io/hindsight-client
+RUN npm ci --ignore-scripts -w @vectorize-io/hindsight-client \
+    && npm run build -w @vectorize-io/hindsight-client
 
 # =============================================================================
 # Stage: Control Plane Builder
 # =============================================================================
-FROM node:20-slim AS cp-builder
-
-ARG INCLUDE_CP
-RUN if [ "$INCLUDE_CP" != "true" ]; then echo "Skipping CP build" && exit 0; fi
+FROM node:24-slim AS cp-builder
 
 # Create directory structure matching the monorepo layout
 # This is required because build:standalone script expects .next/standalone/memory-poc/hindsight-control-plane
@@ -113,8 +111,8 @@ WORKDIR /app/memory-poc/hindsight-control-plane
 # correct platform-specific native bindings for lightningcss/tailwindcss
 COPY hindsight-control-plane/package.json ./
 # Remove the file: dependency on SDK (we'll copy it directly later)
-RUN sed -i '/"@vectorize-io\/hindsight-client":/d' package.json
-RUN npm install
+RUN sed -i '/"@vectorize-io\/hindsight-client":/d' package.json \
+    && npm install
 
 # Copy Control Plane source (excluding node_modules via .dockerignore)
 COPY hindsight-control-plane/ ./
@@ -136,7 +134,9 @@ RUN npm exec -- next build
 # Create standalone directory structure manually
 # Note: Must exclude node_modules from find to avoid wrong server.js from next/dist/experimental/testmode/
 # Note: Must explicitly copy .next since glob * doesn't match hidden directories
-RUN STANDALONE_ROOT=$(find .next/standalone -path '*/node_modules' -prune -o -name 'server.js' -print | head -1 | xargs dirname) && \
+# Note: Use find -print -quit instead of find | head | xargs. A SHELL with pipefail
+# would fail this layer on SIGPIPE when head exits before find finishes walking the tree.
+RUN STANDALONE_ROOT=$(dirname "$(find .next/standalone -path '*/node_modules' -prune -o -name 'server.js' -print -quit)") && \
     mkdir -p standalone && \
     cp -r "$STANDALONE_ROOT"/* standalone/ && \
     cp -r "$STANDALONE_ROOT"/.next standalone/.next && \
@@ -161,14 +161,18 @@ WORKDIR /app
 # Note: libicu version varies by Debian version - try common versions in order
 # Runtime images use uv directly; remove pip build tooling after installation so
 # vulnerable setuptools-vendored packages and wheel are not shipped in production.
-RUN apt-get update && apt-get install -y \
-    curl \
+# `upgrade` before `install`: without it the image ships whatever package
+# snapshot the base image was cut with, so security updates published since
+# never reach the runtime layers - that is how 0.9.2 shipped openssl 3.5.6 with
+# 3.5.7 available (#3906). The tradeoff is deliberate: two builds of the same
+# commit can now resolve different package versions.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     procps \
-    libxml2 \
     libssl3 \
     libgssapi-krb5-2 \
     libossp-uuid16 \
-    && (apt-get install -y libicu72 2>/dev/null || apt-get install -y libicu74 2>/dev/null || apt-get install -y libicu76 2>/dev/null || true) \
+    && (apt-get install -y --no-install-recommends libicu72 2>/dev/null || apt-get install -y --no-install-recommends libicu74 2>/dev/null || apt-get install -y --no-install-recommends libicu76 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv \
     && pip uninstall --yes setuptools wheel
@@ -176,28 +180,24 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -s /bin/bash hindsight
 
 # Copy API with virtual environment from builder
-COPY --from=api-builder /app/api /app/api
+COPY --chown=hindsight:hindsight --from=api-builder /app/api /app/api
 
 # Copy startup script
-COPY docker/standalone/start-all.sh /app/start-all.sh
+COPY --chown=hindsight:hindsight docker/standalone/start-all.sh /app/start-all.sh
 RUN chmod +x /app/start-all.sh
-
-RUN chown -R hindsight:hindsight /app
 
 USER hindsight
 
 # Create pg0 data directory as hindsight user so that Docker seeds new named
 # volumes with correct ownership (UID 1000) on first use, avoiding the
 # "Permission denied" error when mounting a fresh root-owned volume.
-RUN mkdir -p /home/hindsight/.pg0
-
 # Make /home/hindsight traversable when running with --user UID:GID overrides
 # (default 0700 blocks traversal by non-owner UIDs needed for bind-mount ownership matching)
-RUN chmod 755 /home/hindsight
+RUN mkdir -p /home/hindsight/.pg0 && chmod 755 /home/hindsight
 
 ENV PATH="/app/api/.venv/bin:${PATH}"
 
-# No tokenizer pre-download step: quicktok ships its vocabularies inside the wheel,
+# No tokenizer pre-download step: toktok compiles its vocabularies into the wheel,
 # so token counting works offline with nothing cached at build time.
 
 # Pre-download ML models to avoid runtime download (conditional)
@@ -209,7 +209,7 @@ ENV HF_HUB_DOWNLOAD_TIMEOUT=600
 RUN if [ "$PRELOAD_ML_MODELS" = "true" ] && [ "$INCLUDE_LOCAL_MODELS" = "true" ]; then \
     MAX_RETRIES=3; \
     RETRY_DELAY=10; \
-    for i in $(seq 1 $MAX_RETRIES); do \
+    for i in $(seq 1 "$MAX_RETRIES"); do \
       echo "Attempt $i/$MAX_RETRIES: Downloading ML models..."; \
       /app/api/.venv/bin/python -c "\
 import os; os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'; \
@@ -219,13 +219,13 @@ SentenceTransformer('BAAI/bge-small-en-v1.5'); \
 print('Downloading cross-encoder model...'); \
 CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
 print('Models cached successfully')" && break; \
-      if [ $i -lt $MAX_RETRIES ]; then \
+      if [ "$i" -lt "$MAX_RETRIES" ]; then \
         echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
-        sleep $RETRY_DELAY; \
+        sleep "$RETRY_DELAY"; \
         RETRY_DELAY=$((RETRY_DELAY * 2)); \
       fi; \
     done; \
-    if [ $i -eq $MAX_RETRIES ] && ! /app/api/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" 2>/dev/null; then \
+    if [ "$i" -eq "$MAX_RETRIES" ] && ! /app/api/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" 2>/dev/null; then \
       echo "ERROR: Failed to download models after $MAX_RETRIES attempts"; \
       exit 1; \
     fi; \
@@ -250,7 +250,7 @@ CMD ["/app/start-all.sh"]
 # =============================================================================
 # Stage: Final Image - Control Plane Only
 # =============================================================================
-FROM node:20-alpine AS cp-only
+FROM node:24-alpine AS cp-only
 
 WORKDIR /app
 
@@ -269,8 +269,27 @@ WORKDIR /app
 COPY docker/standalone/start-all.sh /app/start-all.sh
 RUN chmod +x /app/start-all.sh
 
-# Install curl for health checks
-RUN apk add --no-cache curl bash
+# Install bash for the shared startup script. No curl: this image performs no
+# health check. start-all.sh probes only the API (gated on ENABLE_API, which
+# this stage sets to false) and the LLM under the opt-in HINDSIGHT_WAIT_FOR_DEPS,
+# which a control-plane-only container has no reason to set; the control-plane
+# branch launches `node server.js` and waits on nothing. There is no HEALTHCHECK
+# instruction either. `apk upgrade` runs first for the same reason the Debian
+# stages run `apt-get upgrade` - see the comment on the api-only stage.
+# npm is removed for the same reason the Debian stages remove pip's build
+# tooling: nothing invokes it at runtime - start-all.sh launches the pre-built
+# Next standalone bundle with `node server.js` - and dropping it leaves no
+# scannable vulnerable tar component in the stage. corepack is deliberately
+# kept: it has no node_modules tree and ships no tar package metadata, so a
+# scanner reports nothing for it. The node base image unpacks npm from its own
+# tarball rather than installing an apk package, so it has to go by path.
+# The `[ -e ]` guard is deliberate: a bare `rm -rf` on a path a future base
+# image no longer uses succeeds silently and npm quietly ships again. Fail the
+# build instead, so the path assumption has to be revisited on a base bump.
+RUN apk upgrade --no-cache && apk add --no-cache bash \
+    && [ -e /usr/local/lib/node_modules/npm ] \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+    && ! command -v npm
 
 EXPOSE 9999
 
@@ -288,60 +307,78 @@ FROM python:3.11-slim AS standalone
 
 WORKDIR /app
 
-# Install Node.js, curl, uv, and system dependencies
+# Install uv and system dependencies. Node arrives separately, below.
 # Note: libicu version varies by Debian version - try common versions in order
 # Runtime images use uv directly; remove pip build tooling after installation so
 # vulnerable setuptools-vendored packages and wheel are not shipped in production.
-RUN apt-get update && apt-get install -y \
-    curl \
+# `upgrade` before `install`: without it the image ships whatever package
+# snapshot the base image was cut with, so security updates published since
+# never reach the runtime layers - that is how 0.9.2 shipped openssl 3.5.6 with
+# 3.5.7 available (#3906). The tradeoff is deliberate: two builds of the same
+# commit can now resolve different package versions.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     procps \
-    libxml2 \
     libssl3 \
     libgssapi-krb5-2 \
     libossp-uuid16 \
-    && (apt-get install -y libicu72 2>/dev/null || apt-get install -y libicu74 2>/dev/null || apt-get install -y libicu76 2>/dev/null || true) \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
+    && (apt-get install -y --no-install-recommends libicu72 2>/dev/null || apt-get install -y --no-install-recommends libicu74 2>/dev/null || apt-get install -y --no-install-recommends libicu76 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv \
     && pip uninstall --yes setuptools wheel
 
-RUN useradd -m -s /bin/bash hindsight
+# This is a Python base image, but it also runs the control plane - a pre-built
+# Next standalone bundle launched with `node server.js` - so it needs a Node
+# runtime. Take cp-builder's binary rather than NodeSource's apt repo. That
+# bootstrap was a `curl | bash` from a third-party host at build time, it made
+# builds non-reproducible (the remote script and repo move under a fixed
+# Dockerfile), and it dragged ~14 packages into the runtime image that nothing
+# runs: the whole GnuPG suite, used only to verify the repo key at build time,
+# plus a second system Python (3.13, in a python:3.11 image).
+#
+# Copying the binary also means npm never arrives, so the previous removal by
+# path - and its `[ -e ]` guard against a base bump moving that path - is gone
+# with it. corepack does not come along either; nothing invoked it.
+#
+# node:24-slim and python:3.11-slim are both Debian and glibc is backward
+# compatible, so the binary runs here. `node --version` fails the build if a
+# base change on either side ever breaks that, rather than shipping an image
+# whose control plane cannot start.
+COPY --from=cp-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=cp-builder /usr/local/LICENSE /usr/local/LICENSE
+RUN node --version && ! command -v npm \
+    && useradd -m -s /bin/bash hindsight
 
 # Copy API with virtual environment from builder
-COPY --from=api-builder /app/api /app/api
+COPY --chown=hindsight:hindsight --from=api-builder /app/api /app/api
 
 # Copy built SDK
-COPY --from=sdk-builder /app/hindsight-clients/typescript /app/sdk
+COPY --chown=hindsight:hindsight --from=sdk-builder /app/hindsight-clients/typescript /app/sdk
 
 # Copy Control Plane standalone build
 WORKDIR /app/control-plane
-COPY --from=cp-builder /app/memory-poc/hindsight-control-plane/standalone ./
-COPY --from=cp-builder /app/memory-poc/hindsight-control-plane/.next/static ./.next/static
-COPY --from=cp-builder /app/memory-poc/hindsight-control-plane/public ./public
+COPY --chown=hindsight:hindsight --from=cp-builder /app/memory-poc/hindsight-control-plane/standalone ./
+COPY --chown=hindsight:hindsight --from=cp-builder /app/memory-poc/hindsight-control-plane/.next/static ./.next/static
+COPY --chown=hindsight:hindsight --from=cp-builder /app/memory-poc/hindsight-control-plane/public ./public
 
 WORKDIR /app
 
 # Copy startup script
-COPY docker/standalone/start-all.sh /app/start-all.sh
+COPY --chown=hindsight:hindsight docker/standalone/start-all.sh /app/start-all.sh
 RUN chmod +x /app/start-all.sh
-
-RUN chown -R hindsight:hindsight /app
 
 USER hindsight
 
 # Create pg0 data directory as hindsight user so that Docker seeds new named
 # volumes with correct ownership (UID 1000) on first use, avoiding the
 # "Permission denied" error when mounting a fresh root-owned volume.
-RUN mkdir -p /home/hindsight/.pg0
-
 # Make /home/hindsight traversable when running with --user UID:GID overrides
 # (default 0700 blocks traversal by non-owner UIDs needed for bind-mount ownership matching)
-RUN chmod 755 /home/hindsight
+RUN mkdir -p /home/hindsight/.pg0 && chmod 755 /home/hindsight
 
 ENV PATH="/app/api/.venv/bin:${PATH}"
 
-# No tokenizer pre-download step: quicktok ships its vocabularies inside the wheel,
+# No tokenizer pre-download step: toktok compiles its vocabularies into the wheel,
 # so token counting works offline with nothing cached at build time.
 
 # Pre-download ML models to avoid runtime download (conditional)
@@ -353,7 +390,7 @@ ENV HF_HUB_DOWNLOAD_TIMEOUT=600
 RUN if [ "$PRELOAD_ML_MODELS" = "true" ] && [ "$INCLUDE_LOCAL_MODELS" = "true" ]; then \
     MAX_RETRIES=3; \
     RETRY_DELAY=10; \
-    for i in $(seq 1 $MAX_RETRIES); do \
+    for i in $(seq 1 "$MAX_RETRIES"); do \
       echo "Attempt $i/$MAX_RETRIES: Downloading ML models..."; \
       /app/api/.venv/bin/python -c "\
 import os; os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'; \
@@ -363,13 +400,13 @@ SentenceTransformer('BAAI/bge-small-en-v1.5'); \
 print('Downloading cross-encoder model...'); \
 CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
 print('Models cached successfully')" && break; \
-      if [ $i -lt $MAX_RETRIES ]; then \
+      if [ "$i" -lt "$MAX_RETRIES" ]; then \
         echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
-        sleep $RETRY_DELAY; \
+        sleep "$RETRY_DELAY"; \
         RETRY_DELAY=$((RETRY_DELAY * 2)); \
       fi; \
     done; \
-    if [ $i -eq $MAX_RETRIES ] && ! /app/api/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" 2>/dev/null; then \
+    if [ "$i" -eq "$MAX_RETRIES" ] && ! /app/api/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" 2>/dev/null; then \
       echo "ERROR: Failed to download models after $MAX_RETRIES attempts"; \
       exit 1; \
     fi; \
@@ -394,12 +431,12 @@ ENV TOKENIZERS_PARALLELISM=false
 CMD ["/app/start-all.sh"]
 
 # =============================================================================
-# Default target selection based on build args
+# Stage aliases
 # =============================================================================
 FROM standalone AS default-both
 FROM api-only AS default-api
 FROM cp-only AS default-cp
 
-# This selects the final stage based on INCLUDE_API and INCLUDE_CP
-# Use --target to override: docker build --target api-only .
+# The last stage is what a build without --target produces.
+# Use --target to pick another: docker build --target api-only .
 FROM standalone
