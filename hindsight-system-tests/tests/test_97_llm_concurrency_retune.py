@@ -17,17 +17,19 @@ pytestmark = pytest.mark.asyncio
 
 async def test_work_retained_under_a_lowered_cap_still_completes(client, llm, bank_id, settled):
     configured = (await client.monitoring.get_llm_concurrency()).configured_max_concurrent
-    lowered = await client.monitoring.update_llm_concurrency({"max_concurrent": 1})
-    assert lowered.max_concurrent == 1
+    try:
+        lowered = await client.monitoring.update_llm_concurrency({"max_concurrent": 1})
+        assert lowered.max_concurrent == 1
 
-    llm.on_step("extract_facts", contains="Oslo").returns(
-        extracted(fact("Bea moved to Oslo in 2024", when="2024", where="Oslo", who="Bea", entities=["Bea", "Oslo"]))
-    )
-    llm.on_step("consolidate").returns(consolidation())
-    await client.aretain(bank_id=bank_id, content="Bea moved to Oslo in 2024.")
-    await settled(bank_id)
-
-    restored = await client.monitoring.reset_llm_concurrency()
+        llm.on_step("extract_facts", contains="Oslo").returns(
+            extracted(fact("Bea moved to Oslo in 2024", when="2024", where="Oslo", who="Bea", entities=["Bea", "Oslo"]))
+        )
+        llm.on_step("consolidate").returns(consolidation())
+        await client.aretain(bank_id=bank_id, content="Bea moved to Oslo in 2024.")
+        await settled(bank_id)
+    finally:
+        # The server is shared by every story: never leave it capped at 1.
+        restored = await client.monitoring.reset_llm_concurrency()
     assert restored.max_concurrent == configured
     assert restored.in_flight == 0
 
