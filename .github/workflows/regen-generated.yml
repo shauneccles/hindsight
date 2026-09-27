@@ -1,0 +1,52 @@
+# Fork-only helper: runs upstream's generators (the same steps as
+# test.yml's verify-generated-files job) on feat/runtime-llm-concurrency and
+# commits their output back to it. Never part of the upstream PR.
+name: regen-generated
+on:
+  push:
+    branches: [ci/regen-llm-concurrency]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  regen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UV_FROZEN: "1"
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: feat/runtime-llm-concurrency
+    - uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+    - uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: package-lock.json
+    - uses: dtolnay/rust-toolchain@stable
+    - run: npm ci
+    - run: |
+        cd hindsight-dev && uv sync --frozen --index-strategy unsafe-best-match
+        cd ../hindsight-api && uv sync --frozen --index-strategy unsafe-best-match
+        cd ../hindsight-embed && uv sync --frozen --index-strategy unsafe-best-match
+    - working-directory: hindsight-dev
+      run: uv run generate-openapi
+    - run: ./scripts/generate-bank-template-schema.sh
+    - run: ./scripts/generate-clients.sh
+    - run: ./scripts/generate-docs-skill.sh
+    - run: ./scripts/hooks/lint.sh
+    - name: Commit regenerated files
+      run: |
+        git status --porcelain
+        if [ -z "$(git status --porcelain)" ]; then echo "nothing to regenerate"; exit 0; fi
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -A
+        git commit -m "chore: regenerate OpenAPI spec, clients and docs skill for the llm-concurrency API"
+        git push origin HEAD:feat/runtime-llm-concurrency
